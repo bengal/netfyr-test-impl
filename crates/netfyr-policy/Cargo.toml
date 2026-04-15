@@ -3,6 +3,10 @@ name = "netfyr-policy"
 version = "0.1.0"
 edition = "2021"
 
+[dev-dependencies]
+# tempfile: create temporary files and directories in tests
+tempfile = "3"
+
 [dependencies]
 netfyr-state = { path = "../netfyr-state" }
 # serde + serde_yaml: FactoryType serialization/deserialization and raw YAML parsing
@@ -14,3 +18,5 @@ thiserror = "1"
 tracing = "0.1"
 # indexmap: PolicySet internal storage — preserves insertion order for deterministic iteration
 indexmap = { version = "2", features = ["serde"] }
+# walkdir: recursive directory traversal for load_policy_dir (std has no recursive walker)
+walkdir = "2"

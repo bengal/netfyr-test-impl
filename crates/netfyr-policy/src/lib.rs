@@ -4,11 +4,26 @@
 //! (`StaticFactory`) is the simplest: it copies inline state definitions from
 //! the policy document into a `StateSet`. Dynamic factories (e.g., DHCPv4)
 //! run inside the daemon.
+//!
+//! [`load_policy_file`] is the unified entry point for reading a single policy
+//! file. It handles three document kinds:
+//!
+//! - No `kind:` field or `kind: state` → bare state, wrapped into a static
+//!   `Policy` with priority 100 and a name derived from the filename.
+//! - `kind: policy` → parsed as an explicit `Policy` (via
+//!   `parse_policy_from_value`).
+//! - Any other `kind` value → error.
+//!
+//! [`load_policy_dir`] walks a directory tree and calls [`load_policy_file`] on
+//! every `.yaml`/`.yml` file, collecting results into a [`PolicySet`].
+
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use netfyr_state::{parse_state_value, union, ConflictError, Provenance, Selector, State, StateSet, YamlError};
 use serde::de::Deserialize;
 use serde::{Deserialize as DeserializeDerive, Serialize};
+use walkdir::WalkDir;
 
 // ── FactoryType ───────────────────────────────────────────────────────────────
 
@@ -233,14 +248,176 @@ pub enum PolicyError {
     Serde(#[from] serde_yaml::Error),
 }
 
+// ── parse_policy_from_value ───────────────────────────────────────────────────
+
+/// Parses a single non-null `serde_yaml::Value` into a `Policy`.
+///
+/// The value must have `kind: policy`. Returns `PolicyError::UnsupportedKind`
+/// for absent or `"state"` kind, and `PolicyError::InvalidKind` for any other
+/// unrecognised kind value. Used by both `parse_policy_yaml` and the file
+/// loader to avoid duplicating parsing logic.
+pub(crate) fn parse_policy_from_value(raw: serde_yaml::Value) -> Result<Policy, PolicyError> {
+    let map = match &raw {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => {
+            return Err(PolicyError::MissingField {
+                field: "kind".to_string(),
+            })
+        }
+    };
+
+    // ── kind ──────────────────────────────────────────────────────────────────
+
+    let kind_key = serde_yaml::Value::String("kind".to_string());
+    match map.get(&kind_key) {
+        Some(serde_yaml::Value::String(k)) if k == "policy" => {}
+        Some(serde_yaml::Value::String(k)) if k == "state" => {
+            return Err(PolicyError::UnsupportedKind { kind: k.clone() });
+        }
+        Some(serde_yaml::Value::String(k)) => {
+            return Err(PolicyError::InvalidKind { kind: k.clone() });
+        }
+        Some(_) => {
+            return Err(PolicyError::InvalidKind {
+                kind: "<non-string>".to_string(),
+            });
+        }
+        None => {
+            return Err(PolicyError::UnsupportedKind {
+                kind: "<absent>".to_string(),
+            });
+        }
+    }
+
+    // ── name (required string) ────────────────────────────────────────────────
+
+    let name_key = serde_yaml::Value::String("name".to_string());
+    let name = match map.get(&name_key) {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err(PolicyError::InvalidFieldType {
+                field: "name".to_string(),
+                expected: "string".to_string(),
+            })
+        }
+        None => {
+            return Err(PolicyError::MissingField {
+                field: "name".to_string(),
+            })
+        }
+    };
+
+    // ── factory (required string → FactoryType) ───────────────────────────────
+
+    let factory_key = serde_yaml::Value::String("factory".to_string());
+    let factory_type = match map.get(&factory_key) {
+        Some(serde_yaml::Value::String(factory_str)) => {
+            serde_yaml::from_value::<FactoryType>(serde_yaml::Value::String(
+                factory_str.clone(),
+            ))
+            .map_err(|_| PolicyError::UnknownFactory {
+                factory: factory_str.clone(),
+            })?
+        }
+        Some(_) => {
+            return Err(PolicyError::InvalidFieldType {
+                field: "factory".to_string(),
+                expected: "string".to_string(),
+            })
+        }
+        None => {
+            return Err(PolicyError::MissingField {
+                field: "factory".to_string(),
+            })
+        }
+    };
+
+    // ── priority (optional non-negative integer, default 100) ─────────────────
+
+    let priority_key = serde_yaml::Value::String("priority".to_string());
+    let priority = match map.get(&priority_key) {
+        Some(serde_yaml::Value::Number(n)) => {
+            let p = n.as_u64().ok_or_else(|| PolicyError::InvalidFieldType {
+                field: "priority".to_string(),
+                expected: "non-negative integer".to_string(),
+            })?;
+            u32::try_from(p).map_err(|_| PolicyError::InvalidFieldType {
+                field: "priority".to_string(),
+                expected: "integer within u32 range (0..=4294967295)".to_string(),
+            })?
+        }
+        Some(_) => {
+            return Err(PolicyError::InvalidFieldType {
+                field: "priority".to_string(),
+                expected: "integer".to_string(),
+            })
+        }
+        None => 100,
+    };
+
+    // ── selector (optional mapping → Selector) ────────────────────────────────
+
+    let selector_key_yaml = serde_yaml::Value::String("selector".to_string());
+    let selector = match map.get(&selector_key_yaml) {
+        Some(v) => {
+            let sel =
+                serde_yaml::from_value::<Selector>(v.clone()).map_err(PolicyError::Serde)?;
+            Some(sel)
+        }
+        None => None,
+    };
+
+    // ── state (optional flat mapping → State) ─────────────────────────────────
+
+    let state_key = serde_yaml::Value::String("state".to_string());
+    let state = match map.get(&state_key) {
+        Some(v) => {
+            let s = parse_state_value(v.clone()).map_err(PolicyError::Yaml)?;
+            Some(s)
+        }
+        None => None,
+    };
+
+    // ── states (optional sequence of flat mappings → Vec<State>) ──────────────
+
+    let states_key = serde_yaml::Value::String("states".to_string());
+    let states = match map.get(&states_key) {
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            let mut result = Vec::new();
+            for item in seq {
+                let s = parse_state_value(item.clone()).map_err(PolicyError::Yaml)?;
+                result.push(s);
+            }
+            Some(result)
+        }
+        Some(_) => {
+            return Err(PolicyError::InvalidFieldType {
+                field: "states".to_string(),
+                expected: "sequence".to_string(),
+            })
+        }
+        None => None,
+    };
+
+    Ok(Policy {
+        name,
+        factory_type,
+        priority,
+        state,
+        states,
+        selector,
+    })
+}
+
 // ── parse_policy_yaml ─────────────────────────────────────────────────────────
 
 /// Parses a (possibly multi-document) YAML string into a list of `Policy` values.
 ///
 /// Each document must have `kind: policy`. Documents with `kind: state` or no
 /// `kind` field return `Err(PolicyError::UnsupportedKind)` — auto-wrapping of
-/// bare state documents into policies is handled by SPEC-008. Trailing `---`
-/// null documents are silently skipped.
+/// bare state documents into policies is handled by the file loader
+/// (`load_policy_file`). Trailing `---` null documents are silently
+/// skipped.
 pub fn parse_policy_yaml(input: &str) -> Result<Vec<Policy>, PolicyError> {
     let mut policies = Vec::new();
 
@@ -253,162 +430,233 @@ pub fn parse_policy_yaml(input: &str) -> Result<Vec<Policy>, PolicyError> {
             continue;
         }
 
-        let map = match &raw {
-            serde_yaml::Value::Mapping(m) => m,
-            _ => {
-                return Err(PolicyError::MissingField {
-                    field: "kind".to_string(),
-                })
-            }
-        };
-
-        // ── kind ──────────────────────────────────────────────────────────────
-
-        let kind_key = serde_yaml::Value::String("kind".to_string());
-        match map.get(&kind_key) {
-            Some(serde_yaml::Value::String(k)) if k == "policy" => {}
-            Some(serde_yaml::Value::String(k)) if k == "state" => {
-                return Err(PolicyError::UnsupportedKind { kind: k.clone() });
-            }
-            Some(serde_yaml::Value::String(k)) => {
-                return Err(PolicyError::InvalidKind { kind: k.clone() });
-            }
-            Some(_) => {
-                return Err(PolicyError::InvalidKind {
-                    kind: "<non-string>".to_string(),
-                });
-            }
-            None => {
-                return Err(PolicyError::UnsupportedKind {
-                    kind: "<absent>".to_string(),
-                });
-            }
-        }
-
-        // ── name (required string) ────────────────────────────────────────────
-
-        let name_key = serde_yaml::Value::String("name".to_string());
-        let name = match map.get(&name_key) {
-            Some(serde_yaml::Value::String(s)) => s.clone(),
-            Some(_) => {
-                return Err(PolicyError::InvalidFieldType {
-                    field: "name".to_string(),
-                    expected: "string".to_string(),
-                })
-            }
-            None => {
-                return Err(PolicyError::MissingField {
-                    field: "name".to_string(),
-                })
-            }
-        };
-
-        // ── factory (required string → FactoryType) ───────────────────────────
-
-        let factory_key = serde_yaml::Value::String("factory".to_string());
-        let factory_type = match map.get(&factory_key) {
-            Some(serde_yaml::Value::String(factory_str)) => {
-                serde_yaml::from_value::<FactoryType>(serde_yaml::Value::String(
-                    factory_str.clone(),
-                ))
-                .map_err(|_| PolicyError::UnknownFactory {
-                    factory: factory_str.clone(),
-                })?
-            }
-            Some(_) => {
-                return Err(PolicyError::InvalidFieldType {
-                    field: "factory".to_string(),
-                    expected: "string".to_string(),
-                })
-            }
-            None => {
-                return Err(PolicyError::MissingField {
-                    field: "factory".to_string(),
-                })
-            }
-        };
-
-        // ── priority (optional non-negative integer, default 100) ─────────────
-
-        let priority_key = serde_yaml::Value::String("priority".to_string());
-        let priority = match map.get(&priority_key) {
-            Some(serde_yaml::Value::Number(n)) => {
-                let p = n.as_u64().ok_or_else(|| PolicyError::InvalidFieldType {
-                    field: "priority".to_string(),
-                    expected: "non-negative integer".to_string(),
-                })?;
-                u32::try_from(p).map_err(|_| PolicyError::InvalidFieldType {
-                    field: "priority".to_string(),
-                    expected: "integer within u32 range (0..=4294967295)".to_string(),
-                })?
-            }
-            Some(_) => {
-                return Err(PolicyError::InvalidFieldType {
-                    field: "priority".to_string(),
-                    expected: "integer".to_string(),
-                })
-            }
-            None => 100,
-        };
-
-        // ── selector (optional mapping → Selector) ────────────────────────────
-
-        let selector_key_yaml = serde_yaml::Value::String("selector".to_string());
-        let selector = match map.get(&selector_key_yaml) {
-            Some(v) => {
-                let sel =
-                    serde_yaml::from_value::<Selector>(v.clone()).map_err(PolicyError::Serde)?;
-                Some(sel)
-            }
-            None => None,
-        };
-
-        // ── state (optional flat mapping → State) ─────────────────────────────
-
-        let state_key = serde_yaml::Value::String("state".to_string());
-        let state = match map.get(&state_key) {
-            Some(v) => {
-                let s = parse_state_value(v.clone()).map_err(PolicyError::Yaml)?;
-                Some(s)
-            }
-            None => None,
-        };
-
-        // ── states (optional sequence of flat mappings → Vec<State>) ──────────
-
-        let states_key = serde_yaml::Value::String("states".to_string());
-        let states = match map.get(&states_key) {
-            Some(serde_yaml::Value::Sequence(seq)) => {
-                let mut result = Vec::new();
-                for item in seq {
-                    let s = parse_state_value(item.clone()).map_err(PolicyError::Yaml)?;
-                    result.push(s);
-                }
-                Some(result)
-            }
-            Some(_) => {
-                return Err(PolicyError::InvalidFieldType {
-                    field: "states".to_string(),
-                    expected: "sequence".to_string(),
-                })
-            }
-            None => None,
-        };
-
-        policies.push(Policy {
-            name,
-            factory_type,
-            priority,
-            state,
-            states,
-            selector,
-        });
+        policies.push(parse_policy_from_value(raw)?);
     }
 
     Ok(policies)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── LoaderError ───────────────────────────────────────────────────────────────
+
+/// Errors that can occur while loading policy files from disk.
+#[derive(Debug, thiserror::Error)]
+pub enum LoaderError {
+    /// Failed to read a file from the filesystem.
+    #[error("failed to read {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// YAML syntax error encountered while deserializing a document.
+    #[error("YAML syntax error in {path}: {source}")]
+    Yaml {
+        path: PathBuf,
+        source: serde_yaml::Error,
+    },
+
+    /// Error parsing a bare state document.
+    #[error("state parse error in {path}: {source}")]
+    State { path: PathBuf, source: YamlError },
+
+    /// Error parsing a `kind: policy` document.
+    #[error("policy parse error in {path}: {source}")]
+    Policy {
+        path: PathBuf,
+        source: PolicyError,
+    },
+
+    /// The `kind` field has an unrecognised value.
+    #[error("unknown kind '{kind}' in {path}; expected 'policy' or 'state'")]
+    UnknownKind { kind: String, path: PathBuf },
+
+    /// Two files in a directory produced a policy with the same name.
+    #[error("duplicate policy name '{name}' (from {path})")]
+    DuplicatePolicyName { name: String, path: PathBuf },
+
+    /// Error traversing a directory tree.
+    #[error("directory traversal error: {0}")]
+    WalkDir(#[from] walkdir::Error),
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Derives a policy name from a file path by stripping the extension.
+///
+/// `eth0.yaml` → `"eth0"`, `bond0-vlan100.yml` → `"bond0-vlan100"`.
+/// Falls back to `"unnamed"` for paths with no file stem or non-UTF-8 names.
+fn policy_name_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+// ── load_policy_file ──────────────────────────────────────────────────────────
+
+/// Reads `path` and returns all policies defined in it.
+///
+/// YAML documents without a `kind:` field, or with `kind: state`, are treated
+/// as bare states and auto-wrapped into a static `Policy` with priority 100.
+/// The policy name is the file stem for single-document files, or
+/// `"{stem}-{N}"` (1-based) for multi-document files.
+///
+/// Documents with `kind: policy` are parsed as explicit policies and keep their
+/// declared `name` and `priority`.
+///
+/// Null/empty documents (trailing `---`) are silently skipped and do not affect
+/// document numbering.
+pub fn load_policy_file(path: &Path) -> Result<Vec<Policy>, LoaderError> {
+    let content = std::fs::read_to_string(path).map_err(|e| LoaderError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    let base_name = policy_name_from_path(path);
+    let filename = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    // ── First pass: collect non-null documents ────────────────────────────────
+
+    let mut docs: Vec<serde_yaml::Value> = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(&content) {
+        let raw: serde_yaml::Value =
+            Deserialize::deserialize(document).map_err(|e| LoaderError::Yaml {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        if !matches!(raw, serde_yaml::Value::Null) {
+            docs.push(raw);
+        }
+    }
+
+    let is_multi = docs.len() > 1;
+
+    // ── Second pass: dispatch by kind ─────────────────────────────────────────
+
+    let mut policies = Vec::new();
+
+    for (index, raw) in docs.into_iter().enumerate() {
+        let doc_num = index + 1; // 1-based index among non-null documents
+
+        // Extract the `kind` field as an owned string. If the field exists but
+        // is not a YAML string, treat it as an unknown kind rather than
+        // silently falling through to the bare-state path.
+        let kind: Option<String> = match raw.get("kind") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(s) => Some(s.to_string()),
+                None => {
+                    return Err(LoaderError::UnknownKind {
+                        kind: "<non-string>".to_string(),
+                        path: path.to_path_buf(),
+                    });
+                }
+            },
+        };
+
+        match kind.as_deref() {
+            // ── Bare state: auto-wrap into a static policy ────────────────────
+            None | Some("state") => {
+                let state =
+                    parse_state_value(raw).map_err(|e| LoaderError::State {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
+
+                let name = if is_multi {
+                    format!("{base_name}-{doc_num}")
+                } else {
+                    base_name.clone()
+                };
+
+                tracing::info!(
+                    "Wrapping bare state from {} as static policy \"{}\" with priority 100",
+                    filename,
+                    name
+                );
+
+                policies.push(Policy {
+                    name,
+                    factory_type: FactoryType::Static,
+                    priority: 100,
+                    state: Some(state),
+                    states: None,
+                    selector: None,
+                });
+            }
+
+            // ── Explicit policy: delegate to shared parser ────────────────────
+            Some("policy") => {
+                let policy =
+                    parse_policy_from_value(raw).map_err(|e| LoaderError::Policy {
+                        path: path.to_path_buf(),
+                        source: e,
+                    })?;
+                policies.push(policy);
+            }
+
+            // ── Unknown kind: error ───────────────────────────────────────────
+            Some(other) => {
+                return Err(LoaderError::UnknownKind {
+                    kind: other.to_string(),
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+
+    Ok(policies)
+}
+
+// ── load_policy_dir ───────────────────────────────────────────────────────────
+
+/// Recursively loads all `.yaml` and `.yml` files from `path` into a
+/// [`PolicySet`].
+///
+/// Files whose name begins with `.` are skipped. Returns an error if two files
+/// produce a policy with the same name.
+pub fn load_policy_dir(path: &Path) -> Result<PolicySet, LoaderError> {
+    let mut policy_set = PolicySet::new();
+
+    for entry in WalkDir::new(path).into_iter() {
+        let entry = entry?; // propagate walkdir::Error
+
+        // Skip directories and non-regular files.
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        // Skip hidden files (names starting with `.`).
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        // Only process YAML files.
+        let ext = entry.path().extension().and_then(|s| s.to_str());
+        if !matches!(ext, Some("yaml" | "yml")) {
+            continue;
+        }
+
+        let policies = load_policy_file(entry.path())?;
+
+        for policy in policies {
+            if policy_set.get(&policy.name).is_some() {
+                return Err(LoaderError::DuplicatePolicyName {
+                    name: policy.name,
+                    path: entry.path().to_path_buf(),
+                });
+            }
+            policy_set.insert(policy);
+        }
+    }
+
+    Ok(policy_set)
+}
+
+// ── Policy model tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1108,5 +1356,515 @@ mtu: 1500
         let result = parse_policy_yaml(yaml);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), PolicyError::UnsupportedKind { .. }));
+    }
+}
+
+// ── Loader tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod loader_tests {
+    use super::*;
+    use netfyr_state::Value;
+    use std::fs;
+    use std::path::PathBuf;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Write `content` to `filename` inside `dir` and return the full path.
+    fn write_file(dir: &tempfile::TempDir, filename: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(filename);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    // ── Scenario: Single bare state file is wrapped into a policy ─────────────
+
+    #[test]
+    fn test_bare_state_single_doc_returns_one_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn test_bare_state_single_doc_policy_name_from_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    #[test]
+    fn test_bare_state_single_doc_factory_type_is_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    #[test]
+    fn test_bare_state_single_doc_priority_is_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].priority, 100);
+    }
+
+    #[test]
+    fn test_bare_state_single_doc_state_entity_type_is_ethernet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.entity_type, "ethernet");
+    }
+
+    #[test]
+    fn test_bare_state_single_doc_state_has_mtu_1500() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    /// Single-doc file must NOT get a numeric suffix ("eth0", not "eth0-1").
+    #[test]
+    fn test_bare_state_single_doc_name_has_no_numeric_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+        assert!(
+            !policies[0].name.ends_with("-1"),
+            "single-document files must not produce a '-1' suffix"
+        );
+    }
+
+    // ── Scenario: Explicit kind: state is treated same as bare state ────────
+
+    #[test]
+    fn test_explicit_kind_state_returns_one_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+    }
+
+    #[test]
+    fn test_explicit_kind_state_policy_name_from_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    #[test]
+    fn test_explicit_kind_state_factory_type_is_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    #[test]
+    fn test_explicit_kind_state_priority_is_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].priority, 100);
+    }
+
+    #[test]
+    fn test_explicit_kind_state_state_entity_type_is_ethernet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.entity_type, "ethernet");
+    }
+
+    #[test]
+    fn test_explicit_kind_state_state_has_mtu_1500() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "kind: state\ntype: ethernet\nname: eth0\nmtu: 1500\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        let state = policies[0].state.as_ref().expect("state should be Some");
+        assert_eq!(state.fields["mtu"].value, Value::U64(1500));
+    }
+
+    // ── Scenario: Multi-document bare state file produces numbered policies ──
+
+    #[test]
+    fn test_multi_doc_bare_state_returns_two_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "interfaces.yaml",
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_doc_bare_state_first_policy_name_has_suffix_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "interfaces.yaml",
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "interfaces-1");
+    }
+
+    #[test]
+    fn test_multi_doc_bare_state_second_policy_name_has_suffix_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "interfaces.yaml",
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[1].name, "interfaces-2");
+    }
+
+    #[test]
+    fn test_multi_doc_bare_state_both_policies_have_static_factory_and_priority_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "interfaces.yaml",
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\ntype: ethernet\nname: eth1\nmtu: 9000\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        for p in &policies {
+            assert_eq!(p.factory_type, FactoryType::Static);
+            assert_eq!(p.priority, 100);
+        }
+    }
+
+    // ── Scenario: kind: policy documents are not wrapped ───────────────────
+
+    #[test]
+    fn test_explicit_kind_policy_returns_one_policy_with_declared_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+        // Name comes from the document, not the filename.
+        assert_eq!(policies[0].name, "custom-policy");
+    }
+
+    #[test]
+    fn test_explicit_kind_policy_priority_is_declared_value_not_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        // Priority 200, not the bare-state default of 100.
+        assert_eq!(policies[0].priority, 200);
+    }
+
+    #[test]
+    fn test_explicit_kind_policy_factory_type_is_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "kind: policy\nname: custom-policy\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "custom.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    // ── Scenario: Mixed file with bare state and explicit policy ────────────
+
+    #[test]
+    fn test_mixed_file_returns_two_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 2);
+    }
+
+    #[test]
+    fn test_mixed_file_first_is_wrapped_bare_state_named_with_suffix_1_and_priority_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "mixed-1");
+        assert_eq!(policies[0].priority, 100);
+        assert_eq!(policies[0].factory_type, FactoryType::Static);
+    }
+
+    #[test]
+    fn test_mixed_file_second_is_explicit_policy_with_declared_name_and_priority_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "type: ethernet\nname: eth0\nmtu: 1500\n---\n\
+                       kind: policy\nname: eth0-override\nfactory: static\npriority: 200\n\
+                       state:\n  type: ethernet\n  name: eth0\n  mtu: 9000\n";
+        let path = write_file(&dir, "mixed.yaml", content);
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[1].name, "eth0-override");
+        assert_eq!(policies[1].priority, 200);
+    }
+
+    // ── Scenario: Info log is emitted for wrapped bare states ───────────────
+
+    #[test]
+    fn test_bare_state_load_succeeds_implying_info_log_path_was_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_ok(), "loading a bare state file should succeed");
+    }
+
+    // ── Scenario: Policy name derived from filename without extension ───────
+
+    #[test]
+    fn test_policy_name_derived_from_yaml_extension_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    #[test]
+    fn test_policy_name_derived_from_yml_extension_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "bond0-vlan100.yml", "type: ethernet\nname: bond0.100\nmtu: 9000\n");
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies[0].name, "bond0-vlan100");
+    }
+
+    // ── Scenario: Load all policies from a directory ────────────────────────
+
+    #[test]
+    fn test_load_policy_dir_three_files_returns_policy_set_with_three_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 3);
+    }
+
+    #[test]
+    fn test_load_policy_dir_contains_eth0_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("eth0").is_some(), "policy set should contain 'eth0'");
+    }
+
+    #[test]
+    fn test_load_policy_dir_contains_dns_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("dns").is_some(), "policy set should contain 'dns'");
+    }
+
+    #[test]
+    fn test_load_policy_dir_contains_custom_explicit_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "dns.yaml", "type: dns\nname: main\nservers:\n  - 10.0.1.2\n");
+        write_file(
+            &dir,
+            "custom.yaml",
+            "kind: policy\nname: custom\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.get("custom").is_some(), "policy set should contain 'custom'");
+    }
+
+    // ── Scenario: Duplicate policy names across files are rejected ──────────
+
+    #[test]
+    fn test_load_policy_dir_duplicate_name_returns_duplicate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // eth0.yaml derives name "eth0" from filename.
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        // also-eth0.yaml uses an explicit kind: policy with name "eth0".
+        write_file(
+            &dir,
+            "also-eth0.yaml",
+            "kind: policy\nname: eth0\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        let result = load_policy_dir(dir.path());
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::DuplicatePolicyName { .. }),
+            "expected DuplicatePolicyName error"
+        );
+    }
+
+    #[test]
+    fn test_load_policy_dir_duplicate_name_error_identifies_conflicting_policy_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(
+            &dir,
+            "also-eth0.yaml",
+            "kind: policy\nname: eth0\nfactory: static\n\
+             state:\n  type: ethernet\n  name: eth1\n  mtu: 9000\n",
+        );
+        match load_policy_dir(dir.path()).unwrap_err() {
+            LoaderError::DuplicatePolicyName { name, .. } => {
+                assert_eq!(name, "eth0");
+            }
+            other => panic!("expected DuplicatePolicyName, got {:?}", other),
+        }
+    }
+
+    // ── Scenario: Hidden files are skipped during directory loading ─────────
+
+    #[test]
+    fn test_load_policy_dir_skips_hidden_yaml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        // .backup.yaml is hidden; same entity as eth0 — would conflict if loaded.
+        write_file(&dir, ".backup.yaml", "type: ethernet\nname: eth0\nmtu: 9000\n");
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 1);
+        assert!(policy_set.get("eth0").is_some());
+    }
+
+    #[test]
+    fn test_load_policy_dir_hidden_file_does_not_cause_duplicate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, ".backup.yaml", "type: ethernet\nname: eth0\nmtu: 9000\n");
+        // If the hidden file were loaded it would trigger a DuplicatePolicyName error.
+        let result = load_policy_dir(dir.path());
+        assert!(result.is_ok(), "hidden files must be skipped, not cause errors");
+    }
+
+    // ── Scenario: Unknown kind value produces an error ──────────────────────
+
+    #[test]
+    fn test_unknown_kind_value_returns_unknown_kind_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "bad.yaml", "kind: unknown\nname: something\n");
+        let result = load_policy_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), LoaderError::UnknownKind { .. }),
+            "expected UnknownKind error for 'kind: unknown'"
+        );
+    }
+
+    #[test]
+    fn test_unknown_kind_value_error_identifies_the_kind_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(&dir, "bad.yaml", "kind: unknown\nname: something\n");
+        match load_policy_file(&path).unwrap_err() {
+            LoaderError::UnknownKind { kind, .. } => {
+                assert_eq!(kind, "unknown");
+            }
+            other => panic!("expected UnknownKind, got {:?}", other),
+        }
+    }
+
+    // ── Additional edge cases ───────────────────────────────────────────────
+
+    /// Non-YAML files in a directory are silently skipped.
+    #[test]
+    fn test_load_policy_dir_skips_non_yaml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yaml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        write_file(&dir, "README.txt", "this is not a YAML policy file");
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 1);
+    }
+
+    /// Trailing `---` separators in a file produce null documents that are
+    /// silently skipped and do not affect document numbering.
+    #[test]
+    fn test_trailing_separator_skipped_single_doc_still_has_no_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            &dir,
+            "eth0.yaml",
+            "type: ethernet\nname: eth0\nmtu: 1500\n---\n",
+        );
+        let policies = load_policy_file(&path).unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].name, "eth0");
+    }
+
+    /// The `.yml` extension (not just `.yaml`) is processed by load_policy_dir.
+    #[test]
+    fn test_load_policy_dir_processes_yml_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir, "eth0.yml", "type: ethernet\nname: eth0\nmtu: 1500\n");
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert_eq!(policy_set.len(), 1);
+        assert!(policy_set.get("eth0").is_some());
+    }
+
+    /// An empty directory produces an empty PolicySet without error.
+    #[test]
+    fn test_load_policy_dir_empty_directory_returns_empty_policy_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_set = load_policy_dir(dir.path()).unwrap();
+        assert!(policy_set.is_empty());
     }
 }
