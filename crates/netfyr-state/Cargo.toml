@@ -10,3 +10,5 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 ipnetwork = { version = "0.20", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
+# Used to derive Error and Display for ConflictError without hand-rolling the impls.
+thiserror = "1"

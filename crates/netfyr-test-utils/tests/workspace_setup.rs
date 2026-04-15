@@ -294,30 +294,35 @@ fn test_binary_crates_have_correct_structure() {
     }
 }
 
-/// AC: No crate has extraneous files (src/ contains only the expected entry point).
+/// AC: No crate has extraneous files (src/ contains only the expected source files).
 #[test]
 fn test_no_extraneous_source_files_in_library_crates() {
     let root = workspace_root();
-    let library_crates = [
-        "netfyr-state",
-        "netfyr-reconcile",
-        "netfyr-backend",
-        "netfyr-policy",
-        "netfyr-varlink",
-        "netfyr-test-utils",
+
+    // Each entry is (crate_name, sorted list of expected source files).
+    // netfyr-state has set.rs and diff.rs in addition to lib.rs per SPEC-004.
+    let library_crates: &[(&str, &[&str])] = &[
+        ("netfyr-state", &["diff.rs", "lib.rs", "set.rs"]),
+        ("netfyr-reconcile", &["lib.rs"]),
+        ("netfyr-backend", &["lib.rs"]),
+        ("netfyr-policy", &["lib.rs"]),
+        ("netfyr-varlink", &["lib.rs"]),
+        ("netfyr-test-utils", &["lib.rs"]),
     ];
 
-    for name in &library_crates {
+    for (name, expected) in library_crates {
         let src_dir = root.join("crates").join(name).join("src");
-        let entries: Vec<_> = fs::read_dir(&src_dir)
+        let mut entries: Vec<String> = fs::read_dir(&src_dir)
             .unwrap_or_else(|e| panic!("{name}: cannot read src/: {e}"))
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
+        entries.sort();
+        let expected_strings: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
         assert_eq!(
             entries,
-            vec!["lib.rs"],
-            "{name}: src/ should contain only lib.rs, found: {entries:?}"
+            expected_strings,
+            "{name}: src/ should contain exactly {expected:?}, found: {entries:?}"
         );
     }
 }

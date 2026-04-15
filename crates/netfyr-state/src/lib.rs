@@ -1,5 +1,11 @@
 //! netfyr-state crate — foundational data model for network entity configuration.
 
+pub mod diff;
+pub mod set;
+
+pub use diff::{diff, DiffOp, StateDiff};
+pub use set::{complement, intersection, union, Conflict, ConflictError, StateSet};
+
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use ipnetwork::IpNetwork;
