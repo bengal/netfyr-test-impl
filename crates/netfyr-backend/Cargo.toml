@@ -11,8 +11,23 @@ netfyr-state = { path = "../netfyr-state" }
 async-trait = "0.1"
 # thiserror: ergonomic #[derive(Error)] for BackendError; already used in netfyr-state.
 thiserror = "1"
+# rtnetlink: safe async Rust bindings to Linux netlink protocol for link/address/route queries.
+# Cannot be replaced by std — netlink is Linux-specific.
+rtnetlink = "0.20"
+# netlink-packet-route: netlink message type definitions. Must match rtnetlink's transitive dep.
+netlink-packet-route = "0.28"
+# tokio: async runtime required by rtnetlink.
+tokio = { version = "1", features = ["rt", "net"] }
+# futures: StreamExt/TryStreamExt for consuming rtnetlink message streams.
+futures = "0.3"
+# tracing: structured logging for warnings on non-fatal attribute extraction failures.
+tracing = "0.1"
+# indexmap: ordered map for State fields; re-exported from netfyr-state but needed directly here.
+indexmap = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+netfyr-test-utils = { path = "../netfyr-test-utils" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 async-trait = "0.1"
 indexmap = "2"
+rtnetlink = "0.20"

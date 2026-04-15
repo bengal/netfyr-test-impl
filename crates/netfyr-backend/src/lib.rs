@@ -2,6 +2,7 @@
 //! and kernel I/O. Provides `NetworkBackend`, report types, `BackendError`, and
 //! `BackendRegistry`.
 
+pub mod netlink;
 pub mod registry;
 pub mod report;
 pub mod trait_;
@@ -11,6 +12,7 @@ pub use report::{
     AppliedOperation, ApplyReport, DiffOpKind, DryRunReport, FailedOperation, FieldChange,
     FieldChangeKind, PlannedChange, SkippedOperation,
 };
+pub use netlink::NetlinkBackend;
 pub use trait_::NetworkBackend;
 
 use netfyr_state::{EntityType, Selector};

@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# nix: Linux namespace syscalls (unshare, setns). Cannot be done with std.
+nix = { version = "0.30", features = ["sched", "user"] }
+# rtnetlink: for creating veth pairs and configuring interfaces in test namespaces.
+rtnetlink = "0.20"
+# netlink-packet-route: message types for rtnetlink (must match rtnetlink's dep).
+netlink-packet-route = "0.28"
+# tokio: async runtime for netlink operations.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# futures: stream processing for netlink responses.
+futures = "0.3"
