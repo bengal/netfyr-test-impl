@@ -273,6 +273,16 @@ fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError> {
     })
 }
 
+/// Parses a raw `serde_yaml::Value` (flat-format mapping) into a `State`.
+///
+/// This is the public interface to the flat-format parser. It accepts the same
+/// input as `parse_yaml` document-by-document. Used by `netfyr-policy` to
+/// convert embedded `state:` / `states:` sub-documents inside policy YAML into
+/// `State` values without re-serializing them to strings first.
+pub fn parse_state_value(raw: serde_yaml::Value) -> Result<State, YamlError> {
+    parse_raw_to_state(raw)
+}
+
 /// Parses a YAML string that may contain one or more `---`-separated documents.
 ///
 /// Each document must be a flat mapping with a required `type` key. Empty

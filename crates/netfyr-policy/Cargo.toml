@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+netfyr-state = { path = "../netfyr-state" }
+# serde + serde_yaml: FactoryType serialization/deserialization and raw YAML parsing
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+# thiserror: ergonomic error type definitions for FactoryError and PolicyError
+thiserror = "1"
+# tracing: logging in factory operations
+tracing = "0.1"
+# indexmap: PolicySet internal storage — preserves insertion order for deterministic iteration
+indexmap = { version = "2", features = ["serde"] }
