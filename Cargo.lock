@@ -829,6 +829,14 @@ version = "0.1.0"
 [[package]]
 name = "netfyr-daemon"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "netfyr-policy",
+ "netfyr-state",
+ "serde_yaml",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "netfyr-policy"

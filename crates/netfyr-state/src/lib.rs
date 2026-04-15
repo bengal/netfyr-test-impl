@@ -14,8 +14,8 @@ pub use schema::{
 };
 pub use set::{complement, intersection, union, Conflict, ConflictError, StateSet};
 pub use yaml::{
-    deserialize_value, parse_state_value, parse_yaml, serialize_value, state_to_yaml,
-    state_to_yaml_explicit, YamlError,
+    deserialize_value, parse_state_value, parse_yaml, serialize_state_to_value, serialize_value,
+    state_to_yaml, state_to_yaml_explicit, YamlError,
 };
 
 /// A string identifying a category of network entity (e.g., `"ethernet"`, `"bond"`, `"vlan"`).

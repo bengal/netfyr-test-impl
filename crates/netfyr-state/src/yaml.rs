@@ -305,7 +305,11 @@ pub fn parse_yaml(input: &str) -> Result<Vec<State>, YamlError> {
 // ── State serialization ───────────────────────────────────────────────────────
 
 /// Builds a flat `serde_yaml::Mapping` from a `State` (bare format, no `kind`).
-fn serialize_state_to_value(state: &State) -> serde_yaml::Value {
+///
+/// Public so that other crates (e.g., `netfyr-daemon`'s policy store) can embed
+/// flat-format state sub-documents inside policy YAML files without duplicating
+/// this serialization logic.
+pub fn serialize_state_to_value(state: &State) -> serde_yaml::Value {
     let mut map = serde_yaml::Mapping::new();
 
     map.insert(

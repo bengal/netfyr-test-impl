@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+netfyr-policy = { path = "../netfyr-policy" }
+netfyr-state = { path = "../netfyr-state" }
+# serde_yaml: YAML serialization for policy files on disk
+serde_yaml = "0.9"
+# anyhow: spec-mandated error handling for the daemon crate
+anyhow = "1"
+# tracing: structured logging for warnings on skipped/malformed files
+tracing = "0.1"
+
+[dev-dependencies]
+# tempfile: creates temporary directories for unit tests
+tempfile = "3"
