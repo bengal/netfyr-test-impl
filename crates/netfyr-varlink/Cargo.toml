@@ -4,3 +4,26 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Serialization for wire types and JSON encoding for the Varlink wire protocol.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Async Unix socket I/O and connection timeout. Already in the workspace dependency tree.
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+# Error enum derivation. Already in the workspace dependency tree.
+thiserror = "1"
+# Field map handling in type conversions.
+indexmap = { version = "2", features = ["serde"] }
+# Domain types for State, Selector, Value, StateSet, etc.
+netfyr-state = { path = "../netfyr-state" }
+# Domain types for Policy, FactoryType.
+netfyr-policy = { path = "../netfyr-policy" }
+# ApplyReport, AppliedOperation, FailedOperation, SkippedOperation, DiffOpKind.
+netfyr-backend = { path = "../netfyr-backend" }
+# StateDiff, DiffOperation, FieldChange, FieldChangeKind, DiffKind, ConflictReport.
+netfyr-reconcile = { path = "../netfyr-reconcile" }
+
+[dev-dependencies]
+# Temporary directories for Unix socket paths in client tests.
+tempfile = "3"
+# Async test harness and multi-thread runtime for client mock-server tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

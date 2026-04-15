@@ -310,7 +310,8 @@ fn test_no_extraneous_source_files_in_library_crates() {
         // SPEC-401 adds dhcp/ for the DHCPv4 factory implementation.
         ("netfyr-backend", &["dhcp", "lib.rs", "netlink", "registry.rs", "report.rs", "trait_.rs"]),
         ("netfyr-policy", &["lib.rs"]),
-        ("netfyr-varlink", &["lib.rs"]),
+        // SPEC-404 adds client.rs, io.netfyr.varlink, and types.rs for the Varlink IPC API.
+        ("netfyr-varlink", &["client.rs", "io.netfyr.varlink", "lib.rs", "types.rs"]),
         // SPEC-401 adds dnsmasq.rs for DHCPv4 integration test infrastructure.
         ("netfyr-test-utils", &["dnsmasq.rs", "lib.rs", "netns.rs"]),
     ];

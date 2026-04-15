@@ -1,0 +1,98 @@
+interface io.netfyr
+
+method SubmitPolicies(policies: []Policy) -> (report: ApplyReport)
+
+method Query(selector: ?Selector) -> (entities: []State)
+
+method DryRun(policies: []Policy) -> (diff: StateDiff)
+
+method GetStatus() -> (status: DaemonStatus)
+
+type Policy (
+    name: string,
+    factory: string,
+    priority: ?int,
+    selector: ?Selector,
+    state: ?StateDef,
+    states: ?[]StateDef
+)
+
+type Selector (
+    type: ?string,
+    name: ?string,
+    driver: ?string,
+    mac: ?string,
+    pci_path: ?string
+)
+
+type StateDef (
+    entity_type: string,
+    selector: Selector,
+    fields: object
+)
+
+type State (
+    entity_type: string,
+    selector: Selector,
+    fields: object
+)
+
+type ApplyReport (
+    succeeded: int,
+    failed: int,
+    skipped: int,
+    changes: []ChangeEntry,
+    conflicts: []ConflictEntry
+)
+
+type ChangeEntry (
+    kind: string,
+    entity_type: string,
+    entity_name: string,
+    description: string,
+    status: string
+)
+
+type ConflictEntry (
+    entity_type: string,
+    entity_name: string,
+    field_name: string,
+    policies: []string,
+    values: []string
+)
+
+type StateDiff (
+    operations: []DiffOperation
+)
+
+type DiffOperation (
+    kind: string,
+    entity_type: string,
+    entity_name: string,
+    field_changes: []FieldChange
+)
+
+type FieldChange (
+    field_name: string,
+    change_kind: string,
+    current: ?object,
+    desired: ?object
+)
+
+type DaemonStatus (
+    uptime_seconds: int,
+    active_policies: int,
+    running_factories: []FactoryStatus
+)
+
+type FactoryStatus (
+    policy_id: string,
+    factory_type: string,
+    interface_name: string,
+    state: string,
+    lease_ip: ?string
+)
+
+error InvalidPolicy (reason: string)
+error BackendError (reason: string)
+error InternalError (reason: string)

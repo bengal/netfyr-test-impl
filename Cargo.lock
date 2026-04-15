@@ -892,6 +892,18 @@ dependencies = [
 [[package]]
 name = "netfyr-varlink"
 version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "netfyr-backend",
+ "netfyr-policy",
+ "netfyr-reconcile",
+ "netfyr-state",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "netlink-packet-core"
@@ -1528,6 +1540,7 @@ version = "1.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
