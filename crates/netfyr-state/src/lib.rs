@@ -13,6 +13,13 @@ pub use yaml::{
     YamlError,
 };
 
+/// A string identifying a category of network entity (e.g., `"ethernet"`, `"bond"`, `"vlan"`).
+///
+/// Type alias for `String` — zero-cost and fully compatible with all existing code
+/// that uses `String` for entity types. Can be upgraded to a newtype in a future story
+/// if stronger type safety is needed across crate boundaries.
+pub type EntityType = String;
+
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use ipnetwork::IpNetwork;

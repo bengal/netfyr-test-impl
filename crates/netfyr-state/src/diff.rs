@@ -45,6 +45,14 @@ pub struct StateDiff {
 }
 
 impl StateDiff {
+    /// Constructs a `StateDiff` from a pre-built ops vector.
+    ///
+    /// Used by dispatch layers (e.g., `BackendRegistry`) that partition a diff by entity
+    /// type and need to construct per-backend sub-diffs.
+    pub fn new(ops: Vec<DiffOp>) -> Self {
+        Self { ops }
+    }
+
     /// Returns the list of operations as a slice.
     pub fn ops(&self) -> &[DiffOp] {
         &self.ops
@@ -72,6 +80,26 @@ impl StateDiff {
         }
 
         format!("{added} added, {modified} modified, {removed} removed")
+    }
+}
+
+impl DiffOp {
+    /// Returns a reference to the entity type for any variant.
+    pub fn entity_type(&self) -> &str {
+        match self {
+            DiffOp::Add { entity_type, .. }
+            | DiffOp::Modify { entity_type, .. }
+            | DiffOp::Remove { entity_type, .. } => entity_type,
+        }
+    }
+
+    /// Returns a reference to the selector for any variant.
+    pub fn selector(&self) -> &Selector {
+        match self {
+            DiffOp::Add { selector, .. }
+            | DiffOp::Modify { selector, .. }
+            | DiffOp::Remove { selector, .. } => selector,
+        }
     }
 }
 

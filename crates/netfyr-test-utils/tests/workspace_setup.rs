@@ -305,7 +305,7 @@ fn test_no_extraneous_source_files_in_library_crates() {
     let library_crates: &[(&str, &[&str])] = &[
         ("netfyr-state", &["diff.rs", "lib.rs", "loader.rs", "set.rs", "yaml.rs"]),
         ("netfyr-reconcile", &["lib.rs"]),
-        ("netfyr-backend", &["lib.rs"]),
+        ("netfyr-backend", &["lib.rs", "registry.rs", "report.rs", "trait_.rs"]),
         ("netfyr-policy", &["lib.rs"]),
         ("netfyr-varlink", &["lib.rs"]),
         ("netfyr-test-utils", &["lib.rs"]),

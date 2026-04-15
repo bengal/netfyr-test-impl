@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+netfyr-state = { path = "../netfyr-state" }
+# async-trait: required for object-safe async trait methods. Rust's native
+# async fn in traits (stable since 1.75) does not support `dyn Trait` — async-trait
+# boxes the futures to enable trait objects.
+async-trait = "0.1"
+# thiserror: ergonomic #[derive(Error)] for BackendError; already used in netfyr-state.
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+async-trait = "0.1"
+indexmap = "2"
