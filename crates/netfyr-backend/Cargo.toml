@@ -16,14 +16,26 @@ thiserror = "1"
 rtnetlink = "0.20"
 # netlink-packet-route: netlink message type definitions. Must match rtnetlink's transitive dep.
 netlink-packet-route = "0.28"
-# tokio: async runtime required by rtnetlink.
-tokio = { version = "1", features = ["rt", "net"] }
+# tokio: async runtime required by rtnetlink and the DHCP client background task.
+# "sync" is needed for mpsc/oneshot channels; "time" for DHCP lease timers.
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 # futures: StreamExt/TryStreamExt for consuming rtnetlink message streams.
 futures = "0.3"
 # tracing: structured logging for warnings on non-fatal attribute extraction failures.
 tracing = "0.1"
 # indexmap: ordered map for State fields; re-exported from netfyr-state but needed directly here.
 indexmap = "2"
+# dhcproto: DHCPv4 message encoding/decoding. The RFC 2131 option format is complex
+# (~50 option types, variable-length encoding). Implementing from scratch would be
+# ~500+ lines of error-prone code.
+dhcproto = "0.14"
+# rand: generate random 4-byte XID (transaction ID) for DHCP messages as required by
+# RFC 2131 Section 4.1. std has no random number generation.
+rand = "0.9"
+# socket2: set SO_BINDTODEVICE and SO_BROADCAST socket options before converting to
+# tokio::net::UdpSocket. tokio's UdpSocket does not expose SO_BINDTODEVICE.
+# socket2: "all" feature enables bind_device (SO_BINDTODEVICE) on Linux.
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 netfyr-test-utils = { path = "../netfyr-test-utils" }

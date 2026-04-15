@@ -307,10 +307,12 @@ fn test_no_extraneous_source_files_in_library_crates() {
         ("netfyr-state", &["diff.rs", "lib.rs", "loader.rs", "schema.rs", "schemas", "set.rs", "yaml.rs"]),
         // SPEC-203 adds diff.rs and report.rs for diff generation.
         ("netfyr-reconcile", &["diff.rs", "lib.rs", "report.rs"]),
-        ("netfyr-backend", &["lib.rs", "netlink", "registry.rs", "report.rs", "trait_.rs"]),
+        // SPEC-401 adds dhcp/ for the DHCPv4 factory implementation.
+        ("netfyr-backend", &["dhcp", "lib.rs", "netlink", "registry.rs", "report.rs", "trait_.rs"]),
         ("netfyr-policy", &["lib.rs"]),
         ("netfyr-varlink", &["lib.rs"]),
-        ("netfyr-test-utils", &["lib.rs", "netns.rs"]),
+        // SPEC-401 adds dnsmasq.rs for DHCPv4 integration test infrastructure.
+        ("netfyr-test-utils", &["dnsmasq.rs", "lib.rs", "netns.rs"]),
     ];
 
     for (name, expected) in library_crates {

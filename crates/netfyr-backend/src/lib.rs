@@ -2,11 +2,13 @@
 //! and kernel I/O. Provides `NetworkBackend`, report types, `BackendError`, and
 //! `BackendRegistry`.
 
+pub mod dhcp;
 pub mod netlink;
 pub mod registry;
 pub mod report;
 pub mod trait_;
 
+pub use dhcp::{lease_to_state, Dhcpv4Factory, DhcpLease, FactoryEvent};
 pub use registry::BackendRegistry;
 pub use report::{
     AppliedOperation, ApplyReport, DiffOpKind, DryRunReport, FailedOperation, FieldChange,
