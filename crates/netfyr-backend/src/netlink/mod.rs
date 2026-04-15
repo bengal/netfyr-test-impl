@@ -3,6 +3,7 @@
 //! Provides `NetlinkBackend`, which queries and applies changes to kernel
 //! networking state via the `rtnetlink` crate.
 
+pub mod apply;
 pub mod ethernet;
 pub mod query;
 
@@ -71,11 +72,13 @@ impl NetworkBackend for NetlinkBackend {
         Ok(merged)
     }
 
-    async fn apply(&self, _diff: &StateDiff) -> Result<ApplyReport, BackendError> {
-        Err(BackendError::Internal("apply not implemented".to_string()))
+    async fn apply(&self, diff: &StateDiff) -> Result<ApplyReport, BackendError> {
+        let handle = establish_connection().await?;
+        apply::apply_ethernet(&handle, diff).await
     }
 
-    async fn dry_run(&self, _diff: &StateDiff) -> Result<DryRunReport, BackendError> {
-        Err(BackendError::Internal("dry_run not implemented".to_string()))
+    async fn dry_run(&self, diff: &StateDiff) -> Result<DryRunReport, BackendError> {
+        let handle = establish_connection().await?;
+        apply::dry_run_ethernet(&handle, diff).await
     }
 }

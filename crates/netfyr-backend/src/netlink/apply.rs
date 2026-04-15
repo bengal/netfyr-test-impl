@@ -1,0 +1,1211 @@
+//! Apply and dry-run logic for ethernet interfaces via rtnetlink.
+//!
+//! Translates `StateDiff` operations into netlink requests that modify running
+//! kernel networking state. Each operation is executed independently; errors are
+//! captured in the report rather than propagated (continue-and-report mode).
+
+use std::net::IpAddr;
+
+use futures::TryStreamExt;
+use indexmap::IndexMap;
+use netfyr_state::{DiffOp, FieldValue, Selector, State, StateDiff, Value};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
+use tracing::warn;
+
+use crate::report::{
+    AppliedOperation, ApplyReport, DiffOpKind, DryRunReport, FailedOperation, FieldChange,
+    FieldChangeKind, PlannedChange, SkippedOperation,
+};
+use crate::BackendError;
+
+use super::ethernet::query_ethernet;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Fields reported by the query layer that cannot be set via netlink.
+const READONLY_FIELDS: &[&str] = &["carrier", "speed", "mac", "driver", "name"];
+
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Apply all ethernet operations in `diff` to the running kernel state.
+///
+/// Never returns `Err` — all per-operation errors are captured in the report.
+pub async fn apply_ethernet(
+    handle: &Handle,
+    diff: &StateDiff,
+) -> Result<ApplyReport, BackendError> {
+    let mut report = ApplyReport::new();
+
+    for op in diff.ops() {
+        if op.entity_type() != "ethernet" {
+            continue;
+        }
+        let (applied, failed, skipped) = apply_one_op(handle, op).await;
+        report.succeeded.extend(applied);
+        report.failed.extend(failed);
+        report.skipped.extend(skipped);
+    }
+
+    Ok(report)
+}
+
+/// Simulate applying `diff` without modifying kernel state.
+///
+/// Queries current interface state to build before/after `PlannedChange` entries.
+/// Operations on non-existent interfaces are added to `report.skipped`.
+pub async fn dry_run_ethernet(
+    handle: &Handle,
+    diff: &StateDiff,
+) -> Result<DryRunReport, BackendError> {
+    let mut report = DryRunReport::new();
+
+    for op in diff.ops() {
+        if op.entity_type() != "ethernet" {
+            continue;
+        }
+
+        let selector = op.selector();
+        let name = match selector.name.as_deref() {
+            Some(n) => n,
+            None => {
+                report.skipped.push(SkippedOperation {
+                    operation: DiffOpKind::from(op),
+                    entity_type: op.entity_type().to_string(),
+                    selector: selector.clone(),
+                    reason: "selector has no name".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let current_state = match get_current_state(handle, name).await {
+            Ok(s) => s,
+            Err(BackendError::NotFound { .. }) => {
+                report.skipped.push(SkippedOperation {
+                    operation: DiffOpKind::from(op),
+                    entity_type: op.entity_type().to_string(),
+                    selector: selector.clone(),
+                    reason: format!("interface not found: {name}"),
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        let field_changes = build_planned_changes(op, &current_state);
+        report.changes.push(PlannedChange {
+            operation: DiffOpKind::from(op),
+            entity_type: op.entity_type().to_string(),
+            selector: selector.clone(),
+            field_changes,
+        });
+    }
+
+    Ok(report)
+}
+
+// ── Operation dispatch ────────────────────────────────────────────────────────
+
+async fn apply_one_op(
+    handle: &Handle,
+    op: &DiffOp,
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    match op {
+        DiffOp::Add {
+            entity_type,
+            selector,
+            fields,
+        } => apply_add(handle, entity_type, selector, fields).await,
+        DiffOp::Modify {
+            entity_type,
+            selector,
+            changed_fields,
+            removed_fields,
+        } => apply_modify(handle, entity_type, selector, changed_fields, removed_fields).await,
+        DiffOp::Remove {
+            entity_type,
+            selector,
+        } => apply_remove(handle, entity_type, selector).await,
+    }
+}
+
+// ── Per-kind apply functions ──────────────────────────────────────────────────
+
+async fn apply_add(
+    handle: &Handle,
+    entity_type: &str,
+    selector: &Selector,
+    fields: &IndexMap<String, FieldValue>,
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    let name = match selector.name.as_deref() {
+        Some(n) => n,
+        None => {
+            return fail_op(
+                DiffOpKind::Add,
+                entity_type,
+                selector,
+                BackendError::Internal("selector has no name".to_string()),
+                fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    // Physical ethernet interfaces cannot be created — they must already exist.
+    let index = match resolve_link_index(handle, name).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Add,
+                entity_type,
+                selector,
+                e,
+                fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    let current_state = match get_current_state(handle, name).await {
+        Ok(s) => s,
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Add,
+                entity_type,
+                selector,
+                e,
+                fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    let (fields_changed, mut failures, skipped) =
+        apply_modify_fields(handle, index, name, &current_state, fields, &[]).await;
+
+    if failures.is_empty() {
+        (
+            vec![AppliedOperation {
+                operation: DiffOpKind::Add,
+                entity_type: entity_type.to_string(),
+                selector: selector.clone(),
+                fields_changed,
+            }],
+            failures,
+            skipped,
+        )
+    } else {
+        let first = failures.remove(0);
+        (
+            vec![],
+            vec![FailedOperation {
+                operation: DiffOpKind::Add,
+                entity_type: entity_type.to_string(),
+                selector: selector.clone(),
+                error: first.error,
+                fields: fields.keys().cloned().collect(),
+            }],
+            skipped,
+        )
+    }
+}
+
+async fn apply_modify(
+    handle: &Handle,
+    entity_type: &str,
+    selector: &Selector,
+    changed_fields: &IndexMap<String, FieldValue>,
+    removed_fields: &[String],
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    let name = match selector.name.as_deref() {
+        Some(n) => n,
+        None => {
+            return fail_op(
+                DiffOpKind::Modify,
+                entity_type,
+                selector,
+                BackendError::Internal("selector has no name".to_string()),
+                changed_fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    let index = match resolve_link_index(handle, name).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Modify,
+                entity_type,
+                selector,
+                e,
+                changed_fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    let current_state = match get_current_state(handle, name).await {
+        Ok(s) => s,
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Modify,
+                entity_type,
+                selector,
+                e,
+                changed_fields.keys().cloned().collect(),
+            );
+        }
+    };
+
+    let (fields_changed, mut failures, skipped) =
+        apply_modify_fields(handle, index, name, &current_state, changed_fields, removed_fields)
+            .await;
+
+    if failures.is_empty() {
+        (
+            vec![AppliedOperation {
+                operation: DiffOpKind::Modify,
+                entity_type: entity_type.to_string(),
+                selector: selector.clone(),
+                fields_changed,
+            }],
+            failures,
+            skipped,
+        )
+    } else {
+        let first = failures.remove(0);
+        (
+            vec![],
+            vec![FailedOperation {
+                operation: DiffOpKind::Modify,
+                entity_type: entity_type.to_string(),
+                selector: selector.clone(),
+                error: first.error,
+                fields: changed_fields.keys().cloned().collect(),
+            }],
+            skipped,
+        )
+    }
+}
+
+async fn apply_remove(
+    handle: &Handle,
+    entity_type: &str,
+    selector: &Selector,
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    let name = match selector.name.as_deref() {
+        Some(n) => n,
+        None => {
+            return fail_op(
+                DiffOpKind::Remove,
+                entity_type,
+                selector,
+                BackendError::Internal("selector has no name".to_string()),
+                vec![],
+            );
+        }
+    };
+
+    let index = match resolve_link_index(handle, name).await {
+        Ok(idx) => idx,
+        Err(e) => return fail_op(DiffOpKind::Remove, entity_type, selector, e, vec![]),
+    };
+
+    let mut fields_changed: Vec<String> = vec![];
+
+    // Remove all addresses first.
+    match query_address_messages(handle, index).await {
+        Ok(msgs) => {
+            for msg in msgs {
+                match handle.address().del(msg).execute().await {
+                    Ok(()) => fields_changed.push("addresses".to_string()),
+                    Err(ref e) if is_not_found_error(e) => {} // already gone
+                    Err(e) => {
+                        warn!("Failed to delete address on {name}: {e}");
+                        return fail_op(
+                            DiffOpKind::Remove,
+                            entity_type,
+                            selector,
+                            map_netlink_error(e, &format!("del address on {name}")),
+                            vec!["addresses".to_string()],
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Remove,
+                entity_type,
+                selector,
+                e,
+                vec!["addresses".to_string()],
+            )
+        }
+    }
+
+    // Remove all routes associated with the interface.
+    match query_route_messages(handle, index).await {
+        Ok(msgs) => {
+            for msg in msgs {
+                match handle.route().del(msg).execute().await {
+                    Ok(()) => fields_changed.push("routes".to_string()),
+                    Err(ref e) if is_not_found_error(e) => {} // already gone
+                    Err(e) => {
+                        warn!("Failed to delete route on {name}: {e}");
+                        return fail_op(
+                            DiffOpKind::Remove,
+                            entity_type,
+                            selector,
+                            map_netlink_error(e, &format!("del route on {name}")),
+                            vec!["routes".to_string()],
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Remove,
+                entity_type,
+                selector,
+                e,
+                vec!["routes".to_string()],
+            )
+        }
+    }
+
+    // Set link down. Physical interfaces are never deleted from the system.
+    match handle
+        .link()
+        .change(LinkUnspec::new_with_index(index).down().build())
+        .execute()
+        .await
+    {
+        Ok(()) => fields_changed.push("operstate".to_string()),
+        Err(e) => {
+            return fail_op(
+                DiffOpKind::Remove,
+                entity_type,
+                selector,
+                map_netlink_error(e, &format!("set link down on {name}")),
+                vec!["operstate".to_string()],
+            );
+        }
+    }
+
+    fields_changed.dedup();
+    (
+        vec![AppliedOperation {
+            operation: DiffOpKind::Remove,
+            entity_type: entity_type.to_string(),
+            selector: selector.clone(),
+            fields_changed,
+        }],
+        vec![],
+        vec![],
+    )
+}
+
+// ── Core field-application engine ─────────────────────────────────────────────
+
+/// Apply field changes to an interface. Returns `(fields_changed, failures, skipped)`.
+///
+/// Field changes are applied in prescribed order:
+/// 1. Link-level (mtu, operstate)
+/// 2. Addresses (add before remove to avoid transient address loss)
+/// 3. Routes
+///
+/// Read-only fields produce `SkippedOperation` entries. Errors are collected and
+/// do not abort remaining field changes within the same operation.
+async fn apply_modify_fields(
+    handle: &Handle,
+    index: u32,
+    name: &str,
+    current_state: &State,
+    changed_fields: &IndexMap<String, FieldValue>,
+    removed_fields: &[String],
+) -> (Vec<String>, Vec<FailedOperation>, Vec<SkippedOperation>) {
+    let mut fields_changed: Vec<String> = vec![];
+    let mut failures: Vec<FailedOperation> = vec![];
+    let mut skipped: Vec<SkippedOperation> = vec![];
+
+    // Emit a skip entry for every read-only field that appears in the diff.
+    for field_name in changed_fields.keys().chain(removed_fields.iter()) {
+        if READONLY_FIELDS.contains(&field_name.as_str()) {
+            skipped.push(SkippedOperation {
+                operation: DiffOpKind::Modify,
+                entity_type: "ethernet".to_string(),
+                selector: Selector::with_name(name),
+                reason: "read-only field".to_string(),
+            });
+        }
+    }
+
+    // ── Phase 1: Link-level ───────────────────────────────────────────────────
+
+    if let Some(fv) = changed_fields.get("mtu") {
+        if let Some(desired) = fv.value.as_u64() {
+            let current = current_state
+                .fields
+                .get("mtu")
+                .and_then(|f| f.value.as_u64())
+                .unwrap_or(0);
+            if desired == current {
+                skipped.push(SkippedOperation {
+                    operation: DiffOpKind::Modify,
+                    entity_type: "ethernet".to_string(),
+                    selector: Selector::with_name(name),
+                    reason: format!("mtu already at desired value ({desired})"),
+                });
+            } else {
+                match handle
+                    .link()
+                    .change(
+                        LinkUnspec::new_with_index(index)
+                            .mtu(desired as u32)
+                            .build(),
+                    )
+                    .execute()
+                    .await
+                {
+                    Ok(()) => fields_changed.push("mtu".to_string()),
+                    Err(e) => failures.push(make_field_failure(
+                        name,
+                        map_netlink_error(e, &format!("set mtu on {name}")),
+                        "mtu",
+                    )),
+                }
+            }
+        }
+    }
+
+    if let Some(fv) = changed_fields.get("operstate") {
+        if let Some(desired) = fv.value.as_str() {
+            match desired {
+                "up" => {
+                    match handle
+                        .link()
+                        .change(LinkUnspec::new_with_index(index).up().build())
+                        .execute()
+                        .await
+                    {
+                        Ok(()) => fields_changed.push("operstate".to_string()),
+                        Err(e) => failures.push(make_field_failure(
+                            name,
+                            map_netlink_error(e, &format!("set link up on {name}")),
+                            "operstate",
+                        )),
+                    }
+                }
+                "down" => {
+                    match handle
+                        .link()
+                        .change(LinkUnspec::new_with_index(index).down().build())
+                        .execute()
+                        .await
+                    {
+                        Ok(()) => fields_changed.push("operstate".to_string()),
+                        Err(e) => failures.push(make_field_failure(
+                            name,
+                            map_netlink_error(e, &format!("set link down on {name}")),
+                            "operstate",
+                        )),
+                    }
+                }
+                other => {
+                    skipped.push(SkippedOperation {
+                        operation: DiffOpKind::Modify,
+                        entity_type: "ethernet".to_string(),
+                        selector: Selector::with_name(name),
+                        reason: format!("cannot set operstate to {other}"),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Phase 2: Addresses ────────────────────────────────────────────────────
+
+    let addr_in_changed = changed_fields.contains_key("addresses");
+    let addr_in_removed = removed_fields.iter().any(|f| f == "addresses");
+
+    if addr_in_changed || addr_in_removed {
+        // Full desired address list; empty when field is being removed.
+        let desired_addrs: Vec<String> = if let Some(fv) = changed_fields.get("addresses") {
+            fv.value
+                .as_list()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let current_addrs: Vec<String> = current_state
+            .fields
+            .get("addresses")
+            .and_then(|fv| fv.value.as_list())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let to_add: Vec<&String> = desired_addrs
+            .iter()
+            .filter(|a| !current_addrs.contains(a))
+            .collect();
+        let to_remove: Vec<&String> = current_addrs
+            .iter()
+            .filter(|a| !desired_addrs.contains(a))
+            .collect();
+
+        // Add new addresses first (to avoid transient loss of all addresses).
+        for cidr in &to_add {
+            match parse_cidr(cidr) {
+                Ok((ip, prefix)) => {
+                    match handle.address().add(index, ip, prefix).execute().await {
+                        Ok(()) => fields_changed.push("addresses".to_string()),
+                        Err(ref e) if is_eexist(e) => {
+                            skipped.push(SkippedOperation {
+                                operation: DiffOpKind::Modify,
+                                entity_type: "ethernet".to_string(),
+                                selector: Selector::with_name(name),
+                                reason: format!("address {cidr} already present"),
+                            });
+                        }
+                        Err(e) => failures.push(make_field_failure(
+                            name,
+                            map_netlink_error(e, &format!("add address {cidr} on {name}")),
+                            "addresses",
+                        )),
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, "addresses")),
+            }
+        }
+
+        // Then remove unwanted addresses.
+        if !to_remove.is_empty() {
+            match query_address_messages(handle, index).await {
+                Ok(msgs) => {
+                    for cidr in &to_remove {
+                        match parse_cidr(cidr) {
+                            Ok((ip, prefix)) => {
+                                match find_address_message(&msgs, ip, prefix) {
+                                    Some(msg) => {
+                                        match handle
+                                            .address()
+                                            .del(msg.clone())
+                                            .execute()
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                fields_changed.push("addresses".to_string())
+                                            }
+                                            Err(ref e) if is_not_found_error(e) => {
+                                                skipped.push(SkippedOperation {
+                                                    operation: DiffOpKind::Modify,
+                                                    entity_type: "ethernet".to_string(),
+                                                    selector: Selector::with_name(name),
+                                                    reason: format!(
+                                                        "address {cidr} not present"
+                                                    ),
+                                                });
+                                            }
+                                            Err(e) => failures.push(make_field_failure(
+                                                name,
+                                                map_netlink_error(
+                                                    e,
+                                                    &format!("del address {cidr} on {name}"),
+                                                ),
+                                                "addresses",
+                                            )),
+                                        }
+                                    }
+                                    None => {
+                                        skipped.push(SkippedOperation {
+                                            operation: DiffOpKind::Modify,
+                                            entity_type: "ethernet".to_string(),
+                                            selector: Selector::with_name(name),
+                                            reason: format!("address {cidr} not present"),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => failures.push(make_field_failure(name, e, "addresses")),
+                        }
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, "addresses")),
+            }
+        }
+    }
+
+    // ── Phase 3: Routes ───────────────────────────────────────────────────────
+
+    let route_in_changed = changed_fields.contains_key("routes");
+    let route_in_removed = removed_fields.iter().any(|f| f == "routes");
+
+    if route_in_changed || route_in_removed {
+        // Full desired route list; empty when field is being removed.
+        let desired_routes: Vec<Value> = if let Some(fv) = changed_fields.get("routes") {
+            fv.value.as_list().cloned().unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let current_routes: Vec<Value> = current_state
+            .fields
+            .get("routes")
+            .and_then(|fv| fv.value.as_list())
+            .cloned()
+            .unwrap_or_default();
+
+        let to_add: Vec<&Value> = desired_routes
+            .iter()
+            .filter(|r| !current_routes.contains(r))
+            .collect();
+        let to_remove: Vec<&Value> = current_routes
+            .iter()
+            .filter(|r| !desired_routes.contains(r))
+            .collect();
+
+        // Add new routes.
+        for route_val in &to_add {
+            if let Some(map) = route_val.as_map() {
+                match extract_route_fields(map) {
+                    Ok((dst_ip, dst_prefix, gateway)) => {
+                        match add_route(handle, index, dst_ip, dst_prefix, gateway).await {
+                            Ok(()) => fields_changed.push("routes".to_string()),
+                            Err(ref e) if is_eexist_backend(e) => {
+                                skipped.push(SkippedOperation {
+                                    operation: DiffOpKind::Modify,
+                                    entity_type: "ethernet".to_string(),
+                                    selector: Selector::with_name(name),
+                                    reason: format!(
+                                        "route {dst_ip}/{dst_prefix} already present"
+                                    ),
+                                });
+                            }
+                            Err(e) => failures.push(make_field_failure(name, e, "routes")),
+                        }
+                    }
+                    Err(e) => failures.push(make_field_failure(name, e, "routes")),
+                }
+            }
+        }
+
+        // Remove unwanted routes.
+        if !to_remove.is_empty() {
+            match query_route_messages(handle, index).await {
+                Ok(route_msgs) => {
+                    for route_val in &to_remove {
+                        if let Some(map) = route_val.as_map() {
+                            match extract_route_fields(map) {
+                                Ok((dst_ip, dst_prefix, gateway)) => {
+                                    match find_route_message(
+                                        &route_msgs,
+                                        dst_ip,
+                                        dst_prefix,
+                                        gateway,
+                                    ) {
+                                        Some(msg) => {
+                                            match handle
+                                                .route()
+                                                .del(msg.clone())
+                                                .execute()
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    fields_changed.push("routes".to_string())
+                                                }
+                                                Err(ref e) if is_not_found_error(e) => {
+                                                    skipped.push(SkippedOperation {
+                                                        operation: DiffOpKind::Modify,
+                                                        entity_type: "ethernet".to_string(),
+                                                        selector: Selector::with_name(name),
+                                                        reason: format!(
+                                                            "route {dst_ip}/{dst_prefix} not present"
+                                                        ),
+                                                    });
+                                                }
+                                                Err(e) => failures.push(make_field_failure(
+                                                    name,
+                                                    map_netlink_error(
+                                                        e,
+                                                        &format!("del route on {name}"),
+                                                    ),
+                                                    "routes",
+                                                )),
+                                            }
+                                        }
+                                        None => {
+                                            skipped.push(SkippedOperation {
+                                                operation: DiffOpKind::Modify,
+                                                entity_type: "ethernet".to_string(),
+                                                selector: Selector::with_name(name),
+                                                reason: format!(
+                                                    "route {dst_ip}/{dst_prefix} not present"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) => failures.push(make_field_failure(name, e, "routes")),
+                            }
+                        }
+                    }
+                }
+                Err(e) => failures.push(make_field_failure(name, e, "routes")),
+            }
+        }
+    }
+
+    fields_changed.dedup();
+    (fields_changed, failures, skipped)
+}
+
+// ── Netlink query helpers ─────────────────────────────────────────────────────
+
+/// Resolve a link name to its kernel interface index.
+async fn resolve_link_index(handle: &Handle, name: &str) -> Result<u32, BackendError> {
+    let mut stream = handle
+        .link()
+        .get()
+        .match_name(name.to_string())
+        .execute();
+    if let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(|e| BackendError::QueryFailed {
+            entity_type: "ethernet".to_string(),
+            source: Box::new(e),
+        })?
+    {
+        return Ok(msg.header.index);
+    }
+    Err(BackendError::NotFound {
+        entity_type: "ethernet".to_string(),
+        selector: Box::new(Selector::with_name(name)),
+    })
+}
+
+/// Query the current `State` for a named interface (for delta computation).
+async fn get_current_state(handle: &Handle, name: &str) -> Result<State, BackendError> {
+    let sel = Selector::with_name(name);
+    let state_set = query_ethernet(handle, Some(&sel)).await?;
+    // Collect the first state before `state_set` is dropped.
+    let first = state_set.iter().next().cloned();
+    first.ok_or_else(|| BackendError::NotFound {
+        entity_type: "ethernet".to_string(),
+        selector: Box::new(sel),
+    })
+}
+
+/// Return all `AddressMessage` objects for the given interface index.
+async fn query_address_messages(
+    handle: &Handle,
+    index: u32,
+) -> Result<Vec<AddressMessage>, BackendError> {
+    let mut msgs = Vec::new();
+    let mut stream = handle.address().get().execute();
+    while let Some(msg) = stream
+        .try_next()
+        .await
+        .map_err(|e| BackendError::QueryFailed {
+            entity_type: "ethernet".to_string(),
+            source: Box::new(e),
+        })?
+    {
+        if msg.header.index == index {
+            msgs.push(msg);
+        }
+    }
+    Ok(msgs)
+}
+
+/// Return all `RouteMessage` objects whose output interface matches `index`.
+async fn query_route_messages(
+    handle: &Handle,
+    index: u32,
+) -> Result<Vec<RouteMessage>, BackendError> {
+    let mut msgs = Vec::new();
+
+    for ip_version in [IpVersion::V4, IpVersion::V6] {
+        let mut route_msg = RouteMessage::default();
+        route_msg.header.address_family = match ip_version {
+            IpVersion::V4 => netlink_packet_route::AddressFamily::Inet,
+            IpVersion::V6 => netlink_packet_route::AddressFamily::Inet6,
+        };
+
+        let mut stream = handle.route().get(route_msg).execute();
+        while let Some(msg) = stream
+            .try_next()
+            .await
+            .map_err(|e| BackendError::QueryFailed {
+                entity_type: "ethernet".to_string(),
+                source: Box::new(e),
+            })?
+        {
+            let oif = msg.attributes.iter().find_map(|attr| {
+                if let RouteAttribute::Oif(idx) = attr {
+                    Some(*idx)
+                } else {
+                    None
+                }
+            });
+            if oif == Some(index) {
+                msgs.push(msg);
+            }
+        }
+    }
+
+    Ok(msgs)
+}
+
+// ── Message matching helpers ──────────────────────────────────────────────────
+
+/// Find an `AddressMessage` matching the given IP and prefix length.
+///
+/// String-based comparison handles both IPv4 and IPv6 inner types generically.
+fn find_address_message(
+    messages: &[AddressMessage],
+    ip: IpAddr,
+    prefix: u8,
+) -> Option<&AddressMessage> {
+    let ip_str = ip.to_string();
+    messages.iter().find(|msg| {
+        if msg.header.prefix_len != prefix {
+            return false;
+        }
+        msg.attributes.iter().any(|attr| {
+            if let AddressAttribute::Address(a) = attr {
+                format!("{a}") == ip_str
+            } else {
+                false
+            }
+        })
+    })
+}
+
+/// Find a `RouteMessage` matching destination prefix and optional gateway.
+fn find_route_message(
+    messages: &[RouteMessage],
+    dst_ip: IpAddr,
+    dst_prefix: u8,
+    gateway: Option<IpAddr>,
+) -> Option<&RouteMessage> {
+    let dst_str = dst_ip.to_string();
+    let gw_str = gateway.map(|g| g.to_string());
+
+    messages.iter().find(|msg| {
+        if msg.header.destination_prefix_length != dst_prefix {
+            return false;
+        }
+
+        let msg_dst = msg.attributes.iter().find_map(|attr| {
+            if let RouteAttribute::Destination(addr) = attr {
+                route_address_to_string(addr)
+            } else {
+                None
+            }
+        });
+
+        // No explicit Destination attribute → default route (0.0.0.0/0 or ::/0).
+        let dst_matches = match msg_dst {
+            Some(ref s) => s == &dst_str,
+            None => match dst_ip {
+                IpAddr::V4(v4) => v4.is_unspecified(),
+                IpAddr::V6(v6) => v6.is_unspecified(),
+            },
+        };
+        if !dst_matches {
+            return false;
+        }
+
+        let msg_gw = msg.attributes.iter().find_map(|attr| {
+            if let RouteAttribute::Gateway(addr) = attr {
+                route_address_to_string(addr)
+            } else {
+                None
+            }
+        });
+
+        match (gw_str.as_deref(), msg_gw.as_deref()) {
+            (Some(gw), Some(mg)) => gw == mg,
+            (None, None) => true,
+            _ => false,
+        }
+    })
+}
+
+fn route_address_to_string(addr: &RouteAddress) -> Option<String> {
+    match addr {
+        RouteAddress::Inet(v4) => Some(v4.to_string()),
+        RouteAddress::Inet6(v6) => Some(v6.to_string()),
+        _ => None,
+    }
+}
+
+// ── Route add ─────────────────────────────────────────────────────────────────
+
+/// Issue a netlink route-add for the given destination/gateway/OIF.
+///
+/// Uses `RouteMessageBuilder<IpAddr>` (rtnetlink 0.20) which sets the correct
+/// defaults: RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_UNIVERSE, RTN_UNICAST.
+async fn add_route(
+    handle: &Handle,
+    index: u32,
+    dst_ip: IpAddr,
+    dst_prefix: u8,
+    gateway: Option<IpAddr>,
+) -> Result<(), BackendError> {
+    // Build the route message with correct kernel-required header fields.
+    let builder = RouteMessageBuilder::<IpAddr>::new();
+
+    // Set destination prefix (required even for default route 0.0.0.0/0).
+    let builder = builder
+        .destination_prefix(dst_ip, dst_prefix)
+        .map_err(|e| BackendError::Internal(format!("invalid route destination: {e}")))?;
+
+    // Set optional gateway.
+    let builder = if let Some(gw) = gateway {
+        builder
+            .gateway(gw)
+            .map_err(|e| BackendError::Internal(format!("invalid route gateway: {e}")))?
+    } else {
+        builder
+    };
+
+    let msg = builder.output_interface(index).build();
+
+    handle
+        .route()
+        .add(msg)
+        .execute()
+        .await
+        .map_err(|e| map_netlink_error(e, &format!("add route via index {index}")))
+}
+
+// ── Error classification ──────────────────────────────────────────────────────
+
+/// Extract the positive errno from an rtnetlink error, if present.
+///
+/// `ErrorMessage.code` is `Option<NonZeroI32>` where the raw value is the
+/// negative errno as sent by the kernel (e.g., -17 for EEXIST).
+fn extract_errno(err: &rtnetlink::Error) -> Option<i32> {
+    if let rtnetlink::Error::NetlinkError(msg) = err {
+        msg.code.map(|c| -c.get())
+    } else {
+        None
+    }
+}
+
+/// Map an `rtnetlink::Error` to a `BackendError`.
+fn map_netlink_error(err: rtnetlink::Error, operation: &str) -> BackendError {
+    let errno = extract_errno(&err);
+    match errno {
+        Some(1) | Some(13) => {
+            // EPERM / EACCES
+            BackendError::PermissionDenied(format!("{operation}: permission denied"))
+        }
+        Some(19) => {
+            // ENODEV
+            BackendError::NotFound {
+                entity_type: "ethernet".to_string(),
+                selector: Box::new(Selector::new()),
+            }
+        }
+        _ => BackendError::ApplyFailed {
+            operation: operation.to_string(),
+            source: Box::new(err),
+        },
+    }
+}
+
+/// Returns `true` if the error is EEXIST (17) — used for idempotent add.
+fn is_eexist(err: &rtnetlink::Error) -> bool {
+    extract_errno(err) == Some(17)
+}
+
+/// Returns `true` if the `BackendError` wraps an EEXIST from `add_route`.
+fn is_eexist_backend(err: &BackendError) -> bool {
+    // add_route returns BackendError directly, so check ApplyFailed's source.
+    if let BackendError::ApplyFailed { source, .. } = err {
+        if let Some(rt_err) = source.downcast_ref::<rtnetlink::Error>() {
+            return is_eexist(rt_err);
+        }
+    }
+    false
+}
+
+/// Returns `true` for errors that indicate the object is already absent.
+///
+/// errno values: ENOENT=2, ESRCH=3, ENODEV=19, EADDRNOTAVAIL=99.
+fn is_not_found_error(err: &rtnetlink::Error) -> bool {
+    matches!(extract_errno(err), Some(2 | 3 | 19 | 99))
+}
+
+// ── Parsing helpers ───────────────────────────────────────────────────────────
+
+/// Parse a CIDR string (e.g., `"10.0.1.50/24"`) into `(IpAddr, prefix_len)`.
+fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8), BackendError> {
+    let (ip_str, prefix_str) = cidr
+        .split_once('/')
+        .ok_or_else(|| BackendError::Internal(format!("invalid CIDR: {cidr}")))?;
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|e| BackendError::Internal(format!("invalid IP in CIDR {cidr}: {e}")))?;
+    let prefix: u8 = prefix_str
+        .parse()
+        .map_err(|e| BackendError::Internal(format!("invalid prefix in CIDR {cidr}: {e}")))?;
+    Ok((ip, prefix))
+}
+
+/// Extract destination and optional gateway from a route `Value::Map`.
+fn extract_route_fields(
+    map: &IndexMap<String, Value>,
+) -> Result<(IpAddr, u8, Option<IpAddr>), BackendError> {
+    let destination = map
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BackendError::Internal("route missing destination".to_string()))?;
+
+    let (dst_ip, dst_prefix) = parse_cidr(destination)?;
+
+    let gateway = map
+        .get("gateway")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.parse::<IpAddr>()
+                .map_err(|e| BackendError::Internal(format!("invalid gateway: {e}")))
+        })
+        .transpose()?;
+
+    Ok((dst_ip, dst_prefix, gateway))
+}
+
+// ── Dry-run helpers ───────────────────────────────────────────────────────────
+
+/// Build `FieldChange` entries from a `DiffOp` and the current kernel state.
+fn build_planned_changes(op: &DiffOp, current_state: &State) -> Vec<FieldChange> {
+    let mut field_changes = Vec::new();
+
+    match op {
+        DiffOp::Add { fields, .. } => {
+            for (field_name, fv) in fields {
+                field_changes.push(FieldChange {
+                    field: field_name.clone(),
+                    current: None,
+                    desired: Some(fv.value.clone()),
+                    kind: FieldChangeKind::Set,
+                });
+            }
+        }
+        DiffOp::Modify {
+            changed_fields,
+            removed_fields,
+            ..
+        } => {
+            for (field_name, fv) in changed_fields {
+                let current = current_state
+                    .fields
+                    .get(field_name)
+                    .map(|f| f.value.clone());
+                let kind = if current.is_some() {
+                    FieldChangeKind::Modify
+                } else {
+                    FieldChangeKind::Set
+                };
+                field_changes.push(FieldChange {
+                    field: field_name.clone(),
+                    current,
+                    desired: Some(fv.value.clone()),
+                    kind,
+                });
+            }
+            for field_name in removed_fields {
+                let current = current_state
+                    .fields
+                    .get(field_name)
+                    .map(|f| f.value.clone());
+                field_changes.push(FieldChange {
+                    field: field_name.clone(),
+                    current,
+                    desired: None,
+                    kind: FieldChangeKind::Unset,
+                });
+            }
+        }
+        DiffOp::Remove { .. } => {
+            for (field_name, fv) in &current_state.fields {
+                field_changes.push(FieldChange {
+                    field: field_name.clone(),
+                    current: Some(fv.value.clone()),
+                    desired: None,
+                    kind: FieldChangeKind::Unset,
+                });
+            }
+        }
+    }
+
+    field_changes
+}
+
+// ── Construction helpers ──────────────────────────────────────────────────────
+
+/// Construct a `([], [failure], [])` triple for a top-level operation failure.
+fn fail_op(
+    op: DiffOpKind,
+    entity_type: &str,
+    selector: &Selector,
+    error: BackendError,
+    fields: Vec<String>,
+) -> (
+    Vec<AppliedOperation>,
+    Vec<FailedOperation>,
+    Vec<SkippedOperation>,
+) {
+    (
+        vec![],
+        vec![FailedOperation {
+            operation: op,
+            entity_type: entity_type.to_string(),
+            selector: selector.clone(),
+            error,
+            fields,
+        }],
+        vec![],
+    )
+}
+
+/// Construct a `FailedOperation` for a single-field error during modify.
+fn make_field_failure(name: &str, error: BackendError, field: &str) -> FailedOperation {
+    FailedOperation {
+        operation: DiffOpKind::Modify,
+        entity_type: "ethernet".to_string(),
+        selector: Selector::with_name(name),
+        error,
+        fields: vec![field.to_string()],
+    }
+}

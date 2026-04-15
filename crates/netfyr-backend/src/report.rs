@@ -159,6 +159,8 @@ pub struct PlannedChange {
 #[derive(Debug, Default)]
 pub struct DryRunReport {
     pub changes: Vec<PlannedChange>,
+    /// Operations that would be skipped (e.g., interface not found).
+    pub skipped: Vec<SkippedOperation>,
 }
 
 impl DryRunReport {
@@ -167,14 +169,14 @@ impl DryRunReport {
         Self::default()
     }
 
-    /// Returns `true` when no changes would be made.
+    /// Returns `true` when there are no changes and no skipped operations.
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.changes.is_empty() && self.skipped.is_empty()
     }
 
     /// Returns a human-readable summary with per-kind breakdown.
     pub fn summary(&self) -> String {
-        if self.changes.is_empty() {
+        if self.changes.is_empty() && self.skipped.is_empty() {
             return "no changes".to_string();
         }
         let added = self
@@ -192,13 +194,17 @@ impl DryRunReport {
             .iter()
             .filter(|c| c.operation == DiffOpKind::Remove)
             .count();
-        format!(
+        let mut s = format!(
             "{} changes planned ({} add, {} modify, {} remove)",
             self.changes.len(),
             added,
             modified,
             removed,
-        )
+        );
+        if !self.skipped.is_empty() {
+            s.push_str(&format!(", {} skipped", self.skipped.len()));
+        }
+        s
     }
 }
 
