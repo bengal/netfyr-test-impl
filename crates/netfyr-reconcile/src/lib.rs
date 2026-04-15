@@ -1,5 +1,11 @@
 //! netfyr-reconcile crate — per-field priority merge for network policy reconciliation.
 
+pub mod diff;
+pub mod report;
+
+pub use diff::{generate_diff, DiffKind, DiffOperation, FieldChange, FieldChangeKind, StateDiff};
+pub use report::DiffReport;
+
 use std::collections::HashMap;
 use std::fmt;
 

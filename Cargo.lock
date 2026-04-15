@@ -752,6 +752,9 @@ name = "netfyr-reconcile"
 version = "0.1.0"
 dependencies = [
  "netfyr-state",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

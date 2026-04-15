@@ -305,7 +305,8 @@ fn test_no_extraneous_source_files_in_library_crates() {
     // SPEC-006 adds schema.rs and schemas/ for entity schema validation.
     let library_crates: &[(&str, &[&str])] = &[
         ("netfyr-state", &["diff.rs", "lib.rs", "loader.rs", "schema.rs", "schemas", "set.rs", "yaml.rs"]),
-        ("netfyr-reconcile", &["lib.rs"]),
+        // SPEC-203 adds diff.rs and report.rs for diff generation.
+        ("netfyr-reconcile", &["diff.rs", "lib.rs", "report.rs"]),
         ("netfyr-backend", &["lib.rs", "netlink", "registry.rs", "report.rs", "trait_.rs"]),
         ("netfyr-policy", &["lib.rs"]),
         ("netfyr-varlink", &["lib.rs"]),

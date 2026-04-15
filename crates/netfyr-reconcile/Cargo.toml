@@ -5,3 +5,9 @@ edition = "2021"
 
 [dependencies]
 netfyr-state = { path = "../netfyr-state" }
+# serde/serde_json/serde_yaml: required for #[derive(Serialize)] on diff types
+# and for format_yaml()/format_json() in DiffReport.
+# All three are already used elsewhere in the workspace (netfyr-state, netfyr-policy).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
