@@ -18,3 +18,6 @@ thiserror = "1"
 # Recursive directory traversal with filter_entry for hidden-file pruning.
 # std::fs::read_dir is not recursive and would require manual recursion.
 walkdir = "2"
+# JSON Schema compilation and validation. No std alternative exists for JSON Schema.
+# Pinned to 0.26 for a stable API (JSONSchema::compile + iter_errors + ValidationErrorKind).
+jsonschema = "0.26"

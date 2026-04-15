@@ -2,11 +2,16 @@
 
 pub mod diff;
 pub mod loader;
+pub mod schema;
 pub mod set;
 pub mod yaml;
 
 pub use diff::{diff, DiffOp, StateDiff};
 pub use loader::{load_dir, load_file};
+pub use schema::{
+    EntitySchema, FieldConstraints, FieldSchemaInfo, FieldType, SchemaRegistry, ValidationError,
+    ValidationErrorKind, ValidationErrors,
+};
 pub use set::{complement, intersection, union, Conflict, ConflictError, StateSet};
 pub use yaml::{
     deserialize_value, parse_yaml, serialize_value, state_to_yaml, state_to_yaml_explicit,

@@ -302,8 +302,9 @@ fn test_no_extraneous_source_files_in_library_crates() {
     // Each entry is (crate_name, sorted list of expected source files).
     // netfyr-state has set.rs and diff.rs in addition to lib.rs per SPEC-004.
     // SPEC-005 adds loader.rs and yaml.rs for YAML serialization support.
+    // SPEC-006 adds schema.rs and schemas/ for entity schema validation.
     let library_crates: &[(&str, &[&str])] = &[
-        ("netfyr-state", &["diff.rs", "lib.rs", "loader.rs", "set.rs", "yaml.rs"]),
+        ("netfyr-state", &["diff.rs", "lib.rs", "loader.rs", "schema.rs", "schemas", "set.rs", "yaml.rs"]),
         ("netfyr-reconcile", &["lib.rs"]),
         ("netfyr-backend", &["lib.rs", "registry.rs", "report.rs", "trait_.rs"]),
         ("netfyr-policy", &["lib.rs"]),
