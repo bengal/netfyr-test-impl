@@ -3,41 +3,203 @@
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use ipnetwork::IpNetwork;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::str::FromStr;
 use uuid::Uuid;
+
+// ── MacAddrParseError ─────────────────────────────────────────────────────────
+
+/// Error returned when parsing a MAC address string fails.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MacAddrParseError;
+
+impl fmt::Display for MacAddrParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid MAC address; expected format AA:BB:CC:DD:EE:FF")
+    }
+}
+
+impl std::error::Error for MacAddrParseError {}
+
+// ── MacAddr ───────────────────────────────────────────────────────────────────
+
+/// A 6-byte hardware (MAC) address.
+///
+/// Stored as raw bytes so equality comparison is always case-insensitive.
+/// Serialized/deserialized as a lowercase colon-separated hex string.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MacAddr(pub [u8; 6]);
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let b = &self.0;
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
+    }
+}
+
+impl FromStr for MacAddr {
+    type Err = MacAddrParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            return Err(MacAddrParseError);
+        }
+        let mut bytes = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] = u8::from_str_radix(part, 16).map_err(|_| MacAddrParseError)?;
+        }
+        Ok(MacAddr(bytes))
+    }
+}
+
+impl Serialize for MacAddr {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MacAddr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 // ── Selector ──────────────────────────────────────────────────────────────────
 
 /// Identifies which system entity a state targets.
 ///
-/// This is a placeholder for SPEC-003. Marked `#[non_exhaustive]` so that
-/// adding fields in SPEC-003 is not a semver-breaking change for downstream crates.
-/// Constructors are provided because `#[non_exhaustive]` prevents struct literal
-/// syntax outside the defining crate.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// All specified (non-None, non-empty) fields must match for `matches()` to
+/// return true (AND logic). Unspecified fields match anything.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Selector {
+    /// Exact interface or entity name (e.g., `"eth0"`, `"bond0.100"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Entity type filter (e.g., `"ethernet"`, `"wifi"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    /// Kernel driver name (e.g., `"ixgbe"`, `"mlx5_core"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// PCI device path for stable hardware identification (e.g., `"0000:03:00.0"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pci_path: Option<String>,
+    /// MAC address (6-byte hardware address).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac: Option<MacAddr>,
+    /// User-defined key-value labels; all specified labels must be present with
+    /// matching values on the target (subset matching).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
 }
 
 impl Selector {
+    /// Returns a selector with all fields unset (matches everything).
     pub fn new() -> Self {
-        Self { name: None }
+        Self::default()
     }
 
+    /// Returns a selector targeting a specific named entity.
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
+            ..Default::default()
         }
     }
-}
 
-impl Default for Selector {
-    fn default() -> Self {
-        Self::new()
+    /// Returns `true` if all fields set in `self` match the corresponding
+    /// fields in `other`. Unspecified fields (None / empty labels) in `self`
+    /// match anything in `other`.
+    pub fn matches(&self, other: &Selector) -> bool {
+        if let Some(ref v) = self.name {
+            if other.name.as_deref() != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref v) = self.entity_type {
+            if other.entity_type.as_deref() != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref v) = self.driver {
+            if other.driver.as_deref() != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref v) = self.pci_path {
+            if other.pci_path.as_deref() != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(ref v) = self.mac {
+            if other.mac.as_ref() != Some(v) {
+                return false;
+            }
+        }
+        for (k, v) in &self.labels {
+            if other.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns `true` if the selector has a `name` set, meaning it targets a
+    /// single known entity rather than a class of entities.
+    pub fn is_specific(&self) -> bool {
+        self.name.is_some()
+    }
+
+    /// Returns a stable string key used for indexing in a StateSet.
+    ///
+    /// When `name` is set, returns the name directly. Otherwise, produces a
+    /// deterministic semicolon-delimited encoding of all set fields in
+    /// alphabetical order (e.g., `"driver=ixgbe;entity_type=ethernet"`).
+    ///
+    /// A fully-empty selector returns `""` — two empty selectors are
+    /// semantically identical and correctly map to the same key.
+    pub fn key(&self) -> String {
+        if let Some(ref n) = self.name {
+            return n.clone();
+        }
+
+        // Collect all set fields into a Vec for sorting.
+        // Field names chosen to sort alphabetically: driver, entity_type, mac, pci_path.
+        // Labels are interleaved as "labels.{key}={value}" and sorted together.
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(ref v) = self.driver {
+            parts.push(format!("driver={v}"));
+        }
+        if let Some(ref v) = self.entity_type {
+            parts.push(format!("entity_type={v}"));
+        }
+        if let Some(ref v) = self.mac {
+            parts.push(format!("mac={v}"));
+        }
+        if let Some(ref v) = self.pci_path {
+            parts.push(format!("pci_path={v}"));
+        }
+
+        // Sort labels by key for determinism (HashMap iteration order is unspecified).
+        let mut label_pairs: Vec<(&String, &String)> = self.labels.iter().collect();
+        label_pairs.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in label_pairs {
+            parts.push(format!("labels.{k}={v}"));
+        }
+
+        // Sort all parts together so labels interleave correctly with field names.
+        parts.sort();
+        parts.join(";")
     }
 }
 
@@ -297,6 +459,446 @@ mod tests {
     use chrono::Utc;
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr};
+
+    // ── MacAddr tests ─────────────────────────────────────────────────────────
+
+    /// Scenario: MacAddr parsing and formatting
+    #[test]
+    fn test_mac_addr_parse_uppercase_succeeds() {
+        let mac: MacAddr = "AA:BB:CC:DD:EE:FF".parse().expect("should parse uppercase MAC");
+        assert_eq!(mac.0, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    }
+
+    /// Scenario: MacAddr parsing and formatting — Display produces lowercase with colons
+    #[test]
+    fn test_mac_addr_display_lowercase_with_colons() {
+        let mac: MacAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    /// MacAddr accepts lowercase input too (case-insensitive parsing)
+    #[test]
+    fn test_mac_addr_parse_lowercase_succeeds() {
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().expect("should parse lowercase MAC");
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    /// Scenario: MacAddr rejects invalid format — non-MAC string returns error
+    #[test]
+    fn test_mac_addr_parse_invalid_format_fails() {
+        let result: Result<MacAddr, _> = "not-a-mac".parse();
+        assert!(result.is_err(), "parsing an invalid MAC should fail");
+    }
+
+    /// MacAddr rejects strings with too few octets
+    #[test]
+    fn test_mac_addr_parse_too_few_octets_fails() {
+        let result: Result<MacAddr, _> = "AA:BB:CC:DD:EE".parse();
+        assert!(result.is_err());
+    }
+
+    /// MacAddr rejects strings with too many octets
+    #[test]
+    fn test_mac_addr_parse_too_many_octets_fails() {
+        let result: Result<MacAddr, _> = "AA:BB:CC:DD:EE:FF:00".parse();
+        assert!(result.is_err());
+    }
+
+    /// MacAddr rejects hex values out of byte range
+    #[test]
+    fn test_mac_addr_parse_invalid_hex_fails() {
+        let result: Result<MacAddr, _> = "ZZ:BB:CC:DD:EE:FF".parse();
+        assert!(result.is_err());
+    }
+
+    /// MacAddrParseError implements Display
+    #[test]
+    fn test_mac_addr_parse_error_display() {
+        let err = MacAddrParseError;
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "error message should not be empty");
+    }
+
+    /// MacAddr serializes to the lowercase colon-separated string
+    #[test]
+    fn test_mac_addr_serialize_as_string() {
+        let mac: MacAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let json = serde_json::to_string(&mac).unwrap();
+        assert_eq!(json, "\"aa:bb:cc:dd:ee:ff\"");
+    }
+
+    /// MacAddr deserializes from a lowercase or uppercase string
+    #[test]
+    fn test_mac_addr_deserialize_from_string() {
+        let mac: MacAddr = serde_json::from_str("\"AA:BB:CC:DD:EE:FF\"").unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+    }
+
+    /// MacAddr parsed from lowercase and uppercase represent the same bytes (case-insensitive equality)
+    #[test]
+    fn test_mac_addr_equality_is_case_insensitive() {
+        let lower: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let upper: MacAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        assert_eq!(lower, upper, "MAC addresses that differ only in case must be equal");
+    }
+
+    // ── Selector::matches() tests ─────────────────────────────────────────────
+
+    /// Scenario: Exact name matching — same name on both selectors returns true
+    #[test]
+    fn test_matches_exact_name_returns_true() {
+        let sel = Selector::with_name("eth0");
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            driver: Some("ixgbe".to_string()),
+            ..Default::default()
+        };
+        assert!(sel.matches(&target));
+    }
+
+    /// Scenario: Name mismatch — different names returns false
+    #[test]
+    fn test_matches_name_mismatch_returns_false() {
+        let sel = Selector::with_name("eth0");
+        let target = Selector::with_name("eth1");
+        assert!(!sel.matches(&target));
+    }
+
+    /// Scenario: Multi-field AND matching succeeds — driver + entity_type both match
+    #[test]
+    fn test_matches_multi_field_and_all_match_returns_true() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        assert!(sel.matches(&target));
+    }
+
+    /// Scenario: Multi-field AND matching fails on one mismatch — entity_type differs
+    #[test]
+    fn test_matches_multi_field_and_one_mismatch_returns_false() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("wifi".to_string()),
+            ..Default::default()
+        };
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        assert!(!sel.matches(&target));
+    }
+
+    /// Scenario: Unspecified fields match anything — only driver set, target has many fields
+    #[test]
+    fn test_matches_unspecified_fields_match_anything() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            ..Default::default()
+        };
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            pci_path: Some("0000:03:00.0".to_string()),
+            ..Default::default()
+        };
+        assert!(sel.matches(&target));
+    }
+
+    /// Scenario: Empty selector matches everything — all-None selector matches any target
+    #[test]
+    fn test_matches_empty_selector_matches_everything() {
+        let sel = Selector::new();
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        assert!(sel.matches(&target));
+    }
+
+    /// Empty selector also matches another empty selector
+    #[test]
+    fn test_matches_empty_selector_matches_empty_target() {
+        let sel = Selector::new();
+        let target = Selector::new();
+        assert!(sel.matches(&target));
+    }
+
+    /// Scenario: Label subset matching succeeds — self has {"role":"uplink"}, target has that plus more
+    #[test]
+    fn test_matches_label_subset_matching_succeeds() {
+        let mut sel = Selector::new();
+        sel.labels.insert("role".to_string(), "uplink".to_string());
+
+        let mut target = Selector::new();
+        target.labels.insert("role".to_string(), "uplink".to_string());
+        target.labels.insert("env".to_string(), "prod".to_string());
+
+        assert!(sel.matches(&target));
+    }
+
+    /// Scenario: Label subset matching fails on missing label — target is missing a required label
+    #[test]
+    fn test_matches_label_subset_fails_on_missing_label() {
+        let mut sel = Selector::new();
+        sel.labels.insert("role".to_string(), "uplink".to_string());
+        sel.labels.insert("env".to_string(), "staging".to_string());
+
+        let mut target = Selector::new();
+        target.labels.insert("role".to_string(), "uplink".to_string());
+        // "env" is absent on target
+
+        assert!(!sel.matches(&target));
+    }
+
+    /// Scenario: Label value mismatch — same key, different value returns false
+    #[test]
+    fn test_matches_label_value_mismatch_returns_false() {
+        let mut sel = Selector::new();
+        sel.labels.insert("role".to_string(), "downlink".to_string());
+
+        let mut target = Selector::new();
+        target.labels.insert("role".to_string(), "uplink".to_string());
+
+        assert!(!sel.matches(&target));
+    }
+
+    /// Scenario: MAC address matching — bytes are equal so comparison is case-insensitive
+    #[test]
+    fn test_matches_mac_address_case_insensitive() {
+        let mac_lower: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let mac_upper: MacAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+
+        let sel = Selector {
+            mac: Some(mac_lower),
+            ..Default::default()
+        };
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            mac: Some(mac_upper),
+            ..Default::default()
+        };
+        assert!(
+            sel.matches(&target),
+            "MAC matching must be case-insensitive (bytes compared, not strings)"
+        );
+    }
+
+    /// matches() returns false when self specifies a MAC but target has no MAC
+    #[test]
+    fn test_matches_mac_specified_but_target_missing_mac_returns_false() {
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        let sel = Selector {
+            mac: Some(mac),
+            ..Default::default()
+        };
+        let target = Selector::with_name("eth0");
+        assert!(!sel.matches(&target));
+    }
+
+    /// matches() returns false when self specifies a pci_path but target differs
+    #[test]
+    fn test_matches_pci_path_mismatch_returns_false() {
+        let sel = Selector {
+            pci_path: Some("0000:03:00.0".to_string()),
+            ..Default::default()
+        };
+        let target = Selector {
+            pci_path: Some("0000:04:00.0".to_string()),
+            ..Default::default()
+        };
+        assert!(!sel.matches(&target));
+    }
+
+    /// matches() returns true when pci_path matches exactly
+    #[test]
+    fn test_matches_pci_path_exact_match_returns_true() {
+        let sel = Selector {
+            pci_path: Some("0000:03:00.0".to_string()),
+            ..Default::default()
+        };
+        let target = Selector {
+            name: Some("eth0".to_string()),
+            pci_path: Some("0000:03:00.0".to_string()),
+            ..Default::default()
+        };
+        assert!(sel.matches(&target));
+    }
+
+    // ── Selector::is_specific() tests ─────────────────────────────────────────
+
+    /// Scenario: is_specific returns true for named selectors
+    #[test]
+    fn test_is_specific_returns_true_when_name_set() {
+        let sel = Selector::with_name("eth0");
+        assert!(sel.is_specific());
+    }
+
+    /// Scenario: is_specific returns false for unnamed selectors
+    #[test]
+    fn test_is_specific_returns_false_when_name_unset() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            ..Default::default()
+        };
+        assert!(!sel.is_specific());
+    }
+
+    /// is_specific returns false for the empty selector
+    #[test]
+    fn test_is_specific_returns_false_for_empty_selector() {
+        assert!(!Selector::new().is_specific());
+    }
+
+    // ── Selector::key() tests ─────────────────────────────────────────────────
+
+    /// Scenario: key produces stable identifier from name — returns the name directly
+    #[test]
+    fn test_key_returns_name_when_name_is_set() {
+        let sel = Selector::with_name("eth0");
+        assert_eq!(sel.key(), "eth0");
+    }
+
+    /// Scenario: key produces deterministic identifier without name — called twice, same result
+    #[test]
+    fn test_key_is_deterministic_without_name() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(sel.key(), sel.key(), "key() must return the same value on repeated calls");
+    }
+
+    /// Scenario: key produces deterministic identifier without name — contains driver and entity_type
+    #[test]
+    fn test_key_contains_driver_and_entity_type_without_name() {
+        let sel = Selector {
+            driver: Some("ixgbe".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            ..Default::default()
+        };
+        let key = sel.key();
+        assert!(
+            key.contains("driver=ixgbe"),
+            "key should contain driver=ixgbe, got: {key}"
+        );
+        assert!(
+            key.contains("entity_type=ethernet"),
+            "key should contain entity_type=ethernet, got: {key}"
+        );
+    }
+
+    /// key for selector with labels contains the label in the expected format
+    #[test]
+    fn test_key_contains_labels_without_name() {
+        let mut sel = Selector::new();
+        sel.labels.insert("role".to_string(), "uplink".to_string());
+        let key = sel.key();
+        assert!(
+            key.contains("labels.role=uplink"),
+            "key should contain labels.role=uplink, got: {key}"
+        );
+    }
+
+    /// key with only driver and a label produces the same result regardless of HashMap order
+    #[test]
+    fn test_key_label_order_is_deterministic() {
+        let mut sel1 = Selector {
+            driver: Some("ixgbe".to_string()),
+            ..Default::default()
+        };
+        sel1.labels.insert("role".to_string(), "uplink".to_string());
+        sel1.labels.insert("env".to_string(), "prod".to_string());
+
+        // Build a second selector with labels inserted in the opposite order.
+        let mut sel2 = Selector {
+            driver: Some("ixgbe".to_string()),
+            ..Default::default()
+        };
+        sel2.labels.insert("env".to_string(), "prod".to_string());
+        sel2.labels.insert("role".to_string(), "uplink".to_string());
+
+        assert_eq!(sel1.key(), sel2.key(), "key() must be stable regardless of label insertion order");
+    }
+
+    /// Empty selector returns an empty string key
+    #[test]
+    fn test_key_empty_selector_returns_empty_string() {
+        assert_eq!(Selector::new().key(), "");
+    }
+
+    // ── Serialization tests ───────────────────────────────────────────────────
+
+    /// Scenario: Selector serializes with only set fields (skip_serializing_if)
+    /// Uses JSON as a proxy for the serde annotations (they apply to all formats).
+    #[test]
+    fn test_selector_serializes_only_set_fields() {
+        let sel = Selector::with_name("eth0");
+        let json = serde_json::to_string(&sel).unwrap();
+
+        assert!(
+            json.contains("\"name\":\"eth0\""),
+            "serialized output should contain name field, got: {json}"
+        );
+        assert!(
+            !json.contains("driver"),
+            "serialized output must not contain driver when unset, got: {json}"
+        );
+        assert!(
+            !json.contains("pci_path"),
+            "serialized output must not contain pci_path when unset, got: {json}"
+        );
+        assert!(
+            !json.contains("mac"),
+            "serialized output must not contain mac when unset, got: {json}"
+        );
+        assert!(
+            !json.contains("labels"),
+            "serialized output must not contain labels when empty, got: {json}"
+        );
+        assert!(
+            !json.contains("entity_type"),
+            "serialized output must not contain entity_type when unset, got: {json}"
+        );
+    }
+
+    /// Selector with all fields set round-trips through JSON correctly
+    #[test]
+    fn test_selector_round_trips_through_json() {
+        let mut sel = Selector {
+            name: Some("eth0".to_string()),
+            entity_type: Some("ethernet".to_string()),
+            driver: Some("ixgbe".to_string()),
+            pci_path: Some("0000:03:00.0".to_string()),
+            mac: Some("aa:bb:cc:dd:ee:ff".parse().unwrap()),
+            ..Default::default()
+        };
+        sel.labels.insert("role".to_string(), "uplink".to_string());
+
+        let json = serde_json::to_string(&sel).unwrap();
+        let restored: Selector = serde_json::from_str(&json).unwrap();
+        assert_eq!(sel, restored);
+    }
+
+    /// Deserializing an empty JSON object yields a default Selector (all None, no labels)
+    #[test]
+    fn test_selector_deserializes_from_empty_object() {
+        let sel: Selector = serde_json::from_str("{}").unwrap();
+        assert_eq!(sel, Selector::new());
+    }
 
     // ── Value tests ───────────────────────────────────────────────────────────
 
