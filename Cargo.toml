@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/netfyr-state",
+    "crates/netfyr-reconcile",
+    "crates/netfyr-backend",
+    "crates/netfyr-policy",
+    "crates/netfyr-varlink",
+    "crates/netfyr-cli",
+    "crates/netfyr-daemon",
+    "crates/netfyr-test-utils",
+]
+
+[workspace.features]
+dhcp = []
+systemd = []
+varlink = []
