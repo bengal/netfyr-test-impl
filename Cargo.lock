@@ -251,6 +251,9 @@ version = "0.1.0"
 [[package]]
 name = "netfyr-reconcile"
 version = "0.1.0"
+dependencies = [
+ "netfyr-state",
+]
 
 [[package]]
 name = "netfyr-state"
