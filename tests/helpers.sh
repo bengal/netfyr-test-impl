@@ -21,7 +21,7 @@ netns_setup() {
     fi
 
     if ! command -v unshare >/dev/null 2>&1; then
-        echo "ERROR: 'unshare' not found; install util-linux to run integration tests" >&2
+        echo "FAIL: 'unshare' not found; install util-linux to run integration tests" >&2
         exit 1
     fi
 
@@ -57,7 +57,7 @@ start_dnsmasq() {
     local lease_time="$5"
 
     if ! command -v dnsmasq >/dev/null 2>&1; then
-        echo "ERROR: 'dnsmasq' not found; install dnsmasq to run DHCP integration tests" >&2
+        echo "FAIL: 'dnsmasq' not found; install dnsmasq to run DHCP integration tests" >&2
         exit 1
     fi
 

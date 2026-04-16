@@ -15,13 +15,12 @@ source "$SCRIPT_DIR/helpers.sh"
 NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"
 
 if [[ ! -x "$NETFYR_BIN" ]]; then
-    echo "SKIP: netfyr binary not found at $NETFYR_BIN; run 'cargo build -p netfyr-cli' first"
-    exit 0
+    echo "FAIL: netfyr binary not found at $NETFYR_BIN" >&2
+    exit 1
 fi
 
 # Enter an unprivileged user+network namespace (re-executes this script inside).
-# Falls back to SKIP if unshare is unavailable or namespaces are disabled.
-netns_setup "$@" || { echo "SKIP: unshare --user --net not available; skipping namespace test"; exit 0; }
+netns_setup "$@"
 
 # ---------- Inside the namespace ----------
 

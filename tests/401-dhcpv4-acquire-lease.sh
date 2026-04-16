@@ -18,22 +18,22 @@ NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"
 NETFYR_DAEMON_BIN="${NETFYR_DAEMON_BIN:-$SCRIPT_DIR/../target/debug/netfyr-daemon}"
 
 if [[ ! -x "$NETFYR_BIN" ]]; then
-    echo "SKIP: netfyr binary not found at $NETFYR_BIN; run 'cargo build -p netfyr-cli' first"
-    exit 0
+    echo "FAIL: netfyr binary not found at $NETFYR_BIN" >&2
+    exit 1
 fi
 
 if [[ ! -x "$NETFYR_DAEMON_BIN" ]]; then
-    echo "SKIP: netfyr-daemon binary not found at $NETFYR_DAEMON_BIN; run 'cargo build -p netfyr-daemon' first"
-    exit 0
+    echo "FAIL: netfyr-daemon binary not found at $NETFYR_DAEMON_BIN" >&2
+    exit 1
 fi
 
 if ! command -v dnsmasq >/dev/null 2>&1; then
-    echo "SKIP: dnsmasq not found; install dnsmasq to run DHCP integration tests"
-    exit 0
+    echo "FAIL: dnsmasq not found; install dnsmasq to run DHCP integration tests" >&2
+    exit 1
 fi
 
 # Enter an unprivileged user+network namespace (re-executes this script inside).
-netns_setup "$@" || { echo "SKIP: unshare --user --net not available; skipping namespace test"; exit 0; }
+netns_setup "$@"
 
 # ---------- Inside the namespace ----------
 

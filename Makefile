@@ -1,13 +1,14 @@
 .PHONY: integration-test
 
-# Run all integration test scripts in tests/test_*.sh.
+# Run all integration test scripts in tests/[0-9]*.sh.
 # Each script runs as a separate bash process inside its own network namespace.
 # Requires: bash, ip (iproute2), unshare (util-linux).
 # Optional: dnsmasq (for DHCP tests).
 integration-test:
-	@scripts=$$(ls tests/test_*.sh 2>/dev/null); \
+	cargo build
+	@scripts=$$(ls tests/[0-9]*.sh 2>/dev/null); \
 	if [ -z "$$scripts" ]; then \
-		echo "No integration test scripts found in tests/test_*.sh"; \
+		echo "No integration test scripts found in tests/[0-9]*.sh"; \
 		exit 0; \
 	fi; \
 	failed=0; \
