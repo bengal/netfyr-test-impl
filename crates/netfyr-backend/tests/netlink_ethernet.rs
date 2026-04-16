@@ -11,9 +11,10 @@ use netfyr_backend::netlink::query::establish_connection;
 use netfyr_backend::{BackendError, NetlinkBackend, NetworkBackend};
 use netfyr_state::{Provenance, Selector};
 use netfyr_test_utils::netns::{
-    add_address, create_veth_pair, set_link_up, set_mtu, NetnsGuard,
+    add_address, create_veth_pair, get_link_index, set_link_up, set_mtu, NetnsGuard,
 };
-use rtnetlink::LinkBridge;
+use rtnetlink::{LinkBond, LinkBridge, LinkVlan, RouteMessageBuilder};
+use std::net::Ipv4Addr;
 
 /// Macro to skip a test when namespace creation is not available (EPERM).
 macro_rules! require_netns {
@@ -565,4 +566,345 @@ async fn test_query_all_via_backend_matches_direct_query() {
         assert!(state.fields.contains_key("mac"),  "must have 'mac' field");
         assert_eq!(state.entity_type, "ethernet");
     }
+}
+
+// ── Test 18: Bond interface is excluded from ethernet results ─────────────────
+
+/// Scenario: Query excludes non-ethernet interfaces — bond interfaces
+/// (InfoKind::Bond) must not appear in ethernet query results.
+///
+/// Covers acceptance criterion: "bridge, bond, and vlan interfaces are excluded".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_excludes_bond_interface() {
+    require_netns!(_guard);
+
+    // Create a veth pair (should appear) and a bond (must NOT appear).
+    create_veth_pair("veth-bnd0", "veth-bnd1").await.unwrap();
+
+    // Create bond interface directly via rtnetlink.
+    let (conn, handle_bond, _) = rtnetlink::new_connection().unwrap();
+    tokio::spawn(conn);
+    handle_bond
+        .link()
+        .add(LinkBond::new("bond-excl").build())
+        .execute()
+        .await
+        .unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let result = query_ethernet(&handle, None).await.unwrap();
+
+    // bond must NOT appear in ethernet query results.
+    let has_bond = result
+        .iter()
+        .any(|s| s.selector.name.as_deref() == Some("bond-excl"));
+    assert!(
+        !has_bond,
+        "bond interface 'bond-excl' must not appear in ethernet query results"
+    );
+
+    // veth endpoints must still appear.
+    assert!(
+        result.get("ethernet", "veth-bnd0").is_some(),
+        "veth-bnd0 must be present"
+    );
+    assert!(
+        result.get("ethernet", "veth-bnd1").is_some(),
+        "veth-bnd1 must be present"
+    );
+}
+
+// ── Test 19: Vlan interface is excluded from ethernet results ─────────────────
+
+/// Scenario: Query excludes non-ethernet interfaces — vlan interfaces
+/// (InfoKind::Vlan) must not appear in ethernet query results.
+///
+/// Covers acceptance criterion: "bridge, bond, and vlan interfaces are excluded".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_excludes_vlan_interface() {
+    require_netns!(_guard);
+
+    // Create a veth pair as the parent for the vlan.
+    create_veth_pair("veth-vlp0", "veth-vlp1").await.unwrap();
+    set_link_up("veth-vlp0").await.unwrap();
+
+    // Resolve parent interface index (required by LinkVlan).
+    let parent_index = get_link_index("veth-vlp0").await.unwrap();
+
+    // Create vlan interface (id=100) on top of veth-vlp0.
+    let (conn, handle_vlan, _) = rtnetlink::new_connection().unwrap();
+    tokio::spawn(conn);
+    handle_vlan
+        .link()
+        .add(LinkVlan::new("vlan100-excl", parent_index, 100).build())
+        .execute()
+        .await
+        .unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let result = query_ethernet(&handle, None).await.unwrap();
+
+    // vlan must NOT appear in ethernet query results.
+    let has_vlan = result
+        .iter()
+        .any(|s| s.selector.name.as_deref() == Some("vlan100-excl"));
+    assert!(
+        !has_vlan,
+        "vlan interface 'vlan100-excl' must not appear in ethernet query results"
+    );
+
+    // veth endpoints must still appear.
+    assert!(
+        result.get("ethernet", "veth-vlp0").is_some(),
+        "veth-vlp0 must be present"
+    );
+    assert!(
+        result.get("ethernet", "veth-vlp1").is_some(),
+        "veth-vlp1 must be present"
+    );
+}
+
+// ── Test 20: Carrier is true when both veth ends are up ───────────────────────
+
+/// Scenario: Query a specific ethernet interface by name — the entity has the
+/// correct carrier value.
+///
+/// For a veth pair, bringing both endpoints up causes the kernel to report
+/// carrier=1 (true). This covers the acceptance criterion that the returned
+/// entity has the correct carrier value for an up interface.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_carrier_is_true_when_both_veth_ends_are_up() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-cup0", "veth-cup1").await.unwrap();
+
+    // Both veth ends must be up for the kernel to report carrier=1.
+    set_link_up("veth-cup0").await.unwrap();
+    set_link_up("veth-cup1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-cup0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-cup0").unwrap();
+
+    // The carrier field must be present.
+    let carrier_fv = state
+        .fields
+        .get("carrier")
+        .expect("carrier field must be present in the returned State");
+
+    // Carrier must hold a bool value.
+    let carrier_val = carrier_fv
+        .value
+        .as_bool()
+        .expect("carrier field must be Value::Bool");
+
+    // When both veth ends are up, the kernel sets IFLA_CARRIER=1 → true.
+    assert!(
+        carrier_val,
+        "carrier must be true when both veth endpoints are up"
+    );
+
+    // Carrier field must have KernelDefault provenance.
+    assert_eq!(
+        carrier_fv.provenance,
+        Provenance::KernelDefault,
+        "carrier field must have KernelDefault provenance"
+    );
+
+    // Core fields must also be present.
+    assert!(state.fields.contains_key("name"), "name must be present");
+    assert!(state.fields.contains_key("mtu"),  "mtu must be present");
+    assert!(state.fields.contains_key("mac"),  "mac must be present");
+}
+
+// ── Test 21: Route with gateway includes "gateway" field ─────────────────────
+
+/// Scenario: Query ethernet interface includes routes — each route has
+/// destination, gateway (if applicable), and metric fields.
+///
+/// This test adds a static default route (0.0.0.0/0) via an explicit gateway
+/// and verifies the "routes" field in the returned State includes a route map
+/// with "destination", "gateway", and "metric" keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_includes_route_with_gateway_field() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-gw0", "veth-gw1").await.unwrap();
+    set_link_up("veth-gw0").await.unwrap();
+    set_link_up("veth-gw1").await.unwrap();
+
+    // Assign an address so there is a connected subnet route and a viable
+    // gateway address in the same subnet.
+    add_address("veth-gw0", "10.99.4.1/24").await.unwrap();
+
+    // Get the interface index to attach the explicit route.
+    let iface_index = get_link_index("veth-gw0").await.unwrap();
+
+    // Add a default route (0.0.0.0/0) via 10.99.4.254 out of veth-gw0.
+    // The gateway 10.99.4.254 is in the 10.99.4.0/24 subnet, so the kernel
+    // accepts the route without the onlink flag on most kernels; onlink is
+    // included for robustness across different kernel configurations.
+    let (conn, handle_rt, _) = rtnetlink::new_connection().unwrap();
+    tokio::spawn(conn);
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .output_interface(iface_index)
+        .gateway("10.99.4.254".parse::<Ipv4Addr>().unwrap())
+        .onlink()
+        .build();
+    handle_rt.route().add(route).execute().await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-gw0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-gw0").unwrap();
+
+    let routes = state
+        .fields
+        .get("routes")
+        .expect("routes field must be present")
+        .value
+        .as_list()
+        .expect("routes must be a list");
+
+    assert!(
+        !routes.is_empty(),
+        "At least one route expected after assigning an address and adding a gateway route"
+    );
+
+    // Each route must be a map with at least "destination" and "metric" keys.
+    for route_val in routes {
+        let route_map = route_val
+            .as_map()
+            .expect("each route entry must be a Value::Map");
+        assert!(route_map.contains_key("destination"), "route must have 'destination' key");
+        assert!(route_map.contains_key("metric"),      "route must have 'metric' key");
+    }
+
+    // The default route 0.0.0.0/0 must appear and must carry a "gateway" key.
+    let default_route = routes
+        .iter()
+        .find(|r| {
+            r.as_map()
+                .and_then(|m| m.get("destination"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.starts_with("0.0.0.0/"))
+                .unwrap_or(false)
+        })
+        .expect("default route (0.0.0.0/x) must appear in the routes field");
+
+    let route_map = default_route
+        .as_map()
+        .expect("default route must be a Value::Map");
+
+    // Gateway key must be present for a route with an explicit next hop.
+    let gw = route_map
+        .get("gateway")
+        .expect("default route must have a 'gateway' key");
+    assert_eq!(
+        gw.as_str(),
+        Some("10.99.4.254"),
+        "gateway must be '10.99.4.254', got: {:?}",
+        gw
+    );
+
+    // Routes field must have KernelDefault provenance.
+    assert_eq!(
+        state.fields.get("routes").unwrap().provenance,
+        Provenance::KernelDefault,
+        "routes field must have KernelDefault provenance"
+    );
+}
+
+// ── Test 22: NetlinkBackend::supported_entities returns "ethernet" ─────────────
+
+/// Scenario: NetlinkBackend supports the "ethernet" entity type.
+///
+/// Covers acceptance criterion: "A NetlinkBackend that supports entity type
+/// 'ethernet'" when query_all is called.
+#[test]
+fn test_netlinkbackend_supports_ethernet_entity_type() {
+    let backend = NetlinkBackend::new();
+    let supported = backend.supported_entities();
+    assert!(
+        supported.contains(&"ethernet".to_string()),
+        "NetlinkBackend must declare 'ethernet' in supported_entities()"
+    );
+}
+
+// ── Test 23: Addresses field is always present (even empty) ───────────────────
+
+/// Scenario: Query by name returns an entity whose "addresses" field is always
+/// a list (even when the interface has no IP address assigned).
+///
+/// Covers the part of criterion 2 and 3 that addresses is always present and
+/// is a list type.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_addresses_field_is_always_a_list() {
+    require_netns!(_guard);
+
+    // veth pair with no address assigned — addresses should be an empty list.
+    create_veth_pair("veth-noaddr0", "veth-noaddr1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-noaddr0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-noaddr0").unwrap();
+
+    let addresses_fv = state
+        .fields
+        .get("addresses")
+        .expect("addresses field must always be present");
+    assert!(
+        addresses_fv.value.as_list().is_some(),
+        "addresses field must always be a list, even when empty"
+    );
+
+    // Provenance must be KernelDefault.
+    assert_eq!(
+        addresses_fv.provenance,
+        Provenance::KernelDefault,
+        "addresses field must have KernelDefault provenance"
+    );
+}
+
+// ── Test 24: Routes field is always present (even empty) ──────────────────────
+
+/// Scenario: The "routes" field is always a list in the returned State, even
+/// when there are no routes for the interface (interface is down with no address).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_routes_field_is_always_a_list() {
+    require_netns!(_guard);
+
+    // veth pair that is down — no routes expected.
+    create_veth_pair("veth-nort0", "veth-nort1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-nort0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-nort0").unwrap();
+
+    let routes_fv = state
+        .fields
+        .get("routes")
+        .expect("routes field must always be present");
+    assert!(
+        routes_fv.value.as_list().is_some(),
+        "routes field must always be a list, even when empty"
+    );
+
+    // Provenance must be KernelDefault.
+    assert_eq!(
+        routes_fv.provenance,
+        Provenance::KernelDefault,
+        "routes field must have KernelDefault provenance"
+    );
 }
