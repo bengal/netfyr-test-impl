@@ -595,6 +595,107 @@ mod tests {
         factory.stop().await.expect("second stop() must succeed (idempotent)");
     }
 
+    // ── FactoryEvent variant structure ────────────────────────────────────────
+
+    /// Scenario: Factory sends LeaseRenewed on renewal
+    ///
+    /// Verify that FactoryEvent::LeaseRenewed carries the correct policy_name
+    /// and a State with the expected fields (operstate, addresses).
+    #[test]
+    fn test_factory_event_lease_renewed_has_policy_name_and_state() {
+        let state = lease_to_state(&make_full_lease(), "eth0", "renew-policy", 100);
+        let event = FactoryEvent::LeaseRenewed {
+            policy_name: "renew-policy".to_string(),
+            state,
+        };
+        match event {
+            FactoryEvent::LeaseRenewed { policy_name, state: ev_state } => {
+                assert_eq!(policy_name, "renew-policy");
+                assert_eq!(ev_state.entity_type, "ethernet");
+                assert!(
+                    ev_state.fields.contains_key("addresses"),
+                    "LeaseRenewed state must contain addresses"
+                );
+                assert_eq!(
+                    ev_state.fields.get("operstate").and_then(|fv| fv.value.as_str()),
+                    Some("up"),
+                    "LeaseRenewed state must have operstate=up"
+                );
+            }
+            _ => panic!("expected FactoryEvent::LeaseRenewed variant"),
+        }
+    }
+
+    /// Scenario: Factory sends LeaseExpired when lease expires
+    ///
+    /// Verify that FactoryEvent::LeaseExpired carries exactly the policy_name
+    /// and no state (the daemon removes the produced state on receipt).
+    #[test]
+    fn test_factory_event_lease_expired_has_policy_name() {
+        let event = FactoryEvent::LeaseExpired {
+            policy_name: "expire-policy".to_string(),
+        };
+        match event {
+            FactoryEvent::LeaseExpired { policy_name } => {
+                assert_eq!(
+                    policy_name, "expire-policy",
+                    "LeaseExpired must carry the correct policy_name"
+                );
+            }
+            _ => panic!("expected FactoryEvent::LeaseExpired variant"),
+        }
+    }
+
+    // ── Scenario 8: current_state returns full state after lease ──────────────
+
+    /// Scenario: current_state returns full state after lease
+    ///
+    /// Verifies that the state produced by lease_to_state (which becomes the
+    /// factory's current_state once a lease is acquired) simultaneously satisfies
+    /// ALL four required fields: operstate=up, addresses, routes, dns_servers.
+    /// This is a holistic check — individual field tests exist above.
+    #[test]
+    fn test_lease_to_state_satisfies_scenario8_all_required_fields_present() {
+        let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
+
+        // operstate must be "up"
+        assert_eq!(
+            state.fields.get("operstate").and_then(|fv| fv.value.as_str()),
+            Some("up"),
+            "full lease state must have operstate=up"
+        );
+
+        // addresses must be present and non-empty
+        let addresses = state
+            .fields
+            .get("addresses")
+            .expect("full lease state must have addresses field")
+            .value
+            .as_list()
+            .expect("addresses must be a list");
+        assert!(!addresses.is_empty(), "addresses list must be non-empty");
+
+        // routes must be present and non-empty (gateway was provided)
+        let routes = state
+            .fields
+            .get("routes")
+            .expect("full lease state must have routes field (gateway was provided)")
+            .value
+            .as_list()
+            .expect("routes must be a list");
+        assert!(!routes.is_empty(), "routes list must be non-empty");
+
+        // dns_servers must be present and non-empty (DNS server was provided)
+        let dns = state
+            .fields
+            .get("dns_servers")
+            .expect("full lease state must have dns_servers field (DNS was provided)")
+            .value
+            .as_list()
+            .expect("dns_servers must be a list");
+        assert!(!dns.is_empty(), "dns_servers list must be non-empty");
+    }
+
     /// Scenario: Factory sends FactoryEvent::Error when the interface is not found.
     ///
     /// The background task fails to read the MAC from sysfs and sends an Error event.

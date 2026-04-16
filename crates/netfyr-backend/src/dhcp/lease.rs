@@ -248,6 +248,36 @@ mod tests {
         );
     }
 
+    // ── Timer ordering invariant ─────────────────────────────────────────────
+
+    /// For a fresh standard lease, the timers must satisfy T1 < T2 < lease_time.
+    ///
+    /// RFC 2131 §4.4.5 requires T1 (renewal) ≤ T2 (rebind) ≤ lease duration.
+    /// This test verifies that time_until_renewal < time_until_rebind <
+    /// time_until_expiry holds for a freshly acquired lease with typical defaults.
+    #[test]
+    fn test_timer_ordering_t1_before_t2_before_expiry_for_fresh_lease() {
+        // Standard defaults: T1=50%, T2=87.5% of lease_time.
+        let lease = make_lease(3600, 1800, 3150, 0, Ipv4Addr::new(255, 255, 255, 0));
+
+        let renewal = lease.time_until_renewal();
+        let rebind = lease.time_until_rebind();
+        let expiry = lease.time_until_expiry();
+
+        assert!(
+            renewal < rebind,
+            "T1 (renewal={:?}) must be before T2 (rebind={:?})",
+            renewal,
+            rebind,
+        );
+        assert!(
+            rebind < expiry,
+            "T2 (rebind={:?}) must be before lease expiry ({:?})",
+            rebind,
+            expiry,
+        );
+    }
+
     /// Clone and Debug work correctly on DhcpLease.
     #[test]
     fn test_dhcp_lease_clone_and_debug() {
