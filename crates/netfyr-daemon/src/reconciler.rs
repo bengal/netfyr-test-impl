@@ -4,13 +4,14 @@
 //! `SchemaRegistry` it holds at construction time. It can be called from both
 //! the Varlink request handler and the factory event handler without locking.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
 use netfyr_backend::{ApplyReport, BackendRegistry, NetlinkBackend};
 use netfyr_policy::{FactoryType, StaticFactory, StateFactory};
 use netfyr_reconcile::{
-    generate_diff, merge, ConflictReport, PolicyId, PolicyInput,
+    generate_diff, merge, ConflictReport, EntityKey, PolicyId, PolicyInput,
     StateDiff as ReconcileStateDiff,
 };
 use netfyr_state::{Selector, SchemaRegistry, StateSet};
@@ -97,6 +98,13 @@ impl Reconciler {
         factory_manager: &FactoryManager,
     ) -> Result<(ReconcileStateDiff, ConflictReport)> {
         let inputs = self.build_policy_inputs(policy_store, factory_manager);
+        // Compute managed_entities before merge() consumes the inputs.
+        // Only entities with produced state are counted; factory policies that have
+        // not yet produced state cannot be removed anyway (nothing to remove).
+        let managed_entities: HashSet<EntityKey> = inputs
+            .iter()
+            .flat_map(|input| input.state_set.entities())
+            .collect();
         let merged = merge(inputs);
         let effective_state = merged.effective_state;
         let conflicts = merged.conflicts;
@@ -104,9 +112,9 @@ impl Reconciler {
         let actual_state = self.backend_registry.query_all().await?;
 
         // Use generate_diff for the rich display diff (with per-field change details).
-        // Note argument order: generate_diff(desired, actual, schema).
+        // Note argument order: generate_diff(desired, actual, managed_entities, schema).
         let reconcile_diff =
-            generate_diff(&effective_state, &actual_state, &self.schema_registry);
+            generate_diff(&effective_state, &actual_state, &managed_entities, &self.schema_registry);
 
         Ok((reconcile_diff, conflicts))
     }

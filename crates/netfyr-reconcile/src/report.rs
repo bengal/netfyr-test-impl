@@ -210,8 +210,9 @@ mod tests {
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -235,8 +236,9 @@ mod tests {
         ));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -261,8 +263,10 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> =
+            [("vlan".to_string(), "bond0.200".to_string())].into_iter().collect();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -285,8 +289,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -303,8 +308,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -328,8 +334,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -352,8 +359,9 @@ mod tests {
             vec![("mtu", Value::U64(1500)), ("addresses", addr_list(&["10.0.1.99/24"]))],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -380,8 +388,9 @@ mod tests {
             vec![("mtu", Value::U64(1500)), ("addresses", addr_list(&["10.0.1.50/24"]))],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -399,8 +408,9 @@ mod tests {
         let desired = StateSet::new();
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         assert!(report.is_empty(), "DiffReport must be empty when both states are empty");
@@ -413,8 +423,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         assert!(report.is_empty(), "DiffReport must be empty when states are identical");
@@ -426,8 +437,9 @@ mod tests {
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))]));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         assert!(!report.is_empty(), "DiffReport must not be empty when there are operations");
@@ -442,8 +454,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         assert_eq!(report.unchanged_entities.len(), 1, "should have one unchanged entity");
@@ -461,8 +474,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         assert!(
@@ -480,8 +494,9 @@ mod tests {
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         actual.insert(make_state("bond", "bond0", vec![("mode", Value::String("802.3ad".to_string()))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
 
         // Both entities are unchanged; list must be sorted
@@ -503,8 +518,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -528,8 +544,9 @@ mod tests {
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let text = report.format_text();
 
@@ -543,6 +560,87 @@ mod tests {
         );
     }
 
+    // ── Scenario: Unmanaged entity not in unchanged_entities ─────────────────
+
+    #[test]
+    fn test_unmanaged_entity_not_in_unchanged_entities() {
+        // Scenario: Unmanaged entity in actual but not desired is completely ignored
+        // "ethernet/eth1 is not in unchanged_entities either (completely ignored)"
+        // An entity present only in actual and NOT in managed_entities must not appear
+        // in unchanged_entities — it is fully invisible to the report.
+        let desired = StateSet::new();
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth1",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("operstate", Value::String("up".to_string())),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new(); // eth1 NOT managed
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+
+        assert!(
+            report.unchanged_entities.is_empty(),
+            "unmanaged entity must not appear in unchanged_entities, got: {:?}",
+            report.unchanged_entities
+        );
+        assert!(report.is_empty(), "report must be empty for unmanaged-only actual state");
+    }
+
+    #[test]
+    fn test_unmanaged_entity_not_in_format_text_output() {
+        // Unmanaged entity should be invisible — format_text must not mention it at all.
+        let desired = StateSet::new();
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+        let text = report.format_text();
+
+        assert!(
+            !text.contains("eth1"),
+            "unmanaged eth1 must not appear in format_text output, got:\n{text}"
+        );
+    }
+
+    // ── Scenario: Unmanaged entity absent from unchanged_entities with managed present ─
+
+    #[test]
+    fn test_unchanged_entity_present_but_unmanaged_entity_absent_from_unchanged_list() {
+        // eth0 is in both desired and actual (unchanged — managed)
+        // eth1 is only in actual and NOT managed (completely ignored)
+        // unchanged_entities must contain eth0 but NOT eth1
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+        actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(9000))])); // unmanaged
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new(); // no managed needed for eth0 (it's in desired)
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+        let report = DiffReport::new(diff, &desired, &actual);
+
+        assert_eq!(
+            report.unchanged_entities.len(),
+            1,
+            "only one unchanged entity expected (eth0); eth1 is unmanaged"
+        );
+        assert_eq!(
+            report.unchanged_entities[0],
+            ("ethernet".to_string(), "eth0".to_string()),
+            "unchanged entity must be (ethernet, eth0)"
+        );
+    }
+
     // ── format_yaml and format_json round-trip ────────────────────────────────
 
     #[test]
@@ -551,8 +649,9 @@ mod tests {
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))]));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let yaml = report.format_yaml();
 
@@ -566,8 +665,9 @@ mod tests {
         desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))]));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let report = DiffReport::new(diff, &desired, &actual);
         let json_str = report.format_json();
 

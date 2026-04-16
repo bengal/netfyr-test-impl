@@ -10,11 +10,17 @@
 //! [`SchemaRegistry`] that appear in actual state but not in desired state are
 //! silently excluded from Modify operations. For entity types not registered in
 //! the schema, all fields are conservatively treated as writable.
+//!
+//! **Managed-entity guard**: Only entities listed in `managed_entities` can
+//! generate Remove operations. Entities present in actual state but not targeted
+//! by any policy are left completely untouched.
+
+use std::collections::HashSet;
 
 use netfyr_state::{FieldValue, SchemaRegistry, Selector, StateSet};
 use serde::Serialize;
 
-use crate::FieldName;
+use crate::{EntityKey, FieldName};
 
 // ── EntityType alias ──────────────────────────────────────────────────────────
 
@@ -126,6 +132,17 @@ impl StateDiff {
 
 /// Generates a [`StateDiff`] by comparing `desired` state against `actual` state.
 ///
+/// # Parameters
+///
+/// - `desired`: the effective desired state produced by reconciliation.
+/// - `actual`: the current system state queried from the backend.
+/// - `managed_entities`: the set of entity keys explicitly targeted by at least
+///   one active policy. Only entities in this set can generate Remove operations.
+///   Entities present in `actual` but absent from this set are left untouched —
+///   they generate no operation and do not appear in any report.
+/// - `schema`: used to identify read-only fields that should be excluded from
+///   Modify operations.
+///
 /// # Algorithm
 ///
 /// **Pass 1** — iterates desired entities:
@@ -139,8 +156,9 @@ impl StateDiff {
 ///   - If any non-`Unchanged` changes exist → **Modify** operation.
 ///   - If all fields are `Unchanged` → no operation emitted.
 ///
-/// **Pass 2** — iterates actual entities absent from desired → **Remove** operation
-/// (all actual fields become `Unset`).
+/// **Pass 2** — iterates actual entities absent from desired:
+/// - If the entity is **not** in `managed_entities` → skip entirely (unmanaged).
+/// - If managed → **Remove** operation (all actual fields become `Unset`).
 ///
 /// # Read-only field handling
 ///
@@ -159,7 +177,12 @@ impl StateDiff {
 /// Callers must ensure both StateSets use resolved (name-based) selectors.
 /// If desired state uses driver-based selectors and actual state uses name-based
 /// selectors, keys will not match and all entities will appear as Add+Remove.
-pub fn generate_diff(desired: &StateSet, actual: &StateSet, schema: &SchemaRegistry) -> StateDiff {
+pub fn generate_diff(
+    desired: &StateSet,
+    actual: &StateSet,
+    managed_entities: &HashSet<EntityKey>,
+    schema: &SchemaRegistry,
+) -> StateDiff {
     let mut operations = Vec::new();
 
     // ── Pass 1: iterate desired entities ─────────────────────────────────────
@@ -262,6 +285,14 @@ pub fn generate_diff(desired: &StateSet, actual: &StateSet, schema: &SchemaRegis
             continue;
         }
 
+        // Guard: only generate Remove operations for entities explicitly targeted
+        // by an active policy. Unmanaged entities in the system are left untouched —
+        // they generate no operation and are completely invisible to the diff.
+        let entity_key: EntityKey = (entity_type.clone(), selector_key.clone());
+        if !managed_entities.contains(&entity_key) {
+            continue;
+        }
+
         let actual_state = actual.get(&entity_type, &selector_key).expect("key from entities()");
         let field_changes = actual_state
             .fields
@@ -334,8 +365,9 @@ mod tests {
         ));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 1, "should have exactly one operation");
         let op = &diff.operations[0];
@@ -357,8 +389,9 @@ mod tests {
         ));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let op = &diff.operations[0];
 
         // mtu: Set(None → 1500)
@@ -393,8 +426,10 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth0".to_string())].into_iter().collect();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 1, "should have exactly one operation");
         let op = &diff.operations[0];
@@ -416,8 +451,10 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth0".to_string())].into_iter().collect();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let op = &diff.operations[0];
 
         // mtu: Unset(1500)
@@ -460,8 +497,9 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 1, "should have exactly one operation");
         let op = &diff.operations[0];
@@ -490,7 +528,8 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
-        let diff = generate_diff(&desired, &actual, &schema);
+        let managed = std::collections::HashSet::<(String, String)>::new();
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
         let op = &diff.operations[0];
 
         // mtu: Set(Some(1500) → 9000)
@@ -535,8 +574,9 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert!(diff.is_empty(), "identical states should produce no operations");
         assert_eq!(diff.len(), 0);
@@ -558,8 +598,9 @@ mod tests {
         let mut actual = StateSet::new();
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 1, "should have one Modify operation");
         let op = &diff.operations[0];
@@ -598,8 +639,9 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 1, "should have one Modify operation");
         let op = &diff.operations[0];
@@ -637,7 +679,10 @@ mod tests {
         actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
 
         let schema = SchemaRegistry::new();
-        let diff = generate_diff(&desired, &actual, &schema);
+        // eth1 must be in managed_entities to generate a Remove operation.
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth1".to_string())].into_iter().collect();
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.len(), 3, "should have 3 operations: Modify eth0, Remove eth1, Add eth2");
         assert_eq!(diff.additions().count(), 1, "1 addition expected (eth2)");
@@ -655,7 +700,9 @@ mod tests {
         actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
 
         let schema = SchemaRegistry::new();
-        let diff = generate_diff(&desired, &actual, &schema);
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth1".to_string())].into_iter().collect();
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         let add_op = diff.additions().next().expect("should have an Add operation");
         assert_eq!(add_op.selector.key(), "eth2", "Add operation should target eth2");
@@ -676,8 +723,15 @@ mod tests {
         actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
         actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
         let schema = SchemaRegistry::new();
+        // Both eth0 and eth1 must be managed to generate Remove operations.
+        let managed: std::collections::HashSet<(String, String)> = [
+            ("ethernet".to_string(), "eth0".to_string()),
+            ("ethernet".to_string(), "eth1".to_string()),
+        ]
+        .into_iter()
+        .collect();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.removals().count(), 2, "should have 2 Remove operations");
         assert_eq!(diff.additions().count(), 0, "should have no Add operations");
@@ -693,8 +747,9 @@ mod tests {
         desired.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.additions().count(), 2, "should have 2 Add operations");
         assert_eq!(diff.removals().count(), 0, "should have no Remove operations");
@@ -708,8 +763,9 @@ mod tests {
         let desired = StateSet::new();
         let actual = StateSet::new();
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert!(diff.is_empty(), "both-empty diff must return true for is_empty()");
         assert_eq!(diff.len(), 0, "both-empty diff must have len 0");
@@ -736,8 +792,9 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         // carrier and speed are read-only → they should not generate a Modify operation
         assert!(
@@ -759,8 +816,9 @@ mod tests {
             vec![("mtu", Value::U64(1500)), ("mac", Value::String("aa:bb:cc:dd:ee:ff".to_string()))],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert!(
             diff.is_empty(),
@@ -785,12 +843,129 @@ mod tests {
         actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
 
         let schema = SchemaRegistry::new();
-        let diff = generate_diff(&desired, &actual, &schema);
+        let managed: std::collections::HashSet<(String, String)> =
+            [("ethernet".to_string(), "eth1".to_string())].into_iter().collect();
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         assert_eq!(diff.additions().count(), 2, "additions() should return 2 items");
         assert_eq!(diff.removals().count(), 1, "removals() should return 1 item");
         assert_eq!(diff.modifications().count(), 1, "modifications() should return 1 item");
         assert_eq!(diff.len(), 4, "len() should return 4 total operations");
+    }
+
+    // ── Scenario: Unmanaged entity in actual but not desired is left alone ───────
+
+    #[test]
+    fn test_unmanaged_entity_in_actual_not_desired_generates_no_operations() {
+        // Scenario: Unmanaged entity in actual but not desired is left alone
+        // Given desired StateSet does not contain ethernet/eth1
+        // And actual StateSet contains ethernet/eth1 with mtu=1500, operstate=up
+        // And managed_entities does NOT contain ethernet/eth1
+        // Then the StateDiff contains no operations for ethernet/eth1
+        let desired = StateSet::new();
+        let mut actual = StateSet::new();
+        actual.insert(make_state(
+            "ethernet",
+            "eth1",
+            vec![
+                ("mtu", Value::U64(1500)),
+                ("operstate", Value::String("up".to_string())),
+            ],
+        ));
+        let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new(); // eth1 NOT managed
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert!(
+            diff.is_empty(),
+            "unmanaged entity in actual but not in desired must produce no operations"
+        );
+        assert_eq!(diff.len(), 0, "len() must be 0 for unmanaged-only diff");
+    }
+
+    // ── Scenario: Empty desired state only removes managed entities ───────────
+
+    #[test]
+    fn test_empty_desired_removes_only_managed_entities_leaves_unmanaged_alone() {
+        // Scenario: Empty desired state only removes managed entities
+        // Given desired StateSet is empty
+        // And actual StateSet contains ethernet/eth0, ethernet/eth1, and ethernet/eth2
+        // And managed_entities contains only ethernet/eth0 and ethernet/eth1
+        // Then the StateDiff has 2 Remove operations (eth0 and eth1)
+        // And ethernet/eth2 is not in the diff (unmanaged)
+        let desired = StateSet::new();
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+        actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
+        actual.insert(make_state("ethernet", "eth2", vec![("mtu", Value::U64(1500))])); // unmanaged
+        let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> = [
+            ("ethernet".to_string(), "eth0".to_string()),
+            ("ethernet".to_string(), "eth1".to_string()),
+            // eth2 intentionally absent from managed_entities
+        ]
+        .into_iter()
+        .collect();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.removals().count(), 2, "should have exactly 2 Remove operations (eth0, eth1)");
+        assert_eq!(diff.additions().count(), 0, "should have no Add operations");
+        assert_eq!(diff.modifications().count(), 0, "should have no Modify operations");
+
+        // eth2 is unmanaged — must not appear in any operation
+        let selectors_in_diff: Vec<String> =
+            diff.operations.iter().map(|op| op.selector.key()).collect();
+        assert!(
+            !selectors_in_diff.contains(&"eth2".to_string()),
+            "unmanaged eth2 must not appear in any diff operation; ops: {:?}",
+            selectors_in_diff
+        );
+    }
+
+    // ── Scenario: Multiple entities spec scenario with explicit unmanaged eth3 ─
+
+    #[test]
+    fn test_multiple_entities_unmanaged_eth3_not_in_diff() {
+        // Exact spec scenario:
+        //   desired: eth0 (mtu=9000), eth2 (mtu=1500)
+        //   actual:  eth0 (mtu=1500), eth1 (mtu=1500), eth3 (mtu=1500)
+        //   managed: eth0, eth1, eth2
+        //   eth3 is unmanaged → must not appear
+        let mut desired = StateSet::new();
+        desired.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(9000))]));
+        desired.insert(make_state("ethernet", "eth2", vec![("mtu", Value::U64(1500))]));
+
+        let mut actual = StateSet::new();
+        actual.insert(make_state("ethernet", "eth0", vec![("mtu", Value::U64(1500))]));
+        actual.insert(make_state("ethernet", "eth1", vec![("mtu", Value::U64(1500))]));
+        actual.insert(make_state("ethernet", "eth3", vec![("mtu", Value::U64(1500))])); // unmanaged
+
+        let schema = SchemaRegistry::new();
+        let managed: std::collections::HashSet<(String, String)> = [
+            ("ethernet".to_string(), "eth0".to_string()),
+            ("ethernet".to_string(), "eth1".to_string()),
+            ("ethernet".to_string(), "eth2".to_string()),
+            // eth3 intentionally absent
+        ]
+        .into_iter()
+        .collect();
+
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
+
+        assert_eq!(diff.len(), 3, "should have 3 operations: Modify eth0, Remove eth1, Add eth2");
+        assert_eq!(diff.additions().count(), 1, "1 addition expected (eth2)");
+        assert_eq!(diff.removals().count(), 1, "1 removal expected (eth1)");
+        assert_eq!(diff.modifications().count(), 1, "1 modification expected (eth0)");
+
+        let selectors_in_diff: Vec<String> =
+            diff.operations.iter().map(|op| op.selector.key()).collect();
+        assert!(
+            !selectors_in_diff.contains(&"eth3".to_string()),
+            "unmanaged eth3 must not appear in any diff operation; ops: {:?}",
+            selectors_in_diff
+        );
     }
 
     // ── Edge case: writable field in unknown entity type is always diffed ─────
@@ -811,8 +986,9 @@ mod tests {
             ],
         ));
         let schema = SchemaRegistry::new();
+        let managed = std::collections::HashSet::<(String, String)>::new();
 
-        let diff = generate_diff(&desired, &actual, &schema);
+        let diff = generate_diff(&desired, &actual, &managed, &schema);
 
         // lacp-rate is not in desired and has no schema → treated as writable → Unset
         assert_eq!(diff.len(), 1, "unknown entity type fields treated as writable → Modify");

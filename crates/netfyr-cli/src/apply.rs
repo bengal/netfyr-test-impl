@@ -5,6 +5,7 @@
 //! 1. **Daemon-free**: Connect to daemon fails → static policies only, apply directly.
 //! 2. **Daemon**: Connect succeeds → submit policies via Varlink, daemon reconciles.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use netfyr_policy::{
     load_policy_dir, load_policy_file, FactoryType, PolicySet, StaticFactory, StateFactory,
 };
 use netfyr_reconcile::{
-    generate_diff, merge, ConflictReport, DiffReport, PolicyId, PolicyInput,
+    generate_diff, merge, ConflictReport, DiffReport, EntityKey, PolicyId, PolicyInput,
     StateDiff as ReconcileDiff,
 };
 // Import the state-level diff function via its full module path to avoid the
@@ -88,6 +89,12 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     // 4. Convert each policy into a PolicyInput for the reconciliation engine.
     let inputs = policies_to_inputs(&policy_set)?;
 
+    // Compute managed_entities before merge() consumes the inputs.
+    let managed_entities: HashSet<EntityKey> = inputs
+        .iter()
+        .flat_map(|input| input.state_set.entities())
+        .collect();
+
     // 5. Reconcile: merge all inputs into an effective state, detecting conflicts.
     let reconciliation = merge(inputs);
 
@@ -104,10 +111,11 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     //    - reconcile diff: rich per-field diff for display (old→new values)
     //    - state diff: lightweight diff consumed by registry.apply()
     //
-    // generate_diff(desired, actual, schema) — desired first, then actual
+    // generate_diff(desired, actual, managed_entities, schema) — desired first, then actual
     // compute_state_diff(from, to) — from=actual, to=desired
     let schema = SchemaRegistry::default();
-    let reconcile_diff: ReconcileDiff = generate_diff(effective_state, &actual_state, &schema);
+    let reconcile_diff: ReconcileDiff =
+        generate_diff(effective_state, &actual_state, &managed_entities, &schema);
     let state_diff: StateDiffState = compute_state_diff(&actual_state, effective_state);
 
     // 8. Dry-run: display planned changes and exit without applying.
