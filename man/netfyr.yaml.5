@@ -1,0 +1,348 @@
+.\" This file is maintained by hand. Do not edit with cargo xtask man.
+.TH "NETFYR.YAML" 5 "" "" "File Formats Manual"
+.SH NAME
+netfyr.yaml \- netfyr policy file formats
+.SH DESCRIPTION
+netfyr reads YAML files from
+.I /etc/netfyr/policies/
+to configure network interfaces.
+This page documents all supported YAML formats and their fields.
+.PP
+Files may contain multiple YAML documents separated by
+.BR \-\-\- .
+Each document is parsed independently and produces one policy.
+.PP
+For worked configuration examples, see
+.BR netfyr\-examples (7).
+.SH "BARE STATE FORMAT"
+The simplest format.
+A YAML document with no
+.B kind
+field declares the desired state of a single network entity.
+It is automatically wrapped into a static policy with default priority 100
+and a name derived from the filename.
+.PP
+All properties are written at the top level in a flat format:
+.B type
+and selector properties (see
+.BR SELECTORS )
+identify the target entity, and configuration properties (see
+.BR FIELDS )
+declare its desired state.
+.PP
+Fields:
+.TP
+.B type
+(string, required)
+The entity type.
+Currently supported:
+.BR ethernet .
+.TP
+.B "Selector properties (at top level)"
+See
+.B SELECTORS
+below.
+Fields:
+.BR name ,
+.BR driver ,
+.BR mac ,
+.BR pci_path .
+.TP
+.B "Configuration properties (at top level)"
+See
+.B FIELDS
+below.
+For ethernet:
+.BR mtu ,
+.BR addresses ,
+.BR routes ,
+.BR state .
+.PP
+Example:
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 1500
+addresses:
+  - 10.0.1.50/24
+.fi
+.RE
+.SH "POLICY FORMAT"
+A YAML document with
+.BR "kind: policy" .
+Provides explicit control over the factory type, priority, and naming.
+.PP
+Fields:
+.TP
+.B kind
+(string, required)
+Must be
+.BR policy .
+.TP
+.B name
+(string, required)
+Unique policy name.
+Used in conflict reports and provenance tracking.
+.TP
+.B factory
+(string, required)
+Factory type.
+One of:
+.BR static ,
+.BR dhcpv4 .
+.RS
+.TP
+.B static
+Produces states from the literal
+.B state
+or
+.B states
+fields defined in this policy.
+.TP
+.B dhcpv4
+Acquires an address via DHCPv4 for the interface identified by
+.BR selector .
+Requires the netfyr daemon to be running.
+.RE
+.TP
+.B priority
+(integer, optional, default: 100)
+Numeric priority for field-level conflict resolution.
+Higher values take precedence when two policies set the same field on the
+same interface.
+.TP
+.B selector
+(mapping, required for dhcpv4)
+Identifies the target interface.
+Used with
+.BR "factory: dhcpv4" .
+For static policies, selector fields are written inside
+.B state
+or
+.B states
+instead.
+See
+.B SELECTORS
+below for the available fields.
+.TP
+.B state
+(mapping, optional)
+A single entity state definition in flat format, with the same structure as
+the bare state format.
+Mutually exclusive with
+.BR states .
+Used with
+.BR "factory: static" .
+.TP
+.B states
+(sequence, optional)
+A list of entity state definitions in flat format.
+Used when a policy produces multiple entities.
+Mutually exclusive with
+.BR state .
+Used with
+.BR "factory: static" .
+.PP
+Example (static, single state):
+.RS 4
+.nf
+kind: policy
+name: server\-network
+factory: static
+priority: 150
+state:
+  type: ethernet
+  name: eth0
+  mtu: 9000
+  addresses:
+    - 10.0.1.50/24
+.fi
+.RE
+.PP
+Example (static, multiple states):
+.RS 4
+.nf
+kind: policy
+name: server\-network
+factory: static
+priority: 150
+states:
+  - type: ethernet
+    name: eth0
+    mtu: 9000
+    addresses:
+      - 10.0.1.50/24
+  - type: ethernet
+    name: eth1
+    mtu: 1500
+.fi
+.RE
+.PP
+Example (dhcpv4):
+.RS 4
+.nf
+kind: policy
+name: eth0\-dhcp
+factory: dhcpv4
+selector:
+  name: eth0
+.fi
+.RE
+.SH "MULTI-DOCUMENT FILES"
+A single YAML file may contain multiple documents separated by
+.BR \-\-\- .
+Each document is parsed independently and produces one policy.
+.PP
+Example:
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 9000
+---
+type: ethernet
+name: eth1
+mtu: 1500
+.fi
+.RE
+.SH SELECTORS
+Selector fields identify which system entity a state targets.
+They are written at the top level of a state definition, alongside the
+.B type
+and configuration fields.
+All specified selector fields must match (AND logic).
+.TP
+.B name
+(string)
+Exact interface name (e.g.,
+.BR eth0 ).
+.TP
+.B driver
+(string)
+Kernel driver name (e.g.,
+.BR ixgbe ).
+.TP
+.B pci_path
+(string)
+PCI device path (e.g.,
+.BR 0000:03:00.0 ).
+.TP
+.B mac
+(string)
+MAC address in colon-separated hexadecimal (e.g.,
+.BR aa:bb:cc:dd:ee:ff ).
+Comparison is case-insensitive.
+.PP
+Note: In
+.B dhcpv4
+policies, selector fields are wrapped in a
+.B selector:
+mapping at the policy level rather than inside a state block, because the
+policy-level
+.B name
+field would otherwise collide with the interface name selector.
+.SH FIELDS
+Configuration fields are written at the top level of a state definition,
+alongside the
+.B type
+and selector properties.
+The available fields depend on the entity type.
+.SS Ethernet
+The following fields apply to
+.BR "type: ethernet" .
+.TP
+.B mtu
+(integer)
+Maximum transmission unit in bytes.
+Valid range: 68\(en65535.
+.TP
+.B addresses
+(sequence of strings)
+IP addresses assigned to the interface, in CIDR notation
+(e.g.,
+.BR 10.0.1.50/24 ).
+Both IPv4 and IPv6 addresses are accepted.
+.TP
+.B routes
+(sequence of mappings)
+Static routes to configure.
+Each route mapping supports the following keys:
+.RS
+.TP
+.B destination
+(string, required)
+Route destination in CIDR notation (e.g.,
+.BR 0.0.0.0/0 ).
+.TP
+.B gateway
+(string, optional)
+Next-hop IP address (e.g.,
+.BR 10.0.1.1 ).
+.TP
+.B metric
+(integer, optional)
+Route metric (lower values are preferred).
+.RE
+.TP
+.B state
+(string)
+Administrative state of the interface.
+Accepted values:
+.BR up ,
+.BR down .
+.SH "VALUE TYPES"
+YAML scalars are mapped to netfyr internal types as follows:
+.TP
+.B "YAML boolean"
+netfyr
+.B Bool
+.TP
+.B "YAML integer >= 0"
+netfyr
+.B U64
+.TP
+.B "YAML integer < 0"
+netfyr
+.B I64
+.TP
+.B "YAML string (valid IP address)"
+netfyr
+.B IpAddr
+(e.g.,
+.BR 10.0.0.1 ,
+.BR "::1" )
+.TP
+.B "YAML string (valid CIDR prefix)"
+netfyr
+.B IpNetwork
+(e.g.,
+.BR 10.0.0.0/24 )
+.TP
+.B "YAML string (other)"
+netfyr
+.B String
+.TP
+.B "YAML sequence"
+netfyr
+.B List
+.TP
+.B "YAML mapping"
+netfyr
+.B Map
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Policy and bare state YAML files.
+Loaded at daemon startup and when
+.B netfyr apply
+is invoked.
+.TP
+.I /var/lib/netfyr/policies/
+Daemon-persisted policies managed automatically by the netfyr daemon.
+Do not edit these files by hand.
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr\-apply (1),
+.BR netfyr\-query (1),
+.BR netfyr\-examples (7)
