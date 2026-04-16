@@ -26,7 +26,7 @@ netns_setup() {
     fi
 
     export __NETNS_ENTERED=1
-    exec unshare --user --net -- "$0" "$@"
+    exec unshare --user --net --map-root-user -- "$0" "$@"
     # exec replaces the shell; code below is unreachable.
 }
 

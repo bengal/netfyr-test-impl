@@ -289,6 +289,192 @@ fn parse_route_message(
     ))
 }
 
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netlink_packet_route::link::InfoKind;
+    use netlink_packet_route::route::RouteAddress;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ── format_mac ────────────────────────────────────────────────────────────
+
+    /// format_mac produces lowercase colon-separated hex for all-zero MAC.
+    #[test]
+    fn test_format_mac_all_zeros() {
+        let bytes = [0u8; 6];
+        assert_eq!(format_mac(&bytes), "00:00:00:00:00:00");
+    }
+
+    /// format_mac produces lowercase colon-separated hex for all-0xFF MAC.
+    #[test]
+    fn test_format_mac_all_ff() {
+        let bytes = [0xFFu8; 6];
+        assert_eq!(format_mac(&bytes), "ff:ff:ff:ff:ff:ff");
+    }
+
+    /// format_mac produces lowercase hex (not uppercase) for mixed bytes.
+    #[test]
+    fn test_format_mac_mixed_bytes_produces_lowercase() {
+        let bytes = [0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0xEEu8, 0x01u8];
+        let result = format_mac(&bytes);
+        assert_eq!(result, "aa:bb:cc:dd:ee:01");
+        // Ensure no uppercase letters
+        assert_eq!(result, result.to_lowercase(), "format_mac must produce lowercase output");
+    }
+
+    /// format_mac output has exactly 17 characters (6 octets + 5 colons).
+    #[test]
+    fn test_format_mac_length_is_17() {
+        let bytes = [0x12u8, 0x34u8, 0x56u8, 0x78u8, 0x9Au8, 0xBCu8];
+        let result = format_mac(&bytes);
+        assert_eq!(result.len(), 17, "MAC string must be 17 characters long: {result}");
+    }
+
+    /// format_mac includes exactly 5 colon separators.
+    #[test]
+    fn test_format_mac_has_five_colons() {
+        let bytes = [0x01u8, 0x02u8, 0x03u8, 0x04u8, 0x05u8, 0x06u8];
+        let result = format_mac(&bytes);
+        assert_eq!(result.chars().filter(|&c| c == ':').count(), 5);
+    }
+
+    // ── is_excluded_kind ──────────────────────────────────────────────────────
+
+    /// Scenario: bridge interfaces are excluded from ethernet query results.
+    #[test]
+    fn test_is_excluded_kind_excludes_bridge() {
+        assert!(is_excluded_kind(&InfoKind::Bridge), "Bridge must be excluded");
+    }
+
+    /// Scenario: bond interfaces are excluded from ethernet query results.
+    #[test]
+    fn test_is_excluded_kind_excludes_bond() {
+        assert!(is_excluded_kind(&InfoKind::Bond), "Bond must be excluded");
+    }
+
+    /// Scenario: vlan interfaces are excluded from ethernet query results.
+    #[test]
+    fn test_is_excluded_kind_excludes_vlan() {
+        assert!(is_excluded_kind(&InfoKind::Vlan), "Vlan must be excluded");
+    }
+
+    /// Dummy interfaces are excluded.
+    #[test]
+    fn test_is_excluded_kind_excludes_dummy() {
+        assert!(is_excluded_kind(&InfoKind::Dummy), "Dummy must be excluded");
+    }
+
+    /// Vxlan interfaces are excluded.
+    #[test]
+    fn test_is_excluded_kind_excludes_vxlan() {
+        assert!(is_excluded_kind(&InfoKind::Vxlan), "Vxlan must be excluded");
+    }
+
+    /// MacVlan interfaces are excluded.
+    #[test]
+    fn test_is_excluded_kind_excludes_macvlan() {
+        assert!(is_excluded_kind(&InfoKind::MacVlan), "MacVlan must be excluded");
+    }
+
+    /// Wireguard interfaces are excluded.
+    #[test]
+    fn test_is_excluded_kind_excludes_wireguard() {
+        assert!(is_excluded_kind(&InfoKind::Wireguard), "Wireguard must be excluded");
+    }
+
+    /// Tun interfaces are excluded.
+    #[test]
+    fn test_is_excluded_kind_excludes_tun() {
+        assert!(is_excluded_kind(&InfoKind::Tun), "Tun must be excluded");
+    }
+
+    /// Veth interfaces are NOT excluded — they appear in ethernet query results.
+    ///
+    /// This is critical: integration tests use veth pairs and expect them to appear.
+    #[test]
+    fn test_is_excluded_kind_includes_veth() {
+        assert!(!is_excluded_kind(&InfoKind::Veth), "Veth must NOT be excluded from ethernet results");
+    }
+
+    // ── build_route_value ─────────────────────────────────────────────────────
+
+    /// build_route_value without gateway produces a map with destination and metric.
+    #[test]
+    fn test_build_route_value_without_gateway() {
+        let val = build_route_value("10.0.0.0/24", None, 100);
+        let map = val.as_map().expect("build_route_value must return Value::Map");
+        assert!(map.contains_key("destination"), "map must have 'destination' key");
+        assert!(map.contains_key("metric"),      "map must have 'metric' key");
+        assert!(!map.contains_key("gateway"),    "map must NOT have 'gateway' key when not provided");
+        assert_eq!(map["destination"].as_str(), Some("10.0.0.0/24"));
+        assert_eq!(map["metric"].as_u64(), Some(100));
+    }
+
+    /// build_route_value with gateway produces a map with destination, gateway, and metric.
+    #[test]
+    fn test_build_route_value_with_gateway() {
+        let val = build_route_value("0.0.0.0/0", Some("192.168.1.1"), 0);
+        let map = val.as_map().expect("build_route_value must return Value::Map");
+        assert!(map.contains_key("destination"), "map must have 'destination' key");
+        assert!(map.contains_key("gateway"),     "map must have 'gateway' key when provided");
+        assert!(map.contains_key("metric"),      "map must have 'metric' key");
+        assert_eq!(map["destination"].as_str(), Some("0.0.0.0/0"));
+        assert_eq!(map["gateway"].as_str(), Some("192.168.1.1"));
+        assert_eq!(map["metric"].as_u64(), Some(0));
+    }
+
+    /// build_route_value gateway field is only present when Some(_) is passed.
+    #[test]
+    fn test_build_route_value_gateway_field_absent_when_none() {
+        let val = build_route_value("::/0", None, 512);
+        let map = val.as_map().unwrap();
+        assert!(!map.contains_key("gateway"), "gateway must be absent when None");
+        assert_eq!(map["metric"].as_u64(), Some(512));
+    }
+
+    /// build_route_value preserves the metric value exactly.
+    #[test]
+    fn test_build_route_value_metric_preserved() {
+        let val = build_route_value("10.99.0.0/24", None, 1024);
+        let map = val.as_map().unwrap();
+        assert_eq!(map["metric"].as_u64(), Some(1024));
+    }
+
+    // ── route_address_to_ip ───────────────────────────────────────────────────
+
+    /// route_address_to_ip converts IPv4 RouteAddress to IpAddr::V4.
+    #[test]
+    fn test_route_address_to_ip_v4() {
+        let addr = RouteAddress::Inet(Ipv4Addr::new(10, 0, 1, 1));
+        let ip = route_address_to_ip(&addr).expect("IPv4 RouteAddress must convert");
+        assert!(ip.is_ipv4(), "must produce an IPv4 address");
+        assert_eq!(ip.to_string(), "10.0.1.1");
+    }
+
+    /// route_address_to_ip converts IPv6 RouteAddress to IpAddr::V6.
+    #[test]
+    fn test_route_address_to_ip_v6() {
+        let addr = RouteAddress::Inet6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        let ip = route_address_to_ip(&addr).expect("IPv6 RouteAddress must convert");
+        assert!(ip.is_ipv6(), "must produce an IPv6 address");
+    }
+
+    /// route_address_to_ip returns None for the Other/Mpls variants.
+    #[test]
+    fn test_route_address_to_ip_other_returns_none() {
+        // RouteAddress::Mpls is an example of a non-IP variant.
+        // We use the RouteAddress::Other variant if available.
+        // The simplest non-Inet/Inet6 is RouteAddress::Other(vec![]).
+        let addr = RouteAddress::Other(vec![0u8; 4]);
+        assert!(
+            route_address_to_ip(&addr).is_none(),
+            "Non-IP RouteAddress variants must return None"
+        );
+    }
+}
+
 // ── Main query function ───────────────────────────────────────────────────────
 
 /// Query ethernet interfaces via rtnetlink.

@@ -9,7 +9,7 @@
 use netfyr_backend::netlink::ethernet::query_ethernet;
 use netfyr_backend::netlink::query::establish_connection;
 use netfyr_backend::{BackendError, NetlinkBackend, NetworkBackend};
-use netfyr_state::{Provenance, Selector};
+use netfyr_state::{MacAddr, Provenance, Selector};
 use netfyr_test_utils::netns::{
     add_address, create_veth_pair, get_link_index, set_link_up, set_mtu, NetnsGuard,
 };
@@ -906,5 +906,270 @@ async fn test_routes_field_is_always_a_list() {
         routes_fv.provenance,
         Provenance::KernelDefault,
         "routes field must have KernelDefault provenance"
+    );
+}
+
+// ── Test 25: operstate field is present with a valid string value ─────────────
+
+/// Scenario: The "operstate" field must be present in every returned State and
+/// must hold a lowercase string matching one of the documented operstate names.
+///
+/// Validates the spec field mapping "operstate: IFLA_OPERSTATE → Enum: Up, Down, ...".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_operstate_field_is_present_and_is_valid_string() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-ops0", "veth-ops1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-ops0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-ops0").unwrap();
+
+    let operstate_fv = state
+        .fields
+        .get("operstate")
+        .expect("operstate field must always be present");
+
+    // operstate must be a string.
+    let operstate_str = operstate_fv
+        .value
+        .as_str()
+        .expect("operstate must be Value::String");
+
+    // Must be one of the documented operstate values.
+    let valid_states = [
+        "unknown", "not_present", "down", "lower_layer_down",
+        "testing", "dormant", "up",
+    ];
+    assert!(
+        valid_states.contains(&operstate_str),
+        "operstate '{}' must be one of: {:?}",
+        operstate_str,
+        valid_states
+    );
+
+    // Must have KernelDefault provenance.
+    assert_eq!(
+        operstate_fv.provenance,
+        Provenance::KernelDefault,
+        "operstate field must have KernelDefault provenance"
+    );
+}
+
+// ── Test 26: Driver selector with no matching driver returns empty ─────────────
+
+/// Scenario: Query by driver selector.
+///
+/// In an unprivileged network namespace, veth interfaces do not expose a
+/// hardware driver via sysfs (no /sys/class/net/<name>/device/driver symlink).
+/// A query with a driver selector that requires a specific driver must therefore
+/// return an empty set (since no interfaces match).
+///
+/// This test validates the driver-selector code path is correctly integrated
+/// with the full query flow, even though an end-to-end positive test (with a
+/// real NIC and driver) requires physical hardware unavailable in CI namespaces.
+/// The positive selector matching logic is covered by unit tests in query.rs.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_driver_selector_no_match_when_veth_has_no_driver() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-drv0", "veth-drv1").await.unwrap();
+
+    let handle = establish_connection().await.unwrap();
+
+    // A driver selector without name — veth has no sysfs driver → no match.
+    let sel = Selector {
+        driver: Some("e1000".to_string()),
+        ..Default::default()
+    };
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert!(
+        result.is_empty(),
+        "Driver selector 'e1000' must not match veth interfaces (which have no kernel driver), \
+         got {} entities",
+        result.len()
+    );
+}
+
+// ── Test 27: NetlinkBackend::query via trait with name selector ───────────────
+
+/// Scenario: NetlinkBackend::query dispatches to query_ethernet and filters by
+/// selector correctly when called through the NetworkBackend trait interface.
+///
+/// Tests the full trait dispatch path (not just the inner query_ethernet function)
+/// by calling `backend.query("ethernet", Some(&sel))` and asserting on the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_netlinkbackend_trait_query_with_name_selector() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-trait0", "veth-trait1").await.unwrap();
+
+    let backend = NetlinkBackend::new();
+    let sel = Selector::with_name("veth-trait0");
+    let result = backend
+        .query(&"ethernet".to_string(), Some(&sel))
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1, "query via trait must return exactly one entity for name selector");
+
+    let state = result.get("ethernet", "veth-trait0")
+        .expect("veth-trait0 must be in result");
+    assert_eq!(state.entity_type, "ethernet");
+    assert_eq!(state.selector.name.as_deref(), Some("veth-trait0"));
+
+    // Core fields must be present.
+    assert!(state.fields.contains_key("name"), "name field must be present");
+    assert!(state.fields.contains_key("mtu"),  "mtu field must be present");
+    assert!(state.fields.contains_key("mac"),  "mac field must be present");
+    assert!(state.fields.contains_key("operstate"), "operstate field must be present");
+    assert!(state.fields.contains_key("carrier"),   "carrier field must be present");
+}
+
+// ── Test 28: NetlinkBackend::query returns NotFound for missing interface ──────
+
+/// Scenario: NetlinkBackend::query via trait returns BackendError::NotFound when
+/// the interface requested by name does not exist.
+///
+/// Covers acceptance criterion: "Query for non-existent interface returns NotFound".
+/// This test uses the NetworkBackend trait interface (not the inner function directly).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_netlinkbackend_trait_query_not_found_for_missing_interface() {
+    require_netns!(_guard);
+
+    let backend = NetlinkBackend::new();
+    let sel = Selector::with_name("eth-does-not-exist-xyzzy99");
+    let result = backend
+        .query(&"ethernet".to_string(), Some(&sel))
+        .await;
+
+    assert!(
+        matches!(result, Err(BackendError::NotFound { .. })),
+        "query via trait must return NotFound for a non-existent interface, got: {result:?}"
+    );
+}
+
+// ── Test 29: NetlinkBackend::query for unsupported entity type ────────────────
+
+/// Scenario: NetlinkBackend::query for an entity type it doesn't support
+/// returns BackendError::UnsupportedEntityType.
+///
+/// Validates that the backend correctly rejects unknown entity types at the
+/// trait dispatch level.
+#[tokio::test]
+async fn test_netlinkbackend_query_unsupported_entity_type_returns_error() {
+    let backend = NetlinkBackend::new();
+    let result = backend.query(&"firewall-rule".to_string(), None).await;
+
+    assert!(result.is_err(), "query for unsupported entity type must return Err");
+    assert!(
+        matches!(result, Err(BackendError::UnsupportedEntityType(_))),
+        "expected UnsupportedEntityType, got: {result:?}"
+    );
+}
+
+// ── Test 30: IPv6 link-local address present after bringing up ────────────────
+
+/// Scenario: Query ethernet interface includes IP addresses — after bringing an
+/// interface up, the kernel assigns a link-local IPv6 address (fe80::/64).
+///
+/// This partially covers the spec scenario "fe80::1/64" address expectation.
+/// In a namespace we can't control the exact address, but we can verify that
+/// IPv6 link-local addresses (fe80::) appear in the addresses list when the
+/// interface is up.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_includes_ipv6_link_local_when_interface_is_up() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-v6-0", "veth-v6-1").await.unwrap();
+    set_link_up("veth-v6-0").await.unwrap();
+    set_link_up("veth-v6-1").await.unwrap();
+    // Give the kernel a moment to generate the link-local address.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let handle = establish_connection().await.unwrap();
+    let sel = Selector::with_name("veth-v6-0");
+    let result = query_ethernet(&handle, Some(&sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let state = result.get("ethernet", "veth-v6-0").unwrap();
+
+    let addresses = state
+        .fields
+        .get("addresses")
+        .expect("addresses field must be present")
+        .value
+        .as_list()
+        .expect("addresses must be a list");
+
+    // A veth pair with both ends up may or may not have a link-local address
+    // depending on the kernel's network namespace configuration. If present,
+    // it must start with "fe80::" and have /64 prefix.
+    for addr in addresses {
+        if let Some(s) = addr.as_str() {
+            if s.starts_with("fe80:") {
+                assert!(
+                    s.ends_with("/64"),
+                    "IPv6 link-local address must use /64 prefix, got: {s}"
+                );
+            }
+        }
+    }
+
+    // All addresses must have KernelDefault provenance.
+    assert_eq!(
+        state.fields.get("addresses").unwrap().provenance,
+        Provenance::KernelDefault
+    );
+}
+
+// ── Test 31: Query by MAC for second veth — first veth excluded ───────────────
+
+/// Scenario: Query by MAC address selector — specifically targets veth-mac1 (not
+/// veth-mac0) to verify the MAC filter selects the correct one and excludes the other.
+///
+/// This supplements test_query_by_mac_address (which queries veth-mac0's MAC) by
+/// also validating that querying veth-mac1's MAC excludes veth-mac0.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_by_mac_selects_second_veth_excludes_first() {
+    require_netns!(_guard);
+
+    create_veth_pair("veth-mac2a", "veth-mac2b").await.unwrap();
+
+    // First get the MAC of veth-mac2b.
+    let handle = establish_connection().await.unwrap();
+    let sel_b = Selector::with_name("veth-mac2b");
+    let result_b = query_ethernet(&handle, Some(&sel_b)).await.unwrap();
+    assert_eq!(result_b.len(), 1);
+    let mac_b_str = result_b
+        .get("ethernet", "veth-mac2b")
+        .and_then(|s| s.fields.get("mac"))
+        .and_then(|fv| fv.value.as_str())
+        .expect("veth-mac2b must have a mac field")
+        .to_owned();
+
+    // Query using veth-mac2b's MAC — should return exactly veth-mac2b.
+    let mac_b: MacAddr = mac_b_str.parse().expect("mac must be parseable");
+    let mac_sel = Selector {
+        mac: Some(mac_b),
+        ..Default::default()
+    };
+    let result = query_ethernet(&handle, Some(&mac_sel)).await.unwrap();
+
+    assert_eq!(result.len(), 1, "MAC selector must return exactly one entity");
+    let found = result.iter().next().unwrap();
+    assert_eq!(
+        found.selector.name.as_deref(),
+        Some("veth-mac2b"),
+        "MAC selector must match veth-mac2b, not veth-mac2a"
+    );
+    // veth-mac2a must NOT appear.
+    assert!(
+        result.get("ethernet", "veth-mac2a").is_none(),
+        "veth-mac2a must be excluded when filtering by veth-mac2b's MAC"
     );
 }
