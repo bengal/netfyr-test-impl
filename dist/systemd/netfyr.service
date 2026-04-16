@@ -1,0 +1,15 @@
+[Unit]
+Description=Netfyr declarative network configuration daemon
+After=network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/netfyr-daemon
+Restart=on-failure
+RuntimeDirectory=netfyr
+StateDirectory=netfyr
+
+[Install]
+WantedBy=multi-user.target

@@ -3,16 +3,38 @@ name = "netfyr-daemon"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "netfyr-daemon"
+path = "src/main.rs"
+
 [dependencies]
 netfyr-policy = { path = "../netfyr-policy" }
 netfyr-state = { path = "../netfyr-state" }
+netfyr-backend = { path = "../netfyr-backend" }
+netfyr-reconcile = { path = "../netfyr-reconcile" }
+netfyr-varlink = { path = "../netfyr-varlink" }
 # serde_yaml: YAML serialization for policy files on disk
 serde_yaml = "0.9"
 # anyhow: spec-mandated error handling for the daemon crate
 anyhow = "1"
 # tracing: structured logging for warnings on skipped/malformed files
 tracing = "0.1"
+# tokio: async runtime with signal handling, Unix sockets, channels, timers
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "io-util"] }
+# serde / serde_json: Varlink JSON wire protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# sd-notify: systemd readiness notification (READY=1); no-op when $NOTIFY_SOCKET unset
+sd-notify = "0.4"
+# tracing-subscriber: formats tracing events to stderr/stdout for the daemon process
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 # tempfile: creates temporary directories for unit tests
 tempfile = "3"
+# netfyr-test-utils: NetnsGuard and DnsmasqGuard for integration tests
+netfyr-test-utils = { path = "../netfyr-test-utils" }
+# rtnetlink / netlink-packet-route: used in netns integration tests to verify applied state
+rtnetlink = "0.20"
+netlink-packet-route = "0.28"
+futures = "0.3"

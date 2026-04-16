@@ -1,0 +1,9 @@
+[Unit]
+Description=Netfyr Varlink socket
+
+[Socket]
+ListenStream=/run/netfyr/netfyr.sock
+SocketMode=0666
+
+[Install]
+WantedBy=sockets.target
