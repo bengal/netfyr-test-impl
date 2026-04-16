@@ -277,7 +277,8 @@ async fn test_factory_retries_on_discovery_timeout() {
                 Some(FactoryEvent::LeaseAcquired { .. }) => {
                     panic!("unexpected LeaseAcquired with no DHCP server")
                 }
-                _ => return None,
+                None => return None,
+                _ => continue,
             }
         }
     })

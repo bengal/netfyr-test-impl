@@ -309,7 +309,7 @@ mod tests {
         let text = report.format_text();
 
         // The spec says: "~   mtu: 1500 → 9000"
-        let expected = format!("~   mtu: 1500 \u{2192} 9000");
+        let expected = "~   mtu: 1500 \u{2192} 9000".to_string();
         assert!(
             text.contains(&expected),
             "changed field must use '~   mtu: 1500 → 9000' format, got:\n{text}"

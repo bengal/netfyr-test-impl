@@ -146,6 +146,76 @@ impl Dhcpv4Factory {
     }
 }
 
+// ── State conversion ──────────────────────────────────────────────────────────
+
+/// Convert a DHCP lease into a `State` with `UserConfigured` provenance.
+///
+/// Follows the exact field naming, value types, and map structure used by
+/// `netlink/ethernet.rs` to ensure reconciliation compatibility:
+/// - Addresses stored as `Value::String("ip/prefix")`.
+/// - Routes stored as `Value::Map` with `"destination"` and `"gateway"` keys.
+/// - DNS servers stored as `Value::List` of `Value::String`.
+pub fn lease_to_state(
+    lease: &DhcpLease,
+    interface: &str,
+    policy_name: &str,
+    priority: u32,
+) -> State {
+    let prov = Provenance::UserConfigured {
+        policy_ref: policy_name.to_string(),
+    };
+
+    let fv = |value: Value| FieldValue {
+        value,
+        provenance: prov.clone(),
+    };
+
+    let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
+
+    // Addresses field: ["ip/prefix"]
+    let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
+    fields.insert(
+        "addresses".to_string(),
+        fv(Value::List(vec![Value::String(cidr)])),
+    );
+
+    // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip"}]
+    if let Some(gateway) = lease.gateway {
+        let mut route_map = IndexMap::new();
+        route_map.insert(
+            "destination".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        route_map.insert(
+            "gateway".to_string(),
+            Value::String(gateway.to_string()),
+        );
+        fields.insert(
+            "routes".to_string(),
+            fv(Value::List(vec![Value::Map(route_map)])),
+        );
+    }
+
+    // DNS servers field: ["server1", "server2", ...]
+    if !lease.dns_servers.is_empty() {
+        let dns_list: Vec<Value> = lease
+            .dns_servers
+            .iter()
+            .map(|s| Value::String(s.to_string()))
+            .collect();
+        fields.insert("dns_servers".to_string(), fv(Value::List(dns_list)));
+    }
+
+    State {
+        entity_type: "ethernet".to_string(),
+        selector: Selector::with_name(interface),
+        fields,
+        metadata: StateMetadata::new(),
+        policy_ref: Some(policy_name.to_string()),
+        priority,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -447,75 +517,5 @@ mod tests {
                 other
             ),
         }
-    }
-}
-
-// ── State conversion ──────────────────────────────────────────────────────────
-
-/// Convert a DHCP lease into a `State` with `UserConfigured` provenance.
-///
-/// Follows the exact field naming, value types, and map structure used by
-/// `netlink/ethernet.rs` to ensure reconciliation compatibility:
-/// - Addresses stored as `Value::String("ip/prefix")`.
-/// - Routes stored as `Value::Map` with `"destination"` and `"gateway"` keys.
-/// - DNS servers stored as `Value::List` of `Value::String`.
-pub fn lease_to_state(
-    lease: &DhcpLease,
-    interface: &str,
-    policy_name: &str,
-    priority: u32,
-) -> State {
-    let prov = Provenance::UserConfigured {
-        policy_ref: policy_name.to_string(),
-    };
-
-    let fv = |value: Value| FieldValue {
-        value,
-        provenance: prov.clone(),
-    };
-
-    let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
-
-    // Addresses field: ["ip/prefix"]
-    let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
-    fields.insert(
-        "addresses".to_string(),
-        fv(Value::List(vec![Value::String(cidr)])),
-    );
-
-    // Routes field: [{destination: "0.0.0.0/0", gateway: "gw_ip"}]
-    if let Some(gateway) = lease.gateway {
-        let mut route_map = IndexMap::new();
-        route_map.insert(
-            "destination".to_string(),
-            Value::String("0.0.0.0/0".to_string()),
-        );
-        route_map.insert(
-            "gateway".to_string(),
-            Value::String(gateway.to_string()),
-        );
-        fields.insert(
-            "routes".to_string(),
-            fv(Value::List(vec![Value::Map(route_map)])),
-        );
-    }
-
-    // DNS servers field: ["server1", "server2", ...]
-    if !lease.dns_servers.is_empty() {
-        let dns_list: Vec<Value> = lease
-            .dns_servers
-            .iter()
-            .map(|s| Value::String(s.to_string()))
-            .collect();
-        fields.insert("dns_servers".to_string(), fv(Value::List(dns_list)));
-    }
-
-    State {
-        entity_type: "ethernet".to_string(),
-        selector: Selector::with_name(interface),
-        fields,
-        metadata: StateMetadata::new(),
-        policy_ref: Some(policy_name.to_string()),
-        priority,
     }
 }

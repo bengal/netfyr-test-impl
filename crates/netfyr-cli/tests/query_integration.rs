@@ -234,9 +234,7 @@ fn test_query_no_matching_entities_empty_json_array_exit_0() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).expect(&format!(
-            "output must be valid JSON for empty result; got: {stdout}"
-        ));
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("output must be valid JSON for empty result; got: {stdout}"));
     assert!(parsed.is_array(), "JSON output for empty result must be an array");
     assert!(
         parsed.as_array().unwrap().is_empty(),
@@ -297,7 +295,7 @@ mod netns_tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("output must be valid JSON; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         assert!(parsed.is_array(), "output must be a JSON array");
 
         let arr = parsed.as_array().unwrap();
@@ -368,7 +366,7 @@ mod netns_tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("output must be valid JSON; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         let arr = parsed.as_array().expect("output must be a JSON array");
         assert!(
             arr.len() >= 2,
@@ -410,7 +408,7 @@ mod netns_tests {
 
         // AC: Output is valid YAML.
         let parsed: serde_yaml::Value = serde_yaml::from_str(&stdout)
-            .expect(&format!("output must be valid YAML; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid YAML; got: {stdout}"));
         assert!(
             parsed.is_sequence(),
             "YAML output must be a sequence; got: {stdout}"
@@ -452,7 +450,7 @@ mod netns_tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("output must be valid JSON; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         let arr = parsed.as_array().expect("output must be a JSON array");
 
         // All returned entities must have type = "ethernet".
@@ -500,7 +498,7 @@ mod netns_tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("output must be valid JSON; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         let arr = parsed.as_array().expect("output must be a JSON array");
 
         // Only veth-qn0 must be present.
@@ -559,7 +557,7 @@ mod netns_tests {
         );
 
         let parsed: serde_json::Value = serde_json::from_str(&stdout)
-            .expect(&format!("output must be valid JSON; got: {stdout}"));
+            .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         let arr = parsed.as_array().expect("output must be a JSON array");
 
         // AND logic: only veth-qm0 (ethernet + name=veth-qm0) must be returned.
@@ -609,10 +607,10 @@ mod netns_tests {
 
         let short_json: serde_json::Value =
             serde_json::from_str(&short_stdout)
-                .expect(&format!("-o json must produce valid JSON; got: {short_stdout}"));
+                .unwrap_or_else(|_| panic!("-o json must produce valid JSON; got: {short_stdout}"));
         let long_json: serde_json::Value =
             serde_json::from_str(&long_stdout)
-                .expect(&format!("--output json must produce valid JSON; got: {long_stdout}"));
+                .unwrap_or_else(|_| panic!("--output json must produce valid JSON; got: {long_stdout}"));
 
         assert!(short_json.is_array(), "-o json must produce a JSON array");
         assert!(long_json.is_array(), "--output json must produce a JSON array");
@@ -649,7 +647,7 @@ mod netns_tests {
         // Simulate `jq '.[].mtu'` by parsing JSON and extracting mtu.
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout)
-                .expect(&format!("output must be valid JSON; got: {stdout}"));
+                .unwrap_or_else(|_| panic!("output must be valid JSON; got: {stdout}"));
         let arr = parsed.as_array().expect("output must be a JSON array");
         assert_eq!(arr.len(), 1, "must return 1 entity for veth-jq0");
         let mtu = arr[0]["mtu"].as_u64();
@@ -690,7 +688,7 @@ mod netns_tests {
 
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&stdout)
-                .expect(&format!("default output must be valid YAML; got: {stdout}"));
+                .unwrap_or_else(|_| panic!("default output must be valid YAML; got: {stdout}"));
 
         assert!(
             parsed.is_sequence(),

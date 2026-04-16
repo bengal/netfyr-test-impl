@@ -1,0 +1,8 @@
+kind: policy
+name: bare-ethernet
+factory: static
+priority: 100
+states:
+  - type: ethernet
+    name: eth0
+    mtu: 1500

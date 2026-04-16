@@ -291,14 +291,14 @@ mod tests {
     /// AC: FILES section header is emitted.
     #[test]
     fn test_files_section_header_present() {
-        let out = render(|buf| append_files(buf));
+        let out = render(append_files);
         assert!(out.contains(".SH FILES"), "FILES .SH header must be present");
     }
 
     /// AC: FILES section lists /etc/netfyr/policies/ (from the spec).
     #[test]
     fn test_files_section_lists_etc_netfyr_policies() {
-        let out = render(|buf| append_files(buf));
+        let out = render(append_files);
         assert!(
             out.contains("/etc/netfyr/policies/"),
             "FILES section must list /etc/netfyr/policies/"
@@ -308,7 +308,7 @@ mod tests {
     /// FILES section also documents the daemon state directory.
     #[test]
     fn test_files_section_lists_var_lib_netfyr() {
-        let out = render(|buf| append_files(buf));
+        let out = render(append_files);
         assert!(
             out.contains("/var/lib/netfyr/"),
             "FILES section must list /var/lib/netfyr/"

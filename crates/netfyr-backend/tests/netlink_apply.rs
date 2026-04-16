@@ -409,7 +409,7 @@ async fn test_apply_skips_readonly_fields_carrier_and_speed() {
     // Skipped list must contain entries for the read-only fields.
     let skip_reasons: Vec<&str> = report.skipped.iter().map(|s| s.reason.as_str()).collect();
     assert!(
-        skip_reasons.iter().any(|r| *r == "read-only field"),
+        skip_reasons.contains(&"read-only field"),
         "Expected 'read-only field' reason in skipped list, got: {skip_reasons:?}"
     );
 
