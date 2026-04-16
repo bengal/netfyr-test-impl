@@ -1,0 +1,160 @@
+.\" This file is maintained by hand. Do not edit with cargo xtask man.
+.TH NETFYR\-EXAMPLES 7 "" "" "Miscellaneous Information Manual"
+.SH NAME
+netfyr\-examples \- configuration examples for netfyr
+.SH DESCRIPTION
+This page shows annotated YAML configuration examples for common
+netfyr scenarios.
+Each example can be saved to a file in
+.I /etc/netfyr/policies/
+and applied with
+.BR "netfyr apply" .
+.PP
+For field and format reference, see
+.BR netfyr.yaml (5).
+.SH "STATIC IP ON A SINGLE INTERFACE"
+Assign a static IPv4 address, default gateway, and custom MTU to
+an interface identified by name.
+.PP
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 1500
+addresses:
+  - 10.0.1.50/24
+routes:
+  - destination: 0.0.0.0/0
+    gateway: 10.0.1.1
+.fi
+.RE
+.SH "MULTIPLE INTERFACES IN ONE FILE"
+Configure two interfaces in a single file using the multi-document
+separator
+.BR \-\-\- .
+.PP
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 9000
+addresses:
+  - 10.0.1.50/24
+---
+type: ethernet
+name: eth1
+mtu: 1500
+addresses:
+  - 192.168.1.10/24
+.fi
+.RE
+.SH "DHCP ON AN INTERFACE"
+Acquire an address via DHCPv4.
+Requires the netfyr daemon to be running.
+.PP
+.RS 4
+.nf
+kind: policy
+name: eth0\-dhcp
+factory: dhcpv4
+selector:
+  name: eth0
+.fi
+.RE
+.SH "MIXED STATIC AND DHCP"
+Two files in
+.IR /etc/netfyr/policies/ :
+one for a static management interface, one for a DHCP uplink.
+.PP
+File:
+.I /etc/netfyr/policies/mgmt.yaml
+.PP
+.RS 4
+.nf
+type: ethernet
+name: eth0
+addresses:
+  - 192.168.100.1/24
+.fi
+.RE
+.PP
+File:
+.I /etc/netfyr/policies/uplink.yaml
+.PP
+.RS 4
+.nf
+kind: policy
+name: uplink\-dhcp
+factory: dhcpv4
+selector:
+  name: eth1
+.fi
+.RE
+.SH "PRIORITY OVERRIDE"
+When two policies set the same field on the same interface, the
+higher priority wins.
+Here the admin override (priority 200) takes precedence over the
+baseline (default priority 100).
+.PP
+File:
+.I /etc/netfyr/policies/baseline.yaml
+.PP
+.RS 4
+.nf
+type: ethernet
+name: eth0
+mtu: 1500
+.fi
+.RE
+.PP
+File:
+.I /etc/netfyr/policies/override.yaml
+.PP
+.RS 4
+.nf
+kind: policy
+name: jumbo\-frames
+factory: static
+priority: 200
+state:
+  type: ethernet
+  name: eth0
+  mtu: 9000
+.fi
+.RE
+.PP
+Result: eth0 gets mtu 9000 because priority 200 > 100.
+.SH "SELECTING BY DRIVER"
+Apply jumbo frames to all interfaces using the ixgbe driver,
+regardless of interface name.
+.PP
+.RS 4
+.nf
+type: ethernet
+driver: ixgbe
+mtu: 9000
+.fi
+.RE
+.SH "DRY\-RUN WORKFLOW"
+Preview changes before applying them:
+.PP
+.RS 4
+.nf
+$ netfyr apply \-\-dry\-run /etc/netfyr/policies/
+ethernet/eth0:
+  mtu: 1500 \-> 9000
+.fi
+.RE
+.PP
+If the diff looks correct, apply for real:
+.PP
+.RS 4
+.nf
+$ netfyr apply /etc/netfyr/policies/
+.fi
+.RE
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr\-apply (1),
+.BR netfyr\-query (1),
+.BR netfyr.yaml (5)

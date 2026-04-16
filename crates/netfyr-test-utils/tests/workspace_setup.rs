@@ -286,12 +286,16 @@ fn test_binary_crates_have_correct_structure() {
             dir.join("src/main.rs").exists(),
             "{name}: src/main.rs not found"
         );
-        // Binary crates must NOT have src/lib.rs (they are binaries, not libs).
-        assert!(
-            !dir.join("src/lib.rs").exists(),
-            "{name}: unexpectedly contains src/lib.rs"
-        );
     }
+
+    // netfyr-daemon must NOT have src/lib.rs (it is a pure binary).
+    // netfyr-cli intentionally has src/lib.rs: SPEC-501 requires the xtask crate
+    // to depend on it as a library (for `Cli::command()` man page generation).
+    let daemon_dir = root.join("crates").join("netfyr-daemon");
+    assert!(
+        !daemon_dir.join("src/lib.rs").exists(),
+        "netfyr-daemon: unexpectedly contains src/lib.rs"
+    );
 }
 
 /// AC: No crate has extraneous files (src/ contains only the expected source files).

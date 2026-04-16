@@ -9,6 +9,7 @@ members = [
     "crates/netfyr-cli",
     "crates/netfyr-daemon",
     "crates/netfyr-test-utils",
+    "xtask",
 ]
 
 [workspace.features]

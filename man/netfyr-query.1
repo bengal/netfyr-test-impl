@@ -1,0 +1,71 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-query 1  "netfyr-query " 
+.SH NAME
+netfyr\-query \- Query current system network state
+.SH SYNOPSIS
+\fBnetfyr\-query\fR [\fB\-s\fR|\fB\-\-selector\fR] [\fB\-o\fR|\fB\-\-output\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Query current system network state
+.PP
+Query the current network state for all supported entity types. If the netfyr daemon is running, the query is forwarded to the daemon via Varlink. Otherwise, the kernel is queried directly via netlink.
+.PP
+Use \-\-selector (\-s) to filter results by entity type, interface name, driver, MAC address, or PCI path. Multiple selectors are combined with AND logic. Use \-\-output (\-o) to select yaml (default) or json output.
+.SH OPTIONS
+.TP
+\fB\-s\fR, \fB\-\-selector\fR \fI<SELECTOR>\fR
+Selector filters (can be specified multiple times, AND logic). Format: key=value (e.g., name=eth0, type=ethernet, driver=ixgbe)
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<OUTPUT>\fR [default: yaml]
+Output format: yaml (default), json
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+yaml
+.IP \(bu 2
+json
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+Query all network interfaces:
+.PP
+.RS 4
+.nf
+netfyr query
+.fi
+.RE
+.PP
+Query a specific interface by name, output as JSON:
+.PP
+.RS 4
+.nf
+netfyr query -s type=ethernet -s name=eth0 -o json
+.fi
+.RE
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-apply (1),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

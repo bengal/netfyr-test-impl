@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Man page generation from clap Command trees — no std equivalent exists
+clap_mangen = "0.2"
+# Argument parsing for the xtask's own subcommands.
+# The "string" feature enables From<String> for clap::builder::Str, which is
+# required to call Command::name() with a dynamically-built subcommand name.
+clap = { version = "4", features = ["derive", "string"] }
+# Internal CLI crate — needed to access Cli::command() for man page generation
+netfyr-cli = { path = "../crates/netfyr-cli" }

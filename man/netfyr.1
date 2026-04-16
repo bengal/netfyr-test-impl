@@ -1,0 +1,71 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr 1  "netfyr " 
+.SH NAME
+netfyr \- Declarative Linux network configuration
+.SH SYNOPSIS
+\fBnetfyr\fR [\fB\-h\fR|\fB\-\-help\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+Declarative Linux network configuration.
+.PP
+netfyr manages network interfaces through declarative YAML policy files. Policies are reconciled into an effective desired state that is applied to the kernel via netlink.
+.PP
+Two operational modes are supported and detected automatically. In standalone mode the netfyr daemon is not running and static policies are applied directly using the netlink backend. In daemon mode policies are submitted to the daemon via Varlink; the daemon reconciles and applies them, including support for dynamic factories such as DHCPv4.
+.PP
+Subcommands:
+.PP
+apply   Load and apply policy files to the system.
+.PP
+query   Query current network state from the kernel or daemon.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH SUBCOMMANDS
+.TP
+netfyr\-apply(1)
+Apply network policies to the system
+.TP
+netfyr\-query(1)
+Query current system network state
+.TP
+netfyr\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+Apply all policies in the default directory:
+.PP
+.RS 4
+.nf
+netfyr apply /etc/netfyr/policies/
+.fi
+.RE
+.PP
+Query current network state:
+.PP
+.RS 4
+.nf
+netfyr query
+.fi
+.RE
+.SH "SEE ALSO"
+.BR netfyr-apply (1),
+.BR netfyr-query (1),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)

@@ -1,0 +1,63 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH netfyr-apply 1  "netfyr-apply " 
+.SH NAME
+netfyr\-apply \- Apply network policies to the system
+.SH SYNOPSIS
+\fBnetfyr\-apply\fR [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATHS\fR> 
+.SH DESCRIPTION
+Apply network policies to the system
+.PP
+Load policy definitions from YAML files or directories, reconcile them into an effective desired state, query the current system state, generate a diff, and apply the changes.
+.PP
+If the netfyr daemon is running, policies are submitted to the daemon via Varlink. Otherwise, static policies are applied directly.
+.PP
+If \-\-dry\-run is given, show what would change without applying.
+.SH OPTIONS
+.TP
+\fB\-\-dry\-run\fR
+Show what would change without applying
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIPATHS\fR>
+Paths to YAML files or directories containing policies
+.SH "EXIT STATUS"
+.TP
+.B 0
+All operations succeeded or no changes needed.
+.TP
+.B 1
+Partial failure or conflicts detected.
+.TP
+.B 2
+Total failure or fatal error.
+.SH FILES
+.TP
+.I /etc/netfyr/policies/
+Default directory for policy files.
+.TP
+.I /var/lib/netfyr/
+State directory for persistent daemon data.
+.SH EXAMPLES
+Apply all policies in the default directory:
+.PP
+.RS 4
+.nf
+netfyr apply /etc/netfyr/policies/
+.fi
+.RE
+.PP
+Preview changes before applying:
+.PP
+.RS 4
+.nf
+netfyr apply --dry-run /etc/netfyr/policies/server.yaml
+.fi
+.RE
+.SH "SEE ALSO"
+.BR netfyr (1),
+.BR netfyr-query (1),
+.BR netfyr-examples (7),
+.BR netfyr.yaml (5)
