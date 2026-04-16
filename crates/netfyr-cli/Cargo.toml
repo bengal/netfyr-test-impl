@@ -3,4 +3,27 @@ name = "netfyr-cli"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "netfyr"
+path = "src/main.rs"
+
 [dependencies]
+# CLI argument parsing — no std equivalent for subcommands and derive macros
+clap = { version = "4", features = ["derive"] }
+# Async runtime — backend and varlink operations are all async
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Error handling with context chains — spec explicitly requires anyhow
+anyhow = "1"
+# Terminal colors — spec explicitly requires colored; auto-detects TTY and NO_COLOR
+colored = "2"
+# Internal crates
+netfyr-policy = { path = "../netfyr-policy" }
+netfyr-reconcile = { path = "../netfyr-reconcile" }
+netfyr-backend = { path = "../netfyr-backend" }
+netfyr-varlink = { path = "../netfyr-varlink" }
+netfyr-state = { path = "../netfyr-state" }
+
+[dev-dependencies]
+netfyr-test-utils = { path = "../netfyr-test-utils" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
