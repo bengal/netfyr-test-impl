@@ -64,6 +64,19 @@
       },
       "description": "Routes via this interface",
       "x-netfyr-writable": true
+    },
+    "operstate": {
+      "type": "string",
+      "description": "Operational state of the interface (up/down/unknown)",
+      "x-netfyr-writable": true
+    },
+    "dns_servers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "DNS server addresses",
+      "x-netfyr-writable": false
     }
   }
 }

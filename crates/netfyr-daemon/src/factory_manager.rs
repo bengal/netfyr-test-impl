@@ -195,7 +195,12 @@ impl FactoryManager {
             .iter()
             .map(|(name, factory)| {
                 let current = factory.current_state();
-                let has_lease = current.is_some();
+                // With pending state, current_state() returns Some(State) even before a
+                // lease is acquired (containing only operstate:up). Check for the
+                // "addresses" field to distinguish a real lease from a pending state.
+                let has_lease = current
+                    .as_ref()
+                    .is_some_and(|s| s.fields.contains_key("addresses"));
                 // Extract the bare IP (without /prefix) from the "addresses" field.
                 let lease_ip = current.and_then(|s| {
                     let addr_list = s.fields.get("addresses")?.value.as_list()?.first()?.as_str()?;

@@ -85,7 +85,14 @@ impl Dhcpv4Factory {
         priority: u32,
         state_tx: mpsc::Sender<FactoryEvent>,
     ) -> Result<Self, BackendError> {
-        let shared_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(None));
+        // Immediately populate a pending state so that current_state() returns
+        // Some(State) before any lease is acquired. This ensures reconciliation
+        // brings the interface UP (operstate: up) before DHCP discovery begins,
+        // solving the chicken-and-egg problem: DHCP needs the interface UP to
+        // send broadcast packets, but without produced state the reconciler
+        // might leave the interface down.
+        let initial_state = Some(pending_state(interface, &policy_name, priority));
+        let shared_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(initial_state));
         let (stop_tx, stop_rx) = oneshot::channel();
 
         let task_shared_state = Arc::clone(&shared_state);
@@ -172,6 +179,9 @@ pub fn lease_to_state(
 
     let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
 
+    // Interface must stay up — this is always present regardless of lease options.
+    fields.insert("operstate".to_string(), fv(Value::String("up".to_string())));
+
     // Addresses field: ["ip/prefix"]
     let cidr = format!("{}/{}", lease.ip, lease.subnet_mask_to_prefix());
     fields.insert(
@@ -206,6 +216,36 @@ pub fn lease_to_state(
         fields.insert("dns_servers".to_string(), fv(Value::List(dns_list)));
     }
 
+    State {
+        entity_type: "ethernet".to_string(),
+        selector: Selector::with_name(interface),
+        fields,
+        metadata: StateMetadata::new(),
+        policy_ref: Some(policy_name.to_string()),
+        priority,
+    }
+}
+
+// ── Pending state ─────────────────────────────────────────────────────────────
+
+/// Build a minimal `State` that ensures the interface is brought UP before a
+/// lease is acquired. Stored in `Dhcpv4Factory::state` immediately on start.
+///
+/// The pending state contains only `operstate: "up"` so that the reconciler
+/// brings the interface up while the DHCP client is discovering a server.
+/// Once a lease is acquired, `lease_to_state` replaces this with the full state.
+fn pending_state(interface: &str, policy_name: &str, priority: u32) -> State {
+    let prov = Provenance::UserConfigured {
+        policy_ref: policy_name.to_string(),
+    };
+    let mut fields: IndexMap<String, FieldValue> = IndexMap::new();
+    fields.insert(
+        "operstate".to_string(),
+        FieldValue {
+            value: Value::String("up".to_string()),
+            provenance: prov,
+        },
+    );
     State {
         entity_type: "ethernet".to_string(),
         selector: Selector::with_name(interface),
@@ -440,27 +480,95 @@ mod tests {
         assert_eq!(state.priority, 200);
     }
 
+    /// Scenario: Produced state always contains operstate=up regardless of lease options.
+    ///
+    /// The spec states: "operstate: up is always present regardless of lease options."
+    /// Verify this holds for both the full lease (with gateway and DNS) and the
+    /// minimal lease (no gateway, no DNS servers).
+    #[test]
+    fn test_lease_to_state_operstate_is_always_up_full_lease() {
+        let state = lease_to_state(&make_full_lease(), "eth0", "test-policy", 100);
+        let operstate = state
+            .fields
+            .get("operstate")
+            .expect("operstate field must always be present in lease_to_state output")
+            .value
+            .as_str()
+            .expect("operstate must be a string");
+        assert_eq!(
+            operstate, "up",
+            "operstate must be 'up' in the full-lease state"
+        );
+    }
+
+    /// Same as above for the minimal lease (no gateway, no DNS).
+    #[test]
+    fn test_lease_to_state_operstate_is_always_up_minimal_lease() {
+        let state = lease_to_state(&make_minimal_lease(), "eth0", "test-policy", 100);
+        let operstate = state
+            .fields
+            .get("operstate")
+            .expect("operstate field must always be present even without gateway/dns")
+            .value
+            .as_str()
+            .expect("operstate must be a string");
+        assert_eq!(
+            operstate, "up",
+            "operstate must be 'up' in the minimal-lease state (no gateway, no dns)"
+        );
+    }
+
     // ── Dhcpv4Factory: current_state before lease ─────────────────────────────
 
-    /// Scenario: current_state returns None before lease
-    /// Given a newly started factory
+    /// Scenario: current_state returns pending state before lease
+    /// Given a newly started factory on interface "nonexistent-iface-xyz99"
     /// When current_state() is called before any lease is acquired
-    /// Then it returns None
+    /// Then it returns Some(State) with operstate=up and no addresses/routes
     #[tokio::test]
-    async fn test_current_state_returns_none_before_lease_acquired() {
+    async fn test_current_state_returns_pending_state_before_lease_acquired() {
         let (tx, _rx) = mpsc::channel::<FactoryEvent>(10);
         // Use a nonexistent interface — start() itself always succeeds (task is spawned
-        // asynchronously); current_state() is None because no lease has been acquired.
+        // asynchronously); the pending state is set synchronously in start().
         let factory =
             Dhcpv4Factory::start("nonexistent-iface-xyz99", "test-policy".to_string(), 100, tx)
                 .await
                 .expect("start() must succeed (task spawned, not executed synchronously)");
 
-        // Check immediately — the spawned task hasn't run yet in the current-thread
-        // runtime, so shared_state is still None.
+        // Check immediately — the pending state is set synchronously in start(),
+        // before the background task has a chance to run.
+        let state = factory
+            .current_state()
+            .expect("current_state() must return Some(State) immediately after start()");
+
+        assert_eq!(state.entity_type, "ethernet", "entity_type must be ethernet");
+        assert_eq!(
+            state.selector.name.as_deref(),
+            Some("nonexistent-iface-xyz99"),
+            "selector name must match interface"
+        );
+
+        // Must have operstate=up
+        let operstate = state
+            .fields
+            .get("operstate")
+            .expect("pending state must have operstate field")
+            .value
+            .as_str()
+            .expect("operstate must be a string");
+        assert_eq!(operstate, "up", "pending state operstate must be 'up'");
+
+        // Must NOT have addresses, routes, or dns_servers
         assert!(
-            factory.current_state().is_none(),
-            "current_state() must return None before any lease is acquired"
+            state.fields.get("addresses").is_none(),
+            "pending state must not have addresses field"
+        );
+        assert!(
+            state.fields.get("routes").is_none(),
+            "pending state must not have routes field"
+        );
+        assert!(
+            state.fields.get("dns_servers").is_none(),
+            "pending state must not have dns_servers field"
         );
     }
 

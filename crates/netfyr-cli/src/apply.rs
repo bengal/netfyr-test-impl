@@ -73,17 +73,21 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     // ── Daemon-free mode ──────────────────────────────────────────────────────
 
     // 3. Reject non-static policies — they require the daemon.
-    let non_static: Vec<&str> = policy_set
+    let non_static: Vec<&netfyr_policy::Policy> = policy_set
         .iter()
         .filter(|p| p.factory_type != FactoryType::Static)
-        .map(|p| p.name.as_str())
         .collect();
     if !non_static.is_empty() {
-        bail!(
-            "policies {:?} use non-static factories which require the netfyr daemon.\n\
-             Start the daemon with: systemctl start netfyr",
-            non_static
-        );
+        let mut msg = String::new();
+        for policy in &non_static {
+            let factory_type = format!("{:?}", policy.factory_type).to_lowercase();
+            msg.push_str(&format!(
+                "policy \"{}\" uses factory \"{}\" which requires the netfyr daemon.\n",
+                policy.name, factory_type
+            ));
+        }
+        msg.push_str("Start the daemon with: systemctl start netfyr");
+        bail!("{}", msg);
     }
 
     // 4. Convert each policy into a PolicyInput for the reconciliation engine.

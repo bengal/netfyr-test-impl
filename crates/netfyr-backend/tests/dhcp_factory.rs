@@ -320,6 +320,112 @@ async fn test_factory_retries_on_discovery_timeout() {
     factory.stop().await.expect("stop() must succeed");
 }
 
+// ── Scenario: current_state full fields after lease ───────────────────────────
+
+/// Scenario: current_state returns full state after lease
+///
+/// Verifies every field the spec mandates: operstate=up, addresses, routes,
+/// and dns_servers are all present once a lease has been acquired.
+///
+/// This is the integration-level counterpart of the unit tests in `mod.rs`
+/// (which test `lease_to_state` in isolation using a synthetic lease).
+#[tokio::test]
+async fn test_current_state_full_fields_after_lease_acquired() {
+    require_netns!(_ns);
+    setup_veth_pair().await;
+    require_dnsmasq!(_dnsmasq, VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "120s");
+
+    let (tx, mut rx) = mpsc::channel::<FactoryEvent>(16);
+    let mut factory = Dhcpv4Factory::start(VETH_CLIENT, "test-full-state".to_string(), 100, tx)
+        .await
+        .expect("start() must succeed");
+
+    assert!(
+        wait_for_lease_acquired(&mut rx).await,
+        "must acquire lease before checking full state"
+    );
+
+    let state = factory
+        .current_state()
+        .expect("current_state() must return Some after LeaseAcquired");
+
+    // Scenario: current_state returns full state after lease
+    // Then it returns Some(State) with operstate=up, addresses, routes, and dns
+
+    // operstate=up is always required.
+    let operstate = state
+        .fields
+        .get("operstate")
+        .expect("operstate field must be present after lease acquisition")
+        .value
+        .as_str()
+        .expect("operstate must be a string value");
+    assert_eq!(operstate, "up", "operstate must be 'up' in the post-lease state");
+
+    // addresses must be present and non-empty.
+    let addresses = state
+        .fields
+        .get("addresses")
+        .expect("addresses field must be present after lease acquisition")
+        .value
+        .as_list()
+        .expect("addresses must be a list");
+    assert!(
+        !addresses.is_empty(),
+        "addresses list must be non-empty after lease acquisition"
+    );
+    // Each entry must be a CIDR string (e.g. "10.99.0.x/24").
+    let cidr = addresses[0].as_str().expect("first address must be a string");
+    assert!(
+        cidr.contains('/'),
+        "address must be in CIDR notation (contains '/'), got: {cidr}"
+    );
+
+    // routes must be present (dnsmasq serves a default gateway = server IP).
+    let routes = state
+        .fields
+        .get("routes")
+        .expect("routes field must be present when DHCP server provides a gateway")
+        .value
+        .as_list()
+        .expect("routes must be a list");
+    assert!(!routes.is_empty(), "routes list must be non-empty");
+    let first_route = routes[0].as_map().expect("each route must be a map");
+    assert!(
+        first_route.contains_key("destination"),
+        "route map must contain 'destination' key"
+    );
+    assert!(
+        first_route.contains_key("gateway"),
+        "route map must contain 'gateway' key"
+    );
+    assert_eq!(
+        first_route.get("destination").and_then(|v| v.as_str()),
+        Some("0.0.0.0/0"),
+        "default route destination must be 0.0.0.0/0"
+    );
+
+    // dns_servers: dnsmasq typically provides itself as DNS; verify the field
+    // exists and is non-empty when present (may be absent if server sends none).
+    if let Some(dns_fv) = state.fields.get("dns_servers") {
+        let dns_list = dns_fv.value.as_list().expect("dns_servers must be a list");
+        assert!(
+            !dns_list.is_empty(),
+            "dns_servers must not be an empty list (absent is fine, empty list is not)"
+        );
+        // Each entry must be a string representation of an IP address.
+        for entry in dns_list {
+            let s = entry.as_str().expect("each dns_server entry must be a string");
+            assert!(
+                s.parse::<std::net::Ipv4Addr>().is_ok(),
+                "dns_server entry must be a valid IPv4 address, got: {s}"
+            );
+        }
+    }
+
+    factory.stop().await.expect("stop() must succeed");
+}
+
 // ── Scenario: Lease renewal in namespace ─────────────────────────────────────
 
 /// Scenario: Lease renewal in namespace
@@ -413,5 +519,93 @@ async fn test_lease_renewal_in_namespace() {
         }
     }
 
+    factory.stop().await.expect("stop() must succeed");
+}
+
+// ── Scenario: Factory sends LeaseExpired when lease expires ───────────────────
+
+/// Scenario: Factory sends LeaseExpired when lease expires without renewal or rebind
+///
+/// Given a factory with an active lease (short lease time = 10s)
+/// When the DHCP server becomes unreachable after the lease is acquired
+///   (simulated by dropping dnsmasq)
+/// Then:
+///   - At T1 (≈5s), the factory attempts unicast renewal → times out (5s timeout)
+///   - By t≈10s (lease_time), the expiry timer fires
+///   - A LeaseExpired event is received
+///
+/// Timing: The test waits up to 30 seconds. With DISCOVER_TIMEOUT=5s and T1=5s,
+/// the expected sequence is:
+///   t=0   → lease acquired
+///   t=0   → dnsmasq dropped (server gone)
+///   t=5   → T1 fires, unicast renewal started, blocks for up to 5s
+///   t=10  → renewal timeout, loop continues; expiry_wait is now ≤0
+///   t=10  → expiry branch fires, LeaseExpired sent
+///
+/// The 30-second budget is generous to account for CI jitter and backoff jitter.
+#[tokio::test]
+async fn test_lease_expired_event_when_dhcp_server_stops() {
+    require_netns!(_ns);
+    setup_veth_pair().await;
+
+    // Start dnsmasq with a 10-second lease. After acquiring the lease, we drop
+    // the guard (kills dnsmasq), making renewal impossible.
+    let dnsmasq =
+        match DnsmasqGuard::start(VETH_SERVER, SERVER_IP, RANGE_START, RANGE_END, "10s") {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Skipping: dnsmasq unavailable: {e}");
+                return;
+            }
+        };
+
+    let (tx, mut rx) = mpsc::channel::<FactoryEvent>(16);
+    let mut factory = Dhcpv4Factory::start(VETH_CLIENT, "test-expire".to_string(), 100, tx)
+        .await
+        .expect("start() must succeed");
+
+    // Wait for the initial lease acquisition before stopping dnsmasq.
+    assert!(
+        wait_for_lease_acquired(&mut rx).await,
+        "must acquire initial lease before testing expiry"
+    );
+
+    // Drop dnsmasq — the DHCP server is now unreachable.
+    drop(dnsmasq);
+
+    // Wait up to 30 seconds for LeaseExpired.
+    // With T1=5s and DISCOVER_TIMEOUT=5s, the expiry fires at ≈10s.
+    let expired = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match rx.recv().await {
+                Some(FactoryEvent::LeaseExpired { policy_name }) => {
+                    assert_eq!(
+                        policy_name, "test-expire",
+                        "LeaseExpired must carry the correct policy_name"
+                    );
+                    return true;
+                }
+                Some(FactoryEvent::LeaseRenewed { .. }) => {
+                    // Renewal succeeded before server was fully gone — keep waiting.
+                }
+                Some(FactoryEvent::Error { error, .. }) => {
+                    // Expected: renewal/rebind timeouts produce Error events.
+                    eprintln!("DHCP error during expiry test (expected): {error}");
+                }
+                Some(FactoryEvent::LeaseAcquired { .. }) => {
+                    // Factory may re-enter DORA after expiry. Continue watching.
+                }
+                None => return false,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        expired.unwrap_or(false),
+        "LeaseExpired event must be received within 30 seconds after the DHCP server stops"
+    );
+
+    // After LeaseExpired, the factory re-enters DORA. Stop it cleanly.
     factory.stop().await.expect("stop() must succeed");
 }
