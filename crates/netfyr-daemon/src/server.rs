@@ -700,6 +700,253 @@ mod tests {
         );
     }
 
+    // ── DryRun handler ────────────────────────────────────────────────────────
+
+    /// Scenario: Dry-run computes diff without applying — empty policies returns success.
+    #[tokio::test]
+    async fn test_handle_dry_run_with_empty_policies_returns_success() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_dry_run(
+            &mut server,
+            &serde_json::json!({"policies": []}),
+            &factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "dry_run with empty policies must not return an error: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: Dry-run response contains a 'diff' field in parameters.
+    #[tokio::test]
+    async fn test_handle_dry_run_response_has_diff_field_in_parameters() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_dry_run(
+            &mut server,
+            &serde_json::json!({"policies": []}),
+            &factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"].get("diff").is_some(),
+            "dry_run response must include a 'diff' field in parameters: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: DryRun with missing 'policies' parameter returns an error response.
+    #[tokio::test]
+    async fn test_handle_dry_run_with_missing_policies_parameter_returns_error() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_dry_run(
+            &mut server,
+            &serde_json::json!({}), // no 'policies' key
+            &factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_some(),
+            "dry_run with missing 'policies' parameter must return an error response"
+        );
+    }
+
+    // ── Query handler ─────────────────────────────────────────────────────────
+
+    /// Scenario: Query returns current system state — no selector returns success.
+    #[tokio::test]
+    async fn test_handle_query_with_no_selector_returns_success() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let reconciler = Reconciler::new();
+
+        handle_query(
+            &mut server,
+            &serde_json::json!({"selector": null}),
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "query with null selector must not return an error: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: Query response contains an 'entities' field.
+    #[tokio::test]
+    async fn test_handle_query_response_has_entities_field() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let reconciler = Reconciler::new();
+
+        handle_query(
+            &mut server,
+            &serde_json::json!({}),
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"].get("entities").is_some(),
+            "query response must include an 'entities' field: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: Query 'entities' field is an array.
+    #[tokio::test]
+    async fn test_handle_query_entities_field_is_an_array() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let reconciler = Reconciler::new();
+
+        handle_query(
+            &mut server,
+            &serde_json::json!({}),
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"]["entities"].is_array(),
+            "query 'entities' must be an array: {:?}",
+            msg
+        );
+    }
+
+    // ── SubmitPolicies handler ────────────────────────────────────────────────
+
+    /// Scenario: Submit policies replaces entire set — empty list returns success.
+    #[tokio::test]
+    async fn test_handle_submit_policies_with_empty_list_returns_success() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let mut policy_store = PolicyStore::ephemeral(vec![]);
+        let mut factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_submit_policies(
+            &mut server,
+            &serde_json::json!({"policies": []}),
+            &mut policy_store,
+            &mut factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_none(),
+            "submit_policies with empty list must not return an error: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: SubmitPolicies response contains a 'report' field.
+    #[tokio::test]
+    async fn test_handle_submit_policies_response_has_report_field() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let mut policy_store = PolicyStore::ephemeral(vec![]);
+        let mut factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_submit_policies(
+            &mut server,
+            &serde_json::json!({"policies": []}),
+            &mut policy_store,
+            &mut factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg["parameters"].get("report").is_some(),
+            "submit_policies response must include a 'report' field: {:?}",
+            msg
+        );
+    }
+
+    /// Scenario: Submit policies replaces entire set — policy store is updated to the new set.
+    #[tokio::test]
+    async fn test_handle_submit_policies_replaces_policy_store_with_new_set() {
+        let (mut server, mut client) = make_stream_pair().await;
+        // Pre-populate with one policy.
+        let mut policy_store = PolicyStore::ephemeral(vec![make_test_policy("old-policy")]);
+        let mut factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        // Submit empty list — old-policy must be replaced with nothing.
+        handle_submit_policies(
+            &mut server,
+            &serde_json::json!({"policies": []}),
+            &mut policy_store,
+            &mut factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let _msg = read_message(&mut client).await.unwrap();
+        assert!(
+            policy_store.is_empty(),
+            "policy store must be empty after submit with empty policy list (replace-all semantics)"
+        );
+    }
+
+    /// Scenario: SubmitPolicies with missing 'policies' field returns an error response.
+    #[tokio::test]
+    async fn test_handle_submit_policies_with_missing_policies_field_returns_error() {
+        let (mut server, mut client) = make_stream_pair().await;
+        let mut policy_store = PolicyStore::ephemeral(vec![]);
+        let mut factory_manager = FactoryManager::new();
+        let reconciler = Reconciler::new();
+
+        handle_submit_policies(
+            &mut server,
+            &serde_json::json!({}), // missing 'policies' key
+            &mut policy_store,
+            &mut factory_manager,
+            &reconciler,
+        )
+        .await
+        .unwrap();
+
+        let msg = read_message(&mut client).await.unwrap();
+        assert!(
+            msg.get("error").is_some(),
+            "submit_policies with missing 'policies' field must return an error response"
+        );
+    }
+
     /// Scenario: Unknown method returns an error response.
     #[tokio::test]
     async fn test_handle_connection_unknown_method_returns_error() {

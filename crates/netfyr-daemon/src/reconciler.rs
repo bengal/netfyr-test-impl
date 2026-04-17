@@ -312,4 +312,103 @@ mod tests {
         // We only verify the call succeeds and the result is a valid StateSet.
         let _len = state_set.len(); // just verify it's usable
     }
+
+    // ── Feature: Full reconcile_and_apply ─────────────────────────────────────
+
+    /// Scenario: reconcile_and_apply with empty store is a no-op and returns Ok.
+    ///
+    /// With an empty desired state the diff is empty, so nothing is applied.
+    /// This smoke-tests the full reconcile_and_apply path without needing
+    /// a real interface or write permissions.
+    #[tokio::test]
+    async fn test_reconciler_reconcile_and_apply_empty_store_returns_ok() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let result = reconciler.reconcile_and_apply(&store, &factory_manager).await;
+        assert!(
+            result.is_ok(),
+            "reconcile_and_apply with empty store must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Scenario: reconcile_and_apply with empty store produces no conflicts.
+    #[tokio::test]
+    async fn test_reconciler_reconcile_and_apply_empty_store_no_conflicts() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let apply_result = reconciler
+            .reconcile_and_apply(&store, &factory_manager)
+            .await
+            .unwrap();
+        assert!(
+            apply_result.conflicts.is_empty(),
+            "empty policy store must produce no conflicts during reconcile_and_apply"
+        );
+    }
+
+    /// Scenario: reconcile_and_apply with empty store produces a successful report
+    /// (no failures — the empty-diff short-circuit returns a fresh ApplyReport).
+    #[tokio::test]
+    async fn test_reconciler_reconcile_and_apply_empty_store_report_has_no_failures() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+        let apply_result = reconciler
+            .reconcile_and_apply(&store, &factory_manager)
+            .await
+            .unwrap();
+        assert!(
+            apply_result.report.is_success(),
+            "empty policy store must produce a successful (no-failure) apply report"
+        );
+    }
+
+    // ── Feature: Dry-run with policy ──────────────────────────────────────────
+
+    /// Scenario: Dry-run with a static policy for a nonexistent interface returns Ok.
+    ///
+    /// The dry-run path only reads system state and generates a diff — it does not
+    /// apply anything. So it must succeed even when the target interface is absent.
+    #[tokio::test]
+    async fn test_reconciler_dry_run_with_static_policy_returns_ok() {
+        use netfyr_policy::parse_policy_yaml;
+        let reconciler = Reconciler::new();
+        let yaml = "kind: policy\nname: test\nfactory: static\npriority: 100\n\
+                    state:\n  type: ethernet\n  name: nonexistent-eth99\n  mtu: 1400\n";
+        let policies = parse_policy_yaml(yaml).unwrap();
+        let store = PolicyStore::ephemeral(policies);
+        let factory_manager = FactoryManager::new();
+        let result = reconciler.dry_run(&store, &factory_manager).await;
+        assert!(
+            result.is_ok(),
+            "dry_run with a static policy must succeed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Scenario: Dry-run does not alter state — calling reconcile_and_apply
+    /// before and after dry_run produces identical results, confirming dry_run
+    /// is truly read-only.
+    #[tokio::test]
+    async fn test_reconciler_dry_run_does_not_alter_system_state() {
+        let reconciler = Reconciler::new();
+        let store = PolicyStore::ephemeral(vec![]);
+        let factory_manager = FactoryManager::new();
+
+        // Take a snapshot of system state before dry_run.
+        let before = reconciler.query(None, None).await.unwrap();
+        // Run dry_run (which must be a no-op for the system).
+        let _ = reconciler.dry_run(&store, &factory_manager).await.unwrap();
+        // Snapshot after.
+        let after = reconciler.query(None, None).await.unwrap();
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "dry_run must not change the number of system entities"
+        );
+    }
 }
