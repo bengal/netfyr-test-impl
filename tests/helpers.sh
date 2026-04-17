@@ -61,12 +61,15 @@ start_dnsmasq() {
         exit 1
     fi
 
+    local leasefile
+    leasefile=$(mktemp)
+
     dnsmasq \
         --no-daemon \
+        --bind-dynamic \
         --interface="$iface" \
-        --bind-interfaces \
-        --listen-address="$server_ip" \
         --dhcp-range="${range_start},${range_end},${lease_time}" \
+        --dhcp-leasefile="$leasefile" \
         --no-resolv \
         --no-hosts \
         --log-dhcp \

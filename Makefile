@@ -6,7 +6,11 @@
 # Optional: dnsmasq (for DHCP tests).
 integration-test:
 	cargo build
-	@scripts=$$(ls tests/[0-9]*.sh 2>/dev/null); \
+	@if [ -n "$(SPEC)" ]; then \
+		scripts=$$(ls tests/$(SPEC)-*.sh 2>/dev/null); \
+	else \
+		scripts=$$(ls tests/[0-9]*.sh 2>/dev/null); \
+	fi; \
 	if [ -z "$$scripts" ]; then \
 		echo "No integration test scripts found in tests/[0-9]*.sh"; \
 		exit 0; \

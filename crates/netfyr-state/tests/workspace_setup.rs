@@ -343,3 +343,314 @@ fn test_workspace_uses_resolver_2() {
         "Root Cargo.toml must declare `resolver = \"2\"` in [workspace]"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: CLI crate produces a binary that prints "netfyr"
+// ---------------------------------------------------------------------------
+
+/// AC: running `netfyr-cli` with no arguments prints exactly "netfyr" to stdout.
+///
+/// Requires `cargo build -p netfyr-cli` to have run first.
+#[test]
+fn test_cli_binary_prints_netfyr_with_no_args() {
+    use std::process::Command;
+
+    let binary = workspace_root()
+        .join("target")
+        .join("debug")
+        .join("netfyr-cli");
+
+    if !binary.exists() {
+        panic!(
+            "FAIL: netfyr-cli binary not found at {:?}. Run `cargo build -p netfyr-cli` first.",
+            binary
+        );
+    }
+
+    let output = Command::new(&binary)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run netfyr-cli: {}", e));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_trimmed = stdout.trim();
+
+    assert_eq!(
+        stdout_trimmed, "netfyr",
+        "netfyr-cli with no arguments must print exactly 'netfyr' to stdout, got: {:?}",
+        stdout_trimmed
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: Daemon crate produces a binary that prints "netfyr"
+// ---------------------------------------------------------------------------
+
+/// AC: running `netfyr-daemon` prints "netfyr" as the first line of stdout.
+///
+/// The daemon is long-running; this test starts it with a temp socket/policy
+/// dir, reads the first stdout line within 5 s, then kills it.
+///
+/// Requires `cargo build -p netfyr-daemon` to have run first.
+#[test]
+fn test_daemon_binary_prints_netfyr_as_first_stdout_line() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let binary = workspace_root()
+        .join("target")
+        .join("debug")
+        .join("netfyr-daemon");
+
+    if !binary.exists() {
+        panic!(
+            "FAIL: netfyr-daemon binary not found at {:?}. Run `cargo build -p netfyr-daemon` first.",
+            binary
+        );
+    }
+
+    // Create a unique temp directory so the daemon can start without needing
+    // system paths like /run/netfyr/ or /var/lib/netfyr/.
+    let tmpdir = {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "netfyr-ws-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap_or_else(|e| panic!("Failed to create tmpdir: {}", e));
+        p
+    };
+    let socket_path = tmpdir.join("netfyr.sock");
+    let policy_dir = tmpdir.join("policies");
+    fs::create_dir_all(&policy_dir).unwrap_or_else(|e| panic!("Failed to create policy dir: {}", e));
+
+    let mut child = Command::new(&binary)
+        .env("NETFYR_SOCKET_PATH", socket_path.to_str().unwrap())
+        .env("NETFYR_POLICY_DIR", policy_dir.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("Failed to spawn netfyr-daemon: {}", e));
+
+    // Read the first line from stdout in a background thread so we can apply
+    // a timeout without blocking the main thread indefinitely.
+    let stdout = child.stdout.take().expect("piped stdout must be available");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok();
+        tx.send(line.trim().to_string()).ok();
+    });
+
+    let first_line = rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+
+    child.kill().ok();
+    child.wait().ok();
+    let _ = fs::remove_dir_all(&tmpdir);
+
+    assert_eq!(
+        first_line, "netfyr",
+        "netfyr-daemon must print 'netfyr' as the first line of stdout on startup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: Makefile integration-test target builds and runs tests
+// ---------------------------------------------------------------------------
+
+/// AC: Makefile exists at the workspace root.
+#[test]
+fn test_makefile_exists() {
+    let makefile = workspace_root().join("Makefile");
+    assert!(
+        makefile.exists(),
+        "Makefile must exist at {:?}",
+        makefile
+    );
+}
+
+/// AC: Makefile declares the integration-test target with cargo build and the
+/// tests/[0-9]*.sh discovery glob, and marks it .PHONY.
+#[test]
+fn test_makefile_integration_test_target_structure() {
+    let makefile_path = workspace_root().join("Makefile");
+    let content = fs::read_to_string(&makefile_path)
+        .unwrap_or_else(|e| panic!("Failed to read Makefile: {}", e));
+
+    assert!(
+        content.contains("integration-test"),
+        "Makefile must declare an 'integration-test' target"
+    );
+    assert!(
+        content.contains("cargo build"),
+        "Makefile integration-test target must run 'cargo build' first"
+    );
+    // The glob used to discover numbered test scripts.
+    assert!(
+        content.contains("tests/[0-9]"),
+        "Makefile must discover test scripts via a 'tests/[0-9]*.sh' glob"
+    );
+    assert!(
+        content.contains(".PHONY"),
+        "Makefile must declare 'integration-test' as .PHONY"
+    );
+}
+
+/// AC: Makefile integration-test propagates failure (overall exit is non-zero
+/// if any test fails).
+#[test]
+fn test_makefile_integration_test_propagates_failure() {
+    let makefile_path = workspace_root().join("Makefile");
+    let content = fs::read_to_string(&makefile_path)
+        .unwrap_or_else(|e| panic!("Failed to read Makefile: {}", e));
+
+    // The Makefile must track failures and exit non-zero if any test fails.
+    // The reference implementation uses a `failed` variable and `exit 1`.
+    assert!(
+        content.contains("failed") && content.contains("exit 1"),
+        "Makefile integration-test must track failures and exit with code 1 if any test fails"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: Test script naming follows convention
+// ---------------------------------------------------------------------------
+
+/// AC: each test script in tests/ follows NNN-description.sh naming where NNN
+/// is one or more digits; helpers.sh is the only non-numbered .sh file.
+#[test]
+fn test_numbered_scripts_follow_naming_convention() {
+    let tests_dir = workspace_root().join("tests");
+
+    let scripts: Vec<_> = fs::read_dir(&tests_dir)
+        .unwrap_or_else(|e| panic!("Failed to read tests/ directory: {}", e))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sh"))
+        .collect();
+
+    for script in &scripts {
+        let name = script.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "helpers.sh" {
+            continue;
+        }
+        // Must start with one or more ASCII digits followed by '-'.
+        let digit_end = name.chars().position(|c| !c.is_ascii_digit());
+        let ok = match digit_end {
+            Some(pos) if pos > 0 => name.chars().nth(pos) == Some('-'),
+            _ => false,
+        };
+        assert!(
+            ok,
+            "Test script '{}' must follow NNN-description.sh naming convention \
+             (starts with one or more digits then '-')",
+            name
+        );
+    }
+}
+
+/// AC: helpers.sh is the only non-numbered .sh file in tests/.
+#[test]
+fn test_helpers_sh_is_only_non_numbered_sh_file() {
+    let tests_dir = workspace_root().join("tests");
+
+    let non_numbered: Vec<_> = fs::read_dir(&tests_dir)
+        .unwrap_or_else(|e| panic!("Failed to read tests/ directory: {}", e))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sh"))
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            name != "helpers.sh"
+                && !name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert!(
+        non_numbered.is_empty(),
+        "Only helpers.sh may be a non-numbered .sh file in tests/; found: {:?}",
+        non_numbered
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: Test scripts never skip on missing prerequisites
+// ---------------------------------------------------------------------------
+
+/// AC: no test script uses '|| exit 0' to silently swallow prerequisite failures.
+#[test]
+fn test_no_script_silently_skips_with_exit_0() {
+    let tests_dir = workspace_root().join("tests");
+
+    let test_scripts: Vec<_> = fs::read_dir(&tests_dir)
+        .unwrap_or_else(|e| panic!("Failed to read tests/ directory: {}", e))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            p.extension().and_then(|e| e.to_str()) == Some("sh") && name != "helpers.sh"
+        })
+        .collect();
+
+    for script in &test_scripts {
+        let content = fs::read_to_string(script)
+            .unwrap_or_else(|e| panic!("Failed to read {:?}: {}", script, e));
+
+        assert!(
+            !content.contains("|| exit 0"),
+            "Test script {:?} uses '|| exit 0' which silently skips on failure; \
+             the no-skip policy requires 'exit 1' when prerequisites are missing",
+            script.file_name().unwrap()
+        );
+    }
+}
+
+/// AC: helpers.sh calls 'exit 1' (not 'exit 0') when 'unshare' is not available.
+#[test]
+fn test_helpers_sh_exits_1_when_unshare_missing() {
+    let helpers_path = workspace_root().join("tests").join("helpers.sh");
+    let content = fs::read_to_string(&helpers_path)
+        .unwrap_or_else(|e| panic!("Failed to read helpers.sh: {}", e));
+
+    // Find the block around the unshare check and verify 'exit 1' is present.
+    let lines: Vec<&str> = content.lines().collect();
+    let has_unshare_exit_1 = lines.windows(8).any(|w| {
+        let block = w.join("\n");
+        (block.contains("unshare") || block.contains("NETNS")) && block.contains("exit 1")
+    });
+
+    assert!(
+        has_unshare_exit_1,
+        "helpers.sh must call 'exit 1' (not 'exit 0') when 'unshare' is not available"
+    );
+}
+
+/// AC: helpers.sh calls 'exit 1' (not 'exit 0') when 'dnsmasq' is not available.
+#[test]
+fn test_helpers_sh_exits_1_when_dnsmasq_missing() {
+    let helpers_path = workspace_root().join("tests").join("helpers.sh");
+    let content = fs::read_to_string(&helpers_path)
+        .unwrap_or_else(|e| panic!("Failed to read helpers.sh: {}", e));
+
+    let lines: Vec<&str> = content.lines().collect();
+    let has_dnsmasq_exit_1 = lines.windows(8).any(|w| {
+        let block = w.join("\n");
+        block.contains("dnsmasq") && block.contains("exit 1")
+    });
+
+    assert!(
+        has_dnsmasq_exit_1,
+        "helpers.sh must call 'exit 1' (not 'exit 0') when 'dnsmasq' is not available"
+    );
+}

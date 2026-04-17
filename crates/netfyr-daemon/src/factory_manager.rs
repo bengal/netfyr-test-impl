@@ -115,7 +115,10 @@ impl FactoryManager {
             // Dhcpv4Factory::start() always succeeds (it spawns a background
             // task), so we must pre-check here to give the caller a synchronous
             // error signal for nonexistent interfaces.
-            if !std::path::Path::new(&format!("/sys/class/net/{interface}")).exists() {
+            // Use rtnetlink (via netfyr_backend::interface_exists) rather than
+            // /sys/class/net/ because sysfs is not network-namespace-aware in
+            // all environments (e.g., containers, unshare --user --net).
+            if !netfyr_backend::interface_exists(&interface).await {
                 error!(
                     policy = %name,
                     interface = %interface,

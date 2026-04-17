@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, OptionCode};
 use dhcproto::{Decodable, Decoder, Encodable, Encoder};
+use futures::TryStreamExt;
+use netlink_packet_route::link::LinkAttribute;
+use rtnetlink::new_connection;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -55,7 +58,7 @@ pub(crate) async fn run_dhcp_client(
     let mut stop_rx = stop_rx;
 
     // Read the interface MAC address for chaddr field.
-    let mac = match get_interface_mac(&interface) {
+    let mac = match get_interface_mac(&interface).await {
         Ok(m) => m,
         Err(e) => {
             let _ = state_tx
@@ -692,29 +695,47 @@ fn create_dhcp_socket(interface: &str) -> Result<UdpSocket, BackendError> {
 
 // ── MAC address discovery ─────────────────────────────────────────────────────
 
-/// Read the interface's MAC address from sysfs.
+/// Read the interface's MAC address via rtnetlink.
 ///
-/// Path: `/sys/class/net/{interface}/address`
-/// Format: `"aa:bb:cc:dd:ee:ff\n"`
-fn get_interface_mac(interface: &str) -> Result<[u8; 6], BackendError> {
-    let path = format!("/sys/class/net/{interface}/address");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| BackendError::Internal(format!("failed to read MAC from {path}: {e}")))?;
-    let trimmed = content.trim();
-    parse_mac(trimmed)
-        .ok_or_else(|| BackendError::Internal(format!("invalid MAC address at {path}: {trimmed}")))
-}
+/// Uses the netlink API instead of `/sys/class/net/` because sysfs is not
+/// network-namespace-aware in all environments (e.g., containers, unshare).
+/// Netlink queries are always scoped to the calling process's network namespace.
+async fn get_interface_mac(interface: &str) -> Result<[u8; 6], BackendError> {
+    let (conn, handle, _) = new_connection()
+        .map_err(|e| BackendError::Internal(format!("netlink connection failed: {e}")))?;
+    tokio::spawn(conn);
 
-fn parse_mac(s: &str) -> Option<[u8; 6]> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 6 {
-        return None;
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(interface.to_string())
+        .execute();
+
+    let msg = links
+        .try_next()
+        .await
+        .map_err(|e| {
+            BackendError::Internal(format!(
+                "netlink query failed for {interface}: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            BackendError::Internal(format!("interface not found: {interface}"))
+        })?;
+
+    for attr in &msg.attributes {
+        if let LinkAttribute::Address(bytes) = attr {
+            if bytes.len() == 6 {
+                let mut mac = [0u8; 6];
+                mac.copy_from_slice(bytes);
+                return Ok(mac);
+            }
+        }
     }
-    let mut out = [0u8; 6];
-    for (i, p) in parts.iter().enumerate() {
-        out[i] = u8::from_str_radix(p, 16).ok()?;
-    }
-    Some(out)
+
+    Err(BackendError::Internal(format!(
+        "no MAC address found for interface {interface}"
+    )))
 }
 
 // ── Encoding helper ───────────────────────────────────────────────────────────

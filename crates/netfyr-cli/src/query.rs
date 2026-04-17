@@ -17,7 +17,12 @@ use netfyr_state::{MacAddr, Selector, State};
 use netfyr_varlink::{VarlinkClient, VarlinkError, VarlinkSelector, VarlinkState};
 
 /// Unix socket path for the netfyr daemon's Varlink API.
-const SOCKET_PATH: &str = "/run/netfyr/netfyr.sock";
+/// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
+/// non-systemd deployments that place the socket at a custom path).
+fn daemon_socket_path() -> String {
+    std::env::var("NETFYR_SOCKET_PATH")
+        .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
+}
 
 /// Valid selector keys for the `--selector` / `-s` flag.
 const VALID_SELECTOR_KEYS: &[&str] = &["type", "name", "driver", "mac", "pci_path"];
@@ -54,7 +59,8 @@ pub async fn run_query(args: QueryArgs) -> Result<ExitCode> {
     let (entity_type, selector) = extract_type_and_selector(&args.selector)?;
 
     // Detect runtime mode: try connecting to the daemon socket.
-    match VarlinkClient::connect(SOCKET_PATH).await {
+    let socket_path = daemon_socket_path();
+    match VarlinkClient::connect(&socket_path).await {
         Ok(mut client) => {
             return run_query_daemon(
                 &mut client,

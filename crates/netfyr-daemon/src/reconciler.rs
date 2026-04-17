@@ -71,10 +71,26 @@ impl Reconciler {
 
         let actual_state = self.backend_registry.query_all().await?;
 
+        // Restrict the actual state to only the entities present in the effective
+        // desired state before computing the diff. This prevents the daemon from
+        // generating Remove operations for interfaces not covered by any policy —
+        // the daemon must not tear down or bring down unmanaged interfaces.
+        //
+        // Consequence: when a policy is removed entirely, the previously-configured
+        // fields (e.g., addresses from a DHCP lease) will linger on the interface
+        // until the lease expires or the interface is reconfigured. Individual field
+        // removal within a still-managed entity is handled correctly via Modify ops.
+        let mut managed_actual = StateSet::new();
+        for (entity_type, selector_key) in effective_state.entities() {
+            if let Some(state) = actual_state.get(&entity_type, &selector_key) {
+                managed_actual.insert(state.clone());
+            }
+        }
+
         // Use netfyr_state::diff::diff (the apply-level diff, not the rich display diff).
-        // diff(from=actual, to=desired) produces operations that take the system
-        // from its current state to the desired effective state.
-        let state_diff = netfyr_state::diff::diff(&actual_state, &effective_state);
+        // diff(from=managed_actual, to=desired) produces Add/Modify operations for the
+        // managed entities only — no Remove ops are generated for unmanaged interfaces.
+        let state_diff = netfyr_state::diff::diff(&managed_actual, &effective_state);
 
         if state_diff.is_empty() {
             tracing::debug!("Reconciliation: no changes needed");

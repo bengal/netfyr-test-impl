@@ -31,7 +31,12 @@ use netfyr_varlink::{
 };
 
 /// Unix socket path for the netfyr daemon's Varlink API.
-const SOCKET_PATH: &str = "/run/netfyr/netfyr.sock";
+/// Override with `NETFYR_SOCKET_PATH` environment variable (used in tests and
+/// non-systemd deployments that place the socket at a custom path).
+fn daemon_socket_path() -> String {
+    std::env::var("NETFYR_SOCKET_PATH")
+        .unwrap_or_else(|_| "/run/netfyr/netfyr.sock".to_string())
+}
 
 // ── CLI argument struct ───────────────────────────────────────────────────────
 
@@ -57,7 +62,8 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
     let policy_set = load_policies(&args.paths)?;
 
     // 2. Detect runtime mode: try connecting to the daemon socket.
-    match VarlinkClient::connect(SOCKET_PATH).await {
+    let socket_path = daemon_socket_path();
+    match VarlinkClient::connect(&socket_path).await {
         Ok(client) => {
             // Daemon is running — delegate all work to it.
             return run_apply_daemon(client, &policy_set, args.dry_run).await;
