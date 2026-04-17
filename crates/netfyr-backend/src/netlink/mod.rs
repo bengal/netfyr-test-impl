@@ -82,3 +82,61 @@ impl NetworkBackend for NetlinkBackend {
         apply::dry_run_ethernet(&handle, diff).await
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: NetlinkBackend supports entity type "ethernet" as required by the spec.
+    #[test]
+    fn test_netlink_backend_new_supports_ethernet_entity_type() {
+        let backend = NetlinkBackend::new();
+        assert!(
+            backend.supported_entities().contains(&"ethernet".to_string()),
+            "NetlinkBackend::new() must include 'ethernet' in supported_entities"
+        );
+    }
+
+    /// Scenario: query_all includes all ethernet interfaces — the backend must advertise
+    /// exactly one entity type ("ethernet") so query_all iterates over it.
+    #[test]
+    fn test_netlink_backend_supported_entities_has_exactly_one_ethernet_entry() {
+        let backend = NetlinkBackend::new();
+        let entities = backend.supported_entities();
+        assert_eq!(
+            entities.len(),
+            1,
+            "NetlinkBackend must support exactly one entity type; got: {:?}",
+            entities
+        );
+        assert_eq!(entities[0], "ethernet");
+    }
+
+    /// NetlinkBackend::default() must produce the same supported_entities as ::new().
+    #[test]
+    fn test_netlink_backend_default_has_same_supported_entities_as_new() {
+        let via_new = NetlinkBackend::new();
+        let via_default = NetlinkBackend::default();
+        assert_eq!(
+            via_new.supported_entities(),
+            via_default.supported_entities(),
+            "Default::default() and ::new() must report the same supported_entities"
+        );
+    }
+
+    /// Querying an unsupported entity type returns UnsupportedEntityType immediately
+    /// (no netlink connection is opened).
+    #[tokio::test]
+    async fn test_query_unsupported_entity_type_returns_error() {
+        let backend = NetlinkBackend::new();
+        let result = backend.query(&"wifi".to_string(), None).await;
+        match result {
+            Err(BackendError::UnsupportedEntityType(t)) => {
+                assert_eq!(t, "wifi", "error must name the unsupported entity type");
+            }
+            other => panic!("expected UnsupportedEntityType, got {:?}", other),
+        }
+    }
+}

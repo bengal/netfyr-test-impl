@@ -60,3 +60,83 @@ pub enum BackendError {
     #[error("internal error: {0}")]
     Internal(String),
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netfyr_state::Selector;
+
+    /// Scenario: Query for non-existent interface returns NotFound.
+    /// BackendError::NotFound display must include the entity type.
+    #[test]
+    fn test_backend_error_not_found_display_contains_entity_type() {
+        let sel = Selector::with_name("eth99");
+        let err = BackendError::NotFound {
+            entity_type: "ethernet".to_string(),
+            selector: Box::new(sel),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ethernet"),
+            "NotFound display must contain the entity type; got: {msg}"
+        );
+    }
+
+    /// BackendError::UnsupportedEntityType display must include the entity type name.
+    #[test]
+    fn test_backend_error_unsupported_entity_type_display_contains_name() {
+        let err = BackendError::UnsupportedEntityType("wifi".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wifi"),
+            "UnsupportedEntityType display must contain the entity type name; got: {msg}"
+        );
+    }
+
+    /// Scenario: If permission is denied, BackendError::PermissionDenied display
+    /// must include the provided reason string.
+    #[test]
+    fn test_backend_error_permission_denied_display_contains_reason() {
+        let err = BackendError::PermissionDenied("operation not permitted".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("operation not permitted"),
+            "PermissionDenied display must contain the reason; got: {msg}"
+        );
+    }
+
+    /// BackendError::Internal display must include the error detail string.
+    #[test]
+    fn test_backend_error_internal_display_contains_detail() {
+        let err = BackendError::Internal("unexpected null handle".to_string());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected null handle"),
+            "Internal display must contain the detail; got: {msg}"
+        );
+    }
+
+    /// BackendError variants are Debug-formattable (required by #[derive(Debug)]).
+    #[test]
+    fn test_backend_error_variants_are_debug_formattable() {
+        let sel = Selector::with_name("eth0");
+        let errors: Vec<Box<dyn std::fmt::Debug>> = vec![
+            Box::new(BackendError::UnsupportedEntityType("wifi".to_string())),
+            Box::new(BackendError::NotFound {
+                entity_type: "ethernet".to_string(),
+                selector: Box::new(sel),
+            }),
+            Box::new(BackendError::PermissionDenied("denied".to_string())),
+            Box::new(BackendError::Internal("detail".to_string())),
+        ];
+        for err in &errors {
+            assert!(
+                !format!("{:?}", err).is_empty(),
+                "Debug output must be non-empty for {:?}",
+                err
+            );
+        }
+    }
+}

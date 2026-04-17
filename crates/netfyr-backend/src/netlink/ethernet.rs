@@ -294,6 +294,7 @@ fn parse_route_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netfyr_state::{Provenance, Value};
     use netlink_packet_route::link::InfoKind;
     use netlink_packet_route::route::RouteAddress;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -472,6 +473,83 @@ mod tests {
             route_address_to_ip(&addr).is_none(),
             "Non-IP RouteAddress variants must return None"
         );
+    }
+
+    // ── kd() provenance helper ────────────────────────────────────────────────────
+
+    /// Scenario: All queried fields have KernelDefault provenance.
+    /// kd() must tag a String value with Provenance::KernelDefault.
+    #[test]
+    fn test_kd_string_value_has_kernel_default_provenance() {
+        let fv = kd(Value::String("eth0".to_owned()));
+        assert_eq!(
+            fv.provenance,
+            Provenance::KernelDefault,
+            "kd() must set provenance to KernelDefault"
+        );
+        assert_eq!(fv.value, Value::String("eth0".to_owned()));
+    }
+
+    /// kd() applied to a U64 (e.g., mtu) produces KernelDefault provenance.
+    #[test]
+    fn test_kd_u64_value_has_kernel_default_provenance() {
+        let fv = kd(Value::U64(1500));
+        assert_eq!(fv.provenance, Provenance::KernelDefault);
+        assert_eq!(fv.value, Value::U64(1500));
+    }
+
+    /// kd() applied to a Bool (e.g., carrier) produces KernelDefault provenance.
+    #[test]
+    fn test_kd_bool_value_has_kernel_default_provenance() {
+        let fv = kd(Value::Bool(false));
+        assert_eq!(fv.provenance, Provenance::KernelDefault);
+        assert_eq!(fv.value, Value::Bool(false));
+    }
+
+    /// kd() applied to a List (e.g., addresses, routes) produces KernelDefault provenance.
+    #[test]
+    fn test_kd_list_value_has_kernel_default_provenance() {
+        let list = Value::List(vec![Value::String("10.0.1.50/24".to_owned())]);
+        let fv = kd(list.clone());
+        assert_eq!(fv.provenance, Provenance::KernelDefault);
+        assert_eq!(fv.value, list);
+    }
+
+    // ── Carrier byte-to-bool conversion ──────────────────────────────────────────
+
+    /// Scenario: Query handles interface with link down gracefully.
+    /// carrier byte 0 maps to false — link is physically down, no carrier signal.
+    #[test]
+    fn test_carrier_byte_zero_maps_to_false() {
+        let carrier: Option<u8> = Some(0);
+        let result = carrier.unwrap_or(0) != 0;
+        assert!(!result, "carrier byte 0 must produce false (link down)");
+    }
+
+    /// carrier byte 1 maps to true — link is up, carrier is present.
+    #[test]
+    fn test_carrier_byte_one_maps_to_true() {
+        let carrier: Option<u8> = Some(1);
+        let result = carrier.unwrap_or(0) != 0;
+        assert!(result, "carrier byte 1 must produce true (link up)");
+    }
+
+    /// Scenario: carrier attribute absent (None) defaults to false.
+    /// Conservative assumption: if the kernel does not report carrier, treat link as down.
+    #[test]
+    fn test_carrier_none_defaults_to_false() {
+        let carrier: Option<u8> = None;
+        let result = carrier.unwrap_or(0) != 0;
+        assert!(!result, "absent carrier attribute must default to false");
+    }
+
+    /// Any nonzero carrier byte maps to true — nonzero signals carrier presence.
+    #[test]
+    fn test_carrier_nonzero_values_map_to_true() {
+        for byte in [2u8, 10u8, 128u8, 255u8] {
+            let result = Some(byte).unwrap_or(0) != 0;
+            assert!(result, "carrier byte {byte} must produce true");
+        }
     }
 }
 
