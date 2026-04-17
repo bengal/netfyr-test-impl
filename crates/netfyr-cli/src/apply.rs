@@ -130,7 +130,7 @@ pub async fn run_apply(args: ApplyArgs) -> Result<ExitCode> {
 
     // 8. Dry-run: display planned changes and exit without applying.
     if args.dry_run {
-        let is_empty = reconcile_diff.is_empty();
+        let is_empty = !reconcile_diff.has_meaningful_changes();
         if !reconciliation.conflicts.is_empty() {
             print_conflicts(&reconciliation.conflicts);
         }
@@ -710,6 +710,176 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    // ── Imports for load_policies and async tests ─────────────────────────────
+    use std::fs;
+    use netfyr_policy::FactoryType as PolicyFactoryType;
+
+    // ── load_policies tests ───────────────────────────────────────────────────
+
+    /// AC "Path does not exist shows error" — error message contains "path not found".
+    #[test]
+    fn test_load_policies_nonexistent_path_returns_error_with_path_not_found() {
+        let result = load_policies(&[PathBuf::from("/nonexistent-path-xyz-123/eth0.yaml")]);
+        assert!(result.is_err(), "nonexistent path must return Err");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("path not found"),
+            "error must contain 'path not found', got: {}",
+            err
+        );
+    }
+
+    /// AC "Path does not exist shows error" — path is included in the error message.
+    #[test]
+    fn test_load_policies_nonexistent_path_error_includes_path_in_message() {
+        let path = PathBuf::from("/tmp/netfyr-test-nonexistent-xyz-abc/eth0.yaml");
+        let result = load_policies(&[path]);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("netfyr-test-nonexistent-xyz-abc"),
+            "error must include the path, got: {}",
+            err
+        );
+    }
+
+    /// AC "Bare state YAML is auto-wrapped into static policy" — factory type is Static.
+    #[test]
+    fn test_load_policies_bare_state_yaml_factory_type_is_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eth0.yaml");
+        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+
+        let policy_set = load_policies(&[path]).unwrap();
+        let policy = policy_set.get("eth0").expect("policy 'eth0' must exist");
+        assert_eq!(
+            policy.factory_type,
+            PolicyFactoryType::Static,
+            "bare state must be auto-wrapped as Static factory"
+        );
+    }
+
+    /// AC "Bare state YAML is auto-wrapped into static policy" — default priority is 100.
+    #[test]
+    fn test_load_policies_bare_state_yaml_default_priority_is_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eth0.yaml");
+        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+
+        let policy_set = load_policies(&[path]).unwrap();
+        let policy = policy_set.get("eth0").expect("policy 'eth0' must exist");
+        assert_eq!(policy.priority, 100, "auto-wrapped bare state must use default priority 100");
+    }
+
+    /// AC "Bare state YAML is auto-wrapped into static policy" — name derived from filename.
+    #[test]
+    fn test_load_policies_bare_state_policy_name_derived_from_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("myinterface.yaml");
+        fs::write(&path, "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+
+        let policy_set = load_policies(&[path]).unwrap();
+        assert!(
+            policy_set.get("myinterface").is_some(),
+            "policy name must be 'myinterface' (derived from filename, without extension)"
+        );
+    }
+
+    /// AC "Apply all files in a directory" — directory loads all YAML files.
+    #[test]
+    fn test_load_policies_directory_loads_multiple_yaml_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.path().join("eth1.yaml"), "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+
+        let policy_set = load_policies(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(policy_set.len(), 2, "directory with two YAML files must produce two policies");
+    }
+
+    /// AC "Apply all files in a directory" — each entity is accessible by derived policy name.
+    #[test]
+    fn test_load_policies_directory_each_policy_accessible_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("eth0.yaml"), "type: ethernet\nname: eth0\nmtu: 1500\n").unwrap();
+        fs::write(dir.path().join("eth1.yaml"), "type: ethernet\nname: eth1\nmtu: 9000\n").unwrap();
+
+        let policy_set = load_policies(&[dir.path().to_path_buf()]).unwrap();
+        assert!(policy_set.get("eth0").is_some(), "policy 'eth0' must be loaded from eth0.yaml");
+        assert!(policy_set.get("eth1").is_some(), "policy 'eth1' must be loaded from eth1.yaml");
+    }
+
+    /// AC "YAML parse error returns exit code 2" — invalid YAML returns Err.
+    #[test]
+    fn test_load_policies_invalid_yaml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        // This YAML has a mapping key with no value followed by a broken structure.
+        fs::write(&path, ": broken: [unclosed\n").unwrap();
+
+        let result = load_policies(&[path]);
+        assert!(result.is_err(), "invalid YAML must return Err");
+    }
+
+    /// AC "DHCP policy without daemon fails with clear error" — DHCP policy loaded correctly.
+    #[test]
+    fn test_load_policies_dhcpv4_policy_file_loads_with_dhcpv4_factory_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eth0-dhcp.yaml");
+        fs::write(
+            &path,
+            "kind: policy\nname: eth0-dhcp\nfactory: dhcpv4\npriority: 100\nselector:\n  name: eth0\n",
+        )
+        .unwrap();
+
+        let policy_set = load_policies(&[path]).unwrap();
+        let policy = policy_set.get("eth0-dhcp").expect("policy 'eth0-dhcp' must exist");
+        assert_eq!(
+            policy.factory_type,
+            PolicyFactoryType::Dhcpv4,
+            "DHCP policy file must produce a Dhcpv4 factory type"
+        );
+    }
+
+    // ── run_apply async tests ─────────────────────────────────────────────────
+
+    /// AC "DHCP policy without daemon fails with clear error" — run_apply returns Err
+    /// mentioning "requires the netfyr daemon" and "systemctl start netfyr".
+    ///
+    /// Note: this test mutates NETFYR_SOCKET_PATH so daemon-free mode is forced.
+    /// All other tests that read NETFYR_SOCKET_PATH will also see a nonexistent path,
+    /// which is acceptable since daemon-free mode is the fallback for any failing socket.
+    #[tokio::test]
+    async fn test_run_apply_dhcp_policy_without_daemon_returns_error_with_daemon_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_file = dir.path().join("eth0-dhcp.yaml");
+        fs::write(
+            &policy_file,
+            "kind: policy\nname: eth0-dhcp\nfactory: dhcpv4\npriority: 100\nselector:\n  name: eth0\n",
+        )
+        .unwrap();
+
+        // Point socket path at a file that does not exist so connection fails immediately.
+        let socket_path = dir.path().join("daemon.sock").to_string_lossy().into_owned();
+        // SAFETY: test-only env mutation; any nonexistent path causes daemon-free fallback.
+        unsafe { std::env::set_var("NETFYR_SOCKET_PATH", &socket_path) };
+
+        let args = ApplyArgs { paths: vec![policy_file], dry_run: false };
+        let result = run_apply(args).await;
+
+        assert!(result.is_err(), "DHCP policy without daemon must return Err");
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("requires the netfyr daemon"),
+            "error must mention 'requires the netfyr daemon', got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("systemctl start netfyr"),
+            "error must include 'systemctl start netfyr', got: {}",
+            err_msg
+        );
     }
 
     // ── determine_exit_code tests ─────────────────────────────────────────────

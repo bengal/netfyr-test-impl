@@ -126,6 +126,22 @@ impl StateDiff {
     pub fn modifications(&self) -> impl Iterator<Item = &DiffOperation> {
         self.operations.iter().filter(|op| op.kind == DiffKind::Modify)
     }
+
+    /// Returns `true` if any operation represents a change that would actually
+    /// be applied. Unlike `is_empty()`, this excludes Modify operations whose
+    /// only field changes are `Unset` — those correspond to fields that are in
+    /// actual state but absent from the desired policy, which the backend skips
+    /// as kernel-managed (e.g., operstate, link-local addresses). A policy that
+    /// only specifies mtu should not report "changes needed" for kernel fields.
+    pub fn has_meaningful_changes(&self) -> bool {
+        self.operations.iter().any(|op| {
+            matches!(op.kind, DiffKind::Add | DiffKind::Remove)
+                || op
+                    .field_changes
+                    .iter()
+                    .any(|fc| matches!(fc.change, FieldChangeKind::Set { .. }))
+        })
+    }
 }
 
 // ── generate_diff ─────────────────────────────────────────────────────────────
