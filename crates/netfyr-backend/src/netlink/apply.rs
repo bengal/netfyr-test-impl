@@ -256,6 +256,20 @@ async fn apply_modify(
 
     let current_state = match get_current_state(handle, name).await {
         Ok(s) => s,
+        Err(BackendError::NotFound { .. }) => {
+            // Interface exists (resolve_link_index succeeded) but is not an
+            // ethernet type (e.g. loopback). Use an empty state so kernel
+            // operations are still attempted — the kernel will return the
+            // appropriate error (e.g. EPERM for non-root).
+            State {
+                entity_type: entity_type.to_string(),
+                selector: selector.clone(),
+                fields: IndexMap::new(),
+                metadata: netfyr_state::StateMetadata::default(),
+                policy_ref: None,
+                priority: 0,
+            }
+        }
         Err(e) => {
             return fail_op(
                 DiffOpKind::Modify,
@@ -546,14 +560,12 @@ async fn apply_modify_fields(
 
     if addr_in_changed || addr_in_removed {
         // Full desired address list; empty when field is being removed.
+        // Use value_to_str to handle both Value::String (from kernel queries)
+        // and Value::IpNetwork (from YAML policy files).
         let desired_addrs: Vec<String> = if let Some(fv) = changed_fields.get("addresses") {
             fv.value
                 .as_list()
-                .map(|list| {
-                    list.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect()
-                })
+                .map(|list| list.iter().filter_map(value_to_str).collect())
                 .unwrap_or_default()
         } else {
             vec![]
@@ -1082,20 +1094,32 @@ fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8), BackendError> {
     Ok((ip, prefix))
 }
 
+/// Convert a `Value` to its string representation, handling String, IpNetwork,
+/// and IpAddr variants. YAML policy files produce IpNetwork/IpAddr; the kernel
+/// query layer produces String. Both must be accepted.
+fn value_to_str(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::IpNetwork(net) => Some(net.to_string()),
+        Value::IpAddr(ip) => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
 /// Extract destination and optional gateway from a route `Value::Map`.
 fn extract_route_fields(
     map: &IndexMap<String, Value>,
 ) -> Result<(IpAddr, u8, Option<IpAddr>), BackendError> {
     let destination = map
         .get("destination")
-        .and_then(|v| v.as_str())
+        .and_then(value_to_str)
         .ok_or_else(|| BackendError::Internal("route missing destination".to_string()))?;
 
-    let (dst_ip, dst_prefix) = parse_cidr(destination)?;
+    let (dst_ip, dst_prefix) = parse_cidr(&destination)?;
 
     let gateway = map
         .get("gateway")
-        .and_then(|v| v.as_str())
+        .and_then(value_to_str)
         .map(|s| {
             s.parse::<IpAddr>()
                 .map_err(|e| BackendError::Internal(format!("invalid gateway: {e}")))
@@ -1170,6 +1194,378 @@ fn build_planned_changes(op: &DiffOp, current_state: &State) -> Vec<FieldChange>
     }
 
     field_changes
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netfyr_state::{FieldValue, Provenance, Selector, StateMetadata, Value};
+
+    // ── Helper constructors ───────────────────────────────────────────────────
+
+    fn kd(v: Value) -> FieldValue {
+        FieldValue {
+            value: v,
+            provenance: Provenance::KernelDefault,
+        }
+    }
+
+    fn empty_state(name: &str) -> State {
+        State {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name(name),
+            fields: IndexMap::new(),
+            metadata: StateMetadata::new(),
+            policy_ref: None,
+            priority: 100,
+        }
+    }
+
+    // ── parse_cidr ────────────────────────────────────────────────────────────
+
+    /// Scenario: valid IPv4 CIDR parses into (IpAddr, prefix_len).
+    #[test]
+    fn test_parse_cidr_valid_ipv4() {
+        let (ip, prefix) = parse_cidr("10.0.1.50/24").expect("valid IPv4 CIDR must parse");
+        assert_eq!(ip.to_string(), "10.0.1.50");
+        assert_eq!(prefix, 24);
+    }
+
+    /// Default route 0.0.0.0/0 must parse successfully.
+    #[test]
+    fn test_parse_cidr_default_route() {
+        let (ip, prefix) = parse_cidr("0.0.0.0/0").expect("default route CIDR must parse");
+        assert_eq!(prefix, 0);
+        assert!(ip.is_unspecified(), "default route IP must be unspecified");
+    }
+
+    /// Valid IPv6 CIDR must parse.
+    #[test]
+    fn test_parse_cidr_valid_ipv6() {
+        let (ip, prefix) = parse_cidr("::1/128").expect("IPv6 CIDR must parse");
+        assert_eq!(prefix, 128);
+        assert!(ip.is_loopback(), "::1 must be identified as loopback");
+    }
+
+    /// CIDR without a slash must return an error.
+    #[test]
+    fn test_parse_cidr_missing_slash_returns_error() {
+        let result = parse_cidr("10.0.1.50");
+        assert!(result.is_err(), "CIDR without slash must fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid CIDR") || err_msg.contains("10.0.1.50"),
+            "Error must mention the invalid input; got: {err_msg}"
+        );
+    }
+
+    /// CIDR with an invalid IP address must return an error.
+    #[test]
+    fn test_parse_cidr_invalid_ip_returns_error() {
+        let result = parse_cidr("not-an-ip/24");
+        assert!(result.is_err(), "Invalid IP in CIDR must fail");
+    }
+
+    /// CIDR with a non-numeric prefix must return an error.
+    #[test]
+    fn test_parse_cidr_invalid_prefix_returns_error() {
+        let result = parse_cidr("10.0.1.1/abc");
+        assert!(result.is_err(), "Non-numeric prefix in CIDR must fail");
+    }
+
+    // ── extract_route_fields ──────────────────────────────────────────────────
+
+    /// Scenario: valid route map with destination and gateway.
+    #[test]
+    fn test_extract_route_fields_valid_with_gateway() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("10.100.0.0/24".to_string()),
+        );
+        map.insert(
+            "gateway".to_string(),
+            Value::String("10.99.0.1".to_string()),
+        );
+
+        let (dst, prefix, gw) = extract_route_fields(&map).expect("valid route map must parse");
+        assert_eq!(dst.to_string(), "10.100.0.0");
+        assert_eq!(prefix, 24);
+        let gw = gw.expect("gateway must be Some");
+        assert_eq!(gw.to_string(), "10.99.0.1");
+    }
+
+    /// Route map without a gateway must parse with gateway == None.
+    #[test]
+    fn test_extract_route_fields_valid_without_gateway() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("10.100.0.0/24".to_string()),
+        );
+
+        let (_, _, gw) =
+            extract_route_fields(&map).expect("route without gateway must parse");
+        assert!(gw.is_none(), "gateway must be None when absent from map");
+    }
+
+    /// Route map with default destination 0.0.0.0/0 and gateway must parse.
+    #[test]
+    fn test_extract_route_fields_default_route_with_gateway() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        map.insert(
+            "gateway".to_string(),
+            Value::String("10.0.0.1".to_string()),
+        );
+
+        let (dst, prefix, gw) =
+            extract_route_fields(&map).expect("default route map must parse");
+        assert!(dst.is_unspecified());
+        assert_eq!(prefix, 0);
+        assert!(gw.is_some());
+    }
+
+    /// Missing destination field must return an error.
+    #[test]
+    fn test_extract_route_fields_missing_destination_returns_error() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "gateway".to_string(),
+            Value::String("10.99.0.1".to_string()),
+        );
+
+        let result = extract_route_fields(&map);
+        assert!(result.is_err(), "Missing destination must return error");
+    }
+
+    /// Invalid destination CIDR must return an error.
+    #[test]
+    fn test_extract_route_fields_invalid_destination_returns_error() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("not-a-cidr".to_string()),
+        );
+
+        let result = extract_route_fields(&map);
+        assert!(result.is_err(), "Invalid destination CIDR must return error");
+    }
+
+    /// Invalid gateway IP must return an error.
+    #[test]
+    fn test_extract_route_fields_invalid_gateway_returns_error() {
+        let mut map = IndexMap::new();
+        map.insert(
+            "destination".to_string(),
+            Value::String("10.100.0.0/24".to_string()),
+        );
+        map.insert(
+            "gateway".to_string(),
+            Value::String("not-an-ip".to_string()),
+        );
+
+        let result = extract_route_fields(&map);
+        assert!(result.is_err(), "Invalid gateway IP must return error");
+    }
+
+    // ── build_planned_changes ─────────────────────────────────────────────────
+
+    /// Scenario: Modify op — changed field produces a FieldChange with kind=Modify
+    /// and correct before/after values.
+    #[test]
+    fn test_build_planned_changes_modify_existing_field_produces_modify_kind() {
+        let mut changed_fields = IndexMap::new();
+        changed_fields.insert("mtu".to_string(), kd(Value::U64(9000)));
+
+        let op = DiffOp::Modify {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            changed_fields,
+            removed_fields: vec![],
+        };
+
+        let mut current = empty_state("eth0");
+        current
+            .fields
+            .insert("mtu".to_string(), kd(Value::U64(1500)));
+
+        let changes = build_planned_changes(&op, &current);
+
+        assert_eq!(changes.len(), 1, "One FieldChange for mtu");
+        let fc = &changes[0];
+        assert_eq!(fc.field, "mtu");
+        assert_eq!(
+            fc.current,
+            Some(Value::U64(1500)),
+            "current must be the kernel value 1500"
+        );
+        assert_eq!(
+            fc.desired,
+            Some(Value::U64(9000)),
+            "desired must be the requested value 9000"
+        );
+        assert_eq!(
+            fc.kind,
+            FieldChangeKind::Modify,
+            "kind must be Modify when field exists in current state"
+        );
+    }
+
+    /// Modify op — field that is new (not in current state) gets kind=Set.
+    #[test]
+    fn test_build_planned_changes_modify_new_field_produces_set_kind() {
+        let mut changed_fields = IndexMap::new();
+        changed_fields.insert(
+            "addresses".to_string(),
+            kd(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
+        );
+
+        let op = DiffOp::Modify {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            changed_fields,
+            removed_fields: vec![],
+        };
+
+        // Current state has no "addresses" field.
+        let current = empty_state("eth0");
+        let changes = build_planned_changes(&op, &current);
+
+        assert_eq!(changes.len(), 1);
+        let fc = &changes[0];
+        assert_eq!(fc.field, "addresses");
+        assert!(fc.current.is_none(), "Set kind must have no current value");
+        assert!(fc.desired.is_some(), "Set kind must have a desired value");
+        assert_eq!(
+            fc.kind,
+            FieldChangeKind::Set,
+            "kind must be Set when field does not exist in current state"
+        );
+    }
+
+    /// Modify op — removed field produces kind=Unset with current value and no desired.
+    #[test]
+    fn test_build_planned_changes_removed_field_produces_unset_kind() {
+        let op = DiffOp::Modify {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            changed_fields: IndexMap::new(),
+            removed_fields: vec!["addresses".to_string()],
+        };
+
+        let mut current = empty_state("eth0");
+        current.fields.insert(
+            "addresses".to_string(),
+            kd(Value::List(vec![Value::String("10.0.1.1/24".to_string())])),
+        );
+
+        let changes = build_planned_changes(&op, &current);
+
+        let fc = changes
+            .iter()
+            .find(|fc| fc.field == "addresses")
+            .expect("addresses field change must be present");
+        assert_eq!(
+            fc.kind,
+            FieldChangeKind::Unset,
+            "Removed field must produce Unset kind"
+        );
+        assert!(fc.current.is_some(), "Unset kind must have a current value");
+        assert!(fc.desired.is_none(), "Unset kind must have no desired value");
+    }
+
+    /// Add op — produces FieldChange with kind=Set and no current value.
+    #[test]
+    fn test_build_planned_changes_add_op_produces_set_kind_no_current() {
+        let mut fields = IndexMap::new();
+        fields.insert("mtu".to_string(), kd(Value::U64(1500)));
+
+        let op = DiffOp::Add {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+            fields,
+        };
+
+        let current = empty_state("eth0");
+        let changes = build_planned_changes(&op, &current);
+
+        assert_eq!(changes.len(), 1, "One FieldChange for mtu");
+        let fc = &changes[0];
+        assert_eq!(fc.field, "mtu");
+        assert!(fc.current.is_none(), "Add op has no current value");
+        assert_eq!(fc.desired, Some(Value::U64(1500)));
+        assert_eq!(fc.kind, FieldChangeKind::Set);
+    }
+
+    /// Remove op — each current field produces FieldChange with kind=Unset and no desired.
+    #[test]
+    fn test_build_planned_changes_remove_op_produces_unset_for_each_current_field() {
+        let op = DiffOp::Remove {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+        };
+
+        let mut current = empty_state("eth0");
+        current
+            .fields
+            .insert("mtu".to_string(), kd(Value::U64(1500)));
+        current.fields.insert(
+            "operstate".to_string(),
+            kd(Value::String("up".to_string())),
+        );
+
+        let changes = build_planned_changes(&op, &current);
+
+        assert_eq!(
+            changes.len(),
+            2,
+            "Remove op produces one Unset per current field"
+        );
+        for fc in &changes {
+            assert_eq!(
+                fc.kind,
+                FieldChangeKind::Unset,
+                "All Remove field changes must be Unset kind"
+            );
+            assert!(fc.current.is_some(), "Unset kind must have current value");
+            assert!(fc.desired.is_none(), "Unset kind must have no desired");
+        }
+    }
+
+    /// Remove op on an empty current state produces an empty changes list.
+    #[test]
+    fn test_build_planned_changes_remove_op_empty_current_produces_empty_changes() {
+        let op = DiffOp::Remove {
+            entity_type: "ethernet".to_string(),
+            selector: Selector::with_name("eth0"),
+        };
+        let current = empty_state("eth0");
+        let changes = build_planned_changes(&op, &current);
+        assert!(
+            changes.is_empty(),
+            "Remove op on empty current state must produce no field changes"
+        );
+    }
+
+    // ── READONLY_FIELDS ───────────────────────────────────────────────────────
+
+    /// Scenario: Modify operation skips read-only fields — READONLY_FIELDS must
+    /// contain every field named in the spec ("carrier", "speed", "mac", "driver").
+    #[test]
+    fn test_readonly_fields_contains_spec_required_fields() {
+        for field in &["carrier", "speed", "mac", "driver"] {
+            assert!(
+                READONLY_FIELDS.contains(field),
+                "READONLY_FIELDS must contain '{field}' per spec"
+            );
+        }
+    }
 }
 
 // ── Construction helpers ──────────────────────────────────────────────────────
