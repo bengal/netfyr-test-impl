@@ -32,6 +32,9 @@ dhcproto = "0.14"
 # rand: generate random 4-byte XID (transaction ID) for DHCP messages as required by
 # RFC 2131 Section 4.1. std has no random number generation.
 rand = "0.9"
+# libc: required for AF_PACKET/SOCK_DGRAM packet socket creation (socket, bind, sendto,
+# recv, fcntl, if_nametoindex, sockaddr_ll). socket2 does not support AF_PACKET domain.
+libc = "0.2"
 # socket2: set SO_BINDTODEVICE and SO_BROADCAST socket options before converting to
 # tokio::net::UdpSocket. tokio's UdpSocket does not expose SO_BINDTODEVICE.
 # socket2: "all" feature enables bind_device (SO_BINDTODEVICE) on Linux.

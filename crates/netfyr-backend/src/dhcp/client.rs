@@ -1,11 +1,15 @@
 //! DHCPv4 client state machine.
 //!
-//! This module implements the full DORA (Discover-Offer-Request-Acknowledge)
-//! handshake plus lease maintenance (renew/rebind/expire/release) as a
-//! long-running tokio task. It is spawned by `Dhcpv4Factory::start()` and
-//! communicates via `FactoryEvent` messages and a shared `Arc<Mutex<Option<State>>>`.
+//! Uses a dual-socket architecture:
+//! - DORA phase (before IP): AF_PACKET/SOCK_DGRAM packet socket with manual IP+UDP framing.
+//!   The kernel does not deliver broadcast UDP to AF_INET sockets on interfaces with no IP,
+//!   so a packet socket is required to receive DHCPOFFER/DHCPACK during initial acquisition.
+//! - Renewal/Rebind/Release: AF_INET/SOCK_DGRAM UDP socket bound to the acquired client IP.
 
+use std::ffi::CString;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +19,7 @@ use futures::TryStreamExt;
 use netlink_packet_route::link::LinkAttribute;
 use rtnetlink::new_connection;
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,20 +31,14 @@ use crate::BackendError;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Timeout for a single DHCP discover/request attempt.
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Initial backoff delay on DHCP discovery failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-/// Maximum backoff delay between retry attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// DHCP client port (source port for client messages).
 const DHCP_CLIENT_PORT: u16 = 68;
-
-/// DHCP server port (destination port for client messages).
 const DHCP_SERVER_PORT: u16 = 67;
+
+// Bounded drain after DHCPACK before dropping the packet socket.
+const DRAIN_LIMIT: usize = 10;
 
 // ── Main client task ──────────────────────────────────────────────────────────
 
@@ -57,7 +56,7 @@ pub(crate) async fn run_dhcp_client(
 ) {
     let mut stop_rx = stop_rx;
 
-    // Read the interface MAC address for chaddr field.
+    // Read the interface MAC address for chaddr field via rtnetlink (not sysfs).
     let mac = match get_interface_mac(&interface).await {
         Ok(m) => m,
         Err(e) => {
@@ -71,23 +70,22 @@ pub(crate) async fn run_dhcp_client(
         }
     };
 
-    // Create and configure the DHCP socket.
-    let socket = match create_dhcp_socket(&interface) {
-        Ok(s) => s,
+    // Get interface index for the packet socket bind address.
+    let ifindex = match get_ifindex(&interface) {
+        Ok(idx) => idx,
         Err(e) => {
             let _ = state_tx
                 .send(FactoryEvent::Error {
                     policy_name: policy_name.clone(),
-                    error: format!("failed to create DHCP socket on {interface}: {e}"),
+                    error: format!("failed to get interface index for {interface}: {e}"),
                 })
                 .await;
             return;
         }
     };
 
-    // Run the DHCP state machine.
     let ctx = DhcpContext {
-        socket,
+        ifindex,
         mac,
         interface,
         policy_name,
@@ -103,7 +101,7 @@ pub(crate) async fn run_dhcp_client(
 /// Context passed to the DHCP state machine. Groups parameters to avoid
 /// exceeding clippy's too_many_arguments limit.
 struct DhcpContext {
-    socket: UdpSocket,
+    ifindex: i32,
     mac: [u8; 6],
     interface: String,
     policy_name: String,
@@ -112,12 +110,9 @@ struct DhcpContext {
     shared_state: Arc<Mutex<Option<State>>>,
 }
 
-async fn run_state_machine(
-    ctx: DhcpContext,
-    stop_rx: &mut oneshot::Receiver<()>,
-) {
+async fn run_state_machine(ctx: DhcpContext, stop_rx: &mut oneshot::Receiver<()>) {
     let DhcpContext {
-        socket,
+        ifindex,
         mac,
         interface,
         policy_name,
@@ -126,10 +121,22 @@ async fn run_state_machine(
         shared_state,
     } = ctx;
     let mut backoff = INITIAL_BACKOFF;
-    let broadcast_addr: SocketAddr =
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_SERVER_PORT));
 
     loop {
+        // Create a fresh packet socket for each DORA attempt.
+        let pkt_sock = match create_packet_socket(ifindex) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = state_tx
+                    .send(FactoryEvent::Error {
+                        policy_name: policy_name.clone(),
+                        error: format!("failed to create packet socket: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
         // ── Discovery phase ───────────────────────────────────────────────────
         let xid: u32 = rand::random();
         let discover = build_discover(xid, mac);
@@ -147,7 +154,8 @@ async fn run_state_machine(
             }
         };
 
-        if let Err(e) = socket.send_to(&encoded, broadcast_addr).await {
+        let frame = build_ip_udp_frame(&encoded);
+        if let Err(e) = send_via_packet_socket(&pkt_sock, ifindex, &frame).await {
             let _ = state_tx
                 .send(FactoryEvent::Error {
                     policy_name: policy_name.clone(),
@@ -161,7 +169,7 @@ async fn run_state_machine(
         let offer_result = tokio::select! {
             biased;
             _ = &mut *stop_rx => return,
-            r = recv_dhcp_response(&socket, xid, MessageType::Offer, DISCOVER_TIMEOUT) => r,
+            r = recv_dhcp_from_packet(&pkt_sock, xid, MessageType::Offer, DISCOVER_TIMEOUT) => r,
         };
 
         let offer = match offer_result {
@@ -187,7 +195,6 @@ async fn run_state_machine(
             }
         };
 
-        // Extract offered IP and server ID from DHCPOFFER.
         let offered_ip = offer.yiaddr();
         let server_id = extract_server_id(offer.opts()).unwrap_or_else(|| offer.siaddr());
 
@@ -206,7 +213,8 @@ async fn run_state_machine(
             }
         };
 
-        if let Err(e) = socket.send_to(&encoded, broadcast_addr).await {
+        let frame = build_ip_udp_frame(&encoded);
+        if let Err(e) = send_via_packet_socket(&pkt_sock, ifindex, &frame).await {
             let _ = state_tx
                 .send(FactoryEvent::Error {
                     policy_name: policy_name.clone(),
@@ -220,7 +228,7 @@ async fn run_state_machine(
         let ack_result = tokio::select! {
             biased;
             _ = &mut *stop_rx => return,
-            r = recv_dhcp_response(&socket, xid, MessageType::Ack, DISCOVER_TIMEOUT) => r,
+            r = recv_dhcp_from_packet(&pkt_sock, xid, MessageType::Ack, DISCOVER_TIMEOUT) => r,
         };
 
         let ack = match ack_result {
@@ -243,7 +251,6 @@ async fn run_state_machine(
             }
         };
 
-        // Parse the lease from DHCPACK.
         let lease = match parse_ack(&ack) {
             Ok(l) => l,
             Err(e) => {
@@ -264,6 +271,24 @@ async fn run_state_machine(
             }
         };
 
+        // DHCPACK received — drain packet socket then transition to UDP socket.
+        drain_packet_socket(&pkt_sock);
+        drop(pkt_sock);
+
+        let udp_socket = match create_udp_renewal_socket(lease.ip, &interface) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = state_tx
+                    .send(FactoryEvent::Error {
+                        policy_name: policy_name.clone(),
+                        error: format!("failed to create UDP renewal socket: {e}"),
+                    })
+                    .await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+
         // Build State and store it.
         let state = lease_to_state(&lease, &interface, &policy_name, priority);
         {
@@ -271,7 +296,6 @@ async fn run_state_machine(
             *guard = Some(state.clone());
         }
 
-        // Send LeaseAcquired event.
         if state_tx
             .send(FactoryEvent::LeaseAcquired {
                 policy_name: policy_name.clone(),
@@ -280,12 +304,12 @@ async fn run_state_machine(
             .await
             .is_err()
         {
-            return; // Daemon has dropped the receiver; shut down.
+            return;
         }
 
         // ── Lease maintenance loop ────────────────────────────────────────────
         let outcome = run_lease_maintenance(
-            &socket,
+            &udp_socket,
             mac,
             &interface,
             &policy_name,
@@ -346,13 +370,11 @@ async fn run_lease_maintenance(
         tokio::select! {
             biased;
 
-            // Stop signal: send DHCPRELEASE and exit.
             _ = &mut *stop_rx => {
                 send_release(socket, mac, lease.ip, lease.server_id).await;
                 return LeaseMaintOutcome::Stop;
             }
 
-            // T1: attempt unicast renewal.
             _ = tokio::time::sleep(renewal_wait), if !renewal_wait.is_zero() => {
                 if let Some(updated) = attempt_renewal(socket, mac, &lease, false).await {
                     lease = updated;
@@ -368,10 +390,8 @@ async fn run_lease_maintenance(
                         })
                         .await;
                 }
-                // If unicast renewal failed, continue; rebind timer will fire.
             }
 
-            // T2: attempt broadcast rebinding.
             _ = tokio::time::sleep(rebind_wait), if !rebind_wait.is_zero() => {
                 if let Some(updated) = attempt_renewal(socket, mac, &lease, true).await {
                     lease = updated;
@@ -387,10 +407,8 @@ async fn run_lease_maintenance(
                         })
                         .await;
                 }
-                // If rebind also failed, expiry timer will fire.
             }
 
-            // Lease expiry.
             _ = tokio::time::sleep(expiry_wait) => {
                 return LeaseMaintOutcome::Expired;
             }
@@ -435,12 +453,9 @@ async fn send_release(socket: &UdpSocket, mac: [u8; 6], client_ip: Ipv4Addr, ser
     }
 }
 
-// ── Receive helper ────────────────────────────────────────────────────────────
+// ── UDP receive helper (renewal phase) ───────────────────────────────────────
 
-/// Receive and validate a DHCP response matching `xid` and `expected_type`.
-///
-/// Ignores packets that don't match. Returns an error if the timeout elapses
-/// or if a DHCPNAK is received.
+/// Receive and validate a DHCP response on a UDP socket (renewal/rebind phase).
 async fn recv_dhcp_response(
     socket: &UdpSocket,
     xid: u32,
@@ -464,18 +479,108 @@ async fn recv_dhcp_response(
         let msg = Message::decode(&mut Decoder::new(&buf[..n]))
             .map_err(|e| format!("failed to decode DHCP message: {e}"))?;
 
-        // Filter by XID.
         if msg.xid() != xid {
             continue;
         }
 
-        // Check for DHCPNAK — abort immediately.
         let msg_type = extract_msg_type(msg.opts());
         if msg_type == Some(MessageType::Nak) {
             return Err("received DHCPNAK from server".to_string());
         }
 
-        // Check expected message type.
+        if msg_type == Some(expected_type) {
+            return Ok(msg);
+        }
+    }
+}
+
+// ── Packet socket receive helper (DORA phase) ─────────────────────────────────
+
+/// Receive and validate a DHCP message from a packet socket (DORA phase).
+///
+/// Parses and filters IP+UDP+DHCP packets from the raw IP stream delivered by
+/// `AF_PACKET/SOCK_DGRAM`. Drops non-UDP, fragmented, wrong-port, or non-BOOTREPLY packets.
+async fn recv_dhcp_from_packet(
+    async_fd: &AsyncFd<OwnedFd>,
+    xid: u32,
+    expected_type: MessageType,
+    timeout: Duration,
+) -> Result<Message, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = vec![0u8; 2048];
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| "DHCP response timeout".to_string())?;
+
+        let n = tokio::time::timeout(remaining, recv_from_packet_socket(async_fd, &mut buf))
+            .await
+            .map_err(|_| "DHCP response timeout".to_string())?
+            .map_err(|e| format!("packet socket recv error: {e}"))?;
+
+        if n < 28 {
+            continue;
+        }
+
+        // IPv4 version check.
+        if (buf[0] >> 4) != 4 {
+            continue;
+        }
+
+        let ihl = (buf[0] & 0x0F) as usize * 4;
+        if ihl < 20 || n < ihl + 8 {
+            continue;
+        }
+
+        // Protocol must be UDP (17).
+        if buf[9] != 17 {
+            continue;
+        }
+
+        // Drop fragmented packets (MF flag or nonzero fragment offset).
+        let flags_frag = u16::from_be_bytes([buf[6], buf[7]]);
+        if (flags_frag & 0x1FFF) != 0 || (flags_frag & 0x2000) != 0 {
+            continue;
+        }
+
+        // UDP destination port must be 68 (DHCP client).
+        let udp_dst_port = u16::from_be_bytes([buf[ihl + 2], buf[ihl + 3]]);
+        if udp_dst_port != DHCP_CLIENT_PORT {
+            continue;
+        }
+
+        let dhcp_start = ihl + 8;
+        if n < dhcp_start + 240 {
+            continue;
+        }
+
+        let payload = &buf[dhcp_start..n];
+
+        // DHCP op must be BOOTREPLY (2).
+        if payload[0] != 2 {
+            continue;
+        }
+
+        // Magic cookie must be 0x63825363.
+        if payload[236..240] != [0x63, 0x82, 0x53, 0x63] {
+            continue;
+        }
+
+        let msg = match Message::decode(&mut Decoder::new(payload)) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if msg.xid() != xid {
+            continue;
+        }
+
+        let msg_type = extract_msg_type(msg.opts());
+        if msg_type == Some(MessageType::Nak) {
+            return Err("received DHCPNAK from server".to_string());
+        }
+
         if msg_type == Some(expected_type) {
             return Ok(msg);
         }
@@ -484,7 +589,6 @@ async fn recv_dhcp_response(
 
 // ── Option extraction helpers ─────────────────────────────────────────────────
 
-/// Extract the MessageType option from DhcpOptions.
 fn extract_msg_type(opts: &dhcproto::v4::DhcpOptions) -> Option<MessageType> {
     match opts.get(OptionCode::MessageType) {
         Some(DhcpOption::MessageType(mt)) => Some(*mt),
@@ -492,7 +596,6 @@ fn extract_msg_type(opts: &dhcproto::v4::DhcpOptions) -> Option<MessageType> {
     }
 }
 
-/// Extract the ServerIdentifier option from DhcpOptions.
 fn extract_server_id(opts: &dhcproto::v4::DhcpOptions) -> Option<Ipv4Addr> {
     match opts.get(OptionCode::ServerIdentifier) {
         Some(DhcpOption::ServerIdentifier(ip)) => Some(*ip),
@@ -584,9 +687,6 @@ fn build_release(mac: [u8; 6], client_ip: Ipv4Addr, server_id: Ipv4Addr) -> Mess
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
 
-/// Parse a DHCPACK message into a `DhcpLease`.
-///
-/// Returns an error string if required options (lease time) are missing.
 fn parse_ack(msg: &Message) -> Result<DhcpLease, String> {
     let ip = msg.yiaddr();
     if ip.is_unspecified() {
@@ -613,7 +713,6 @@ fn parse_ack(msg: &Message) -> Result<DhcpLease, String> {
 
     let server_id = extract_server_id(opts).unwrap_or_else(|| msg.siaddr());
 
-    // T1 defaults to 50% of lease_time; T2 defaults to 87.5% of lease_time.
     let renewal_time = extract_u32(opts, OptionCode::Renewal).unwrap_or(lease_time / 2);
     let rebind_time = extract_u32(opts, OptionCode::Rebinding).unwrap_or(lease_time * 7 / 8);
 
@@ -630,7 +729,6 @@ fn parse_ack(msg: &Message) -> Result<DhcpLease, String> {
     })
 }
 
-/// Extract a u32 value from a DhcpOption.
 fn extract_u32(opts: &dhcproto::v4::DhcpOptions, code: OptionCode) -> Option<u32> {
     match opts.get(code) {
         Some(DhcpOption::AddressLeaseTime(t)) => Some(*t),
@@ -640,7 +738,6 @@ fn extract_u32(opts: &dhcproto::v4::DhcpOptions, code: OptionCode) -> Option<u32
     }
 }
 
-/// Extract an Ipv4Addr from single-IP options (SubnetMask, ServerIdentifier, etc.).
 fn extract_ipv4(opts: &dhcproto::v4::DhcpOptions, code: OptionCode) -> Option<Ipv4Addr> {
     match opts.get(code) {
         Some(DhcpOption::SubnetMask(ip)) => Some(*ip),
@@ -650,17 +747,162 @@ fn extract_ipv4(opts: &dhcproto::v4::DhcpOptions, code: OptionCode) -> Option<Ip
     }
 }
 
-// ── Socket setup ──────────────────────────────────────────────────────────────
+// ── IP/UDP framing ────────────────────────────────────────────────────────────
 
-/// Create and configure a UDP socket for DHCP client use.
+/// RFC 1071 one's-complement checksum over `data`.
+fn ip_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    if i < data.len() {
+        // Odd byte: treat as MSB of a zero-padded 16-bit word.
+        sum += u32::from(data[i]) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// UDP checksum over the pseudo-header + UDP header + payload.
+fn udp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, udp_header_and_payload: &[u8]) -> u16 {
+    let udp_len = udp_header_and_payload.len() as u16;
+    let src = src_ip.octets();
+    let dst = dst_ip.octets();
+    let pseudo: [u8; 12] = [
+        src[0], src[1], src[2], src[3],
+        dst[0], dst[1], dst[2], dst[3],
+        0, 17,
+        (udp_len >> 8) as u8, (udp_len & 0xFF) as u8,
+    ];
+    let mut combined = Vec::with_capacity(12 + udp_header_and_payload.len());
+    combined.extend_from_slice(&pseudo);
+    combined.extend_from_slice(udp_header_and_payload);
+    let csum = ip_checksum(&combined);
+    // Per RFC 768: transmitted checksum of 0 means "no checksum"; encode as 0xFFFF.
+    if csum == 0 { 0xFFFF } else { csum }
+}
+
+/// Build a raw IP+UDP frame carrying `dhcp_payload` (src 0.0.0.0:68 → dst 255.255.255.255:67).
+fn build_ip_udp_frame(dhcp_payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8u16 + dhcp_payload.len() as u16;
+    let ip_total_len = 20u16 + udp_len;
+    let ident: u16 = rand::random();
+
+    let mut frame = vec![0u8; 28 + dhcp_payload.len()];
+
+    // IP header (20 bytes).
+    frame[0] = 0x45; // version=4, IHL=5
+    frame[1] = 0x00; // DSCP/ECN
+    frame[2] = (ip_total_len >> 8) as u8;
+    frame[3] = (ip_total_len & 0xFF) as u8;
+    frame[4] = (ident >> 8) as u8;
+    frame[5] = (ident & 0xFF) as u8;
+    // frame[6..8] = 0x0000 (no flags, no fragmentation)
+    frame[8] = 64;   // TTL
+    frame[9] = 17;   // protocol = UDP
+    // frame[10..12] = checksum placeholder (zero)
+    // frame[12..16] = src IP 0.0.0.0 (already zero)
+    frame[16] = 255; // dst IP 255.255.255.255
+    frame[17] = 255;
+    frame[18] = 255;
+    frame[19] = 255;
+
+    let ip_csum = ip_checksum(&frame[0..20]);
+    frame[10] = (ip_csum >> 8) as u8;
+    frame[11] = (ip_csum & 0xFF) as u8;
+
+    // UDP header (8 bytes at offset 20).
+    frame[20] = (DHCP_CLIENT_PORT >> 8) as u8;
+    frame[21] = (DHCP_CLIENT_PORT & 0xFF) as u8;
+    frame[22] = (DHCP_SERVER_PORT >> 8) as u8;
+    frame[23] = (DHCP_SERVER_PORT & 0xFF) as u8;
+    frame[24] = (udp_len >> 8) as u8;
+    frame[25] = (udp_len & 0xFF) as u8;
+    // frame[26..28] = UDP checksum placeholder (zero)
+
+    // DHCP payload at offset 28.
+    frame[28..].copy_from_slice(dhcp_payload);
+
+    let udp_csum = udp_checksum(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, &frame[20..]);
+    frame[26] = (udp_csum >> 8) as u8;
+    frame[27] = (udp_csum & 0xFF) as u8;
+
+    frame
+}
+
+// ── Socket creation ───────────────────────────────────────────────────────────
+
+/// Get the interface index via `if_nametoindex()` (namespace-aware, unlike sysfs).
+fn get_ifindex(interface: &str) -> Result<i32, BackendError> {
+    let c_name = CString::new(interface)
+        .map_err(|_| BackendError::Internal(format!("invalid interface name: {interface}")))?;
+    let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if idx == 0 {
+        Err(BackendError::Internal(format!(
+            "interface not found: {interface}"
+        )))
+    } else {
+        Ok(idx as i32)
+    }
+}
+
+/// Create an `AF_PACKET/SOCK_DGRAM/ETH_P_IP` socket bound to `ifindex`.
 ///
-/// - Sets `SO_BROADCAST` to send to 255.255.255.255.
-/// - Sets `SO_BINDTODEVICE` (Linux) to restrict I/O to `interface`.
-/// - Binds to `0.0.0.0:68` (standard DHCP client port).
-/// - Converts to a non-blocking `tokio::net::UdpSocket`.
-fn create_dhcp_socket(interface: &str) -> Result<UdpSocket, BackendError> {
+/// Uses `SOCK_DGRAM` so the kernel strips/adds Ethernet headers; we only
+/// construct IP+UDP headers. The socket is set non-blocking and wrapped in
+/// `AsyncFd<OwnedFd>` for integration with tokio's event loop.
+fn create_packet_socket(ifindex: i32) -> Result<AsyncFd<OwnedFd>, BackendError> {
+    let proto = (libc::ETH_P_IP as u16).to_be() as i32;
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM, proto) };
+    if fd < 0 {
+        return Err(BackendError::Internal(format!(
+            "AF_PACKET socket creation failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+
+    let mut sockaddr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sockaddr.sll_family = libc::AF_PACKET as u16;
+    sockaddr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+    sockaddr.sll_ifindex = ifindex;
+
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_ll>() as u32,
+        )
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(BackendError::Internal(format!(
+            "AF_PACKET bind failed: {err}"
+        )));
+    }
+
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(BackendError::Internal(format!(
+            "set O_NONBLOCK failed: {err}"
+        )));
+    }
+
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    AsyncFd::new(owned)
+        .map_err(|e| BackendError::Internal(format!("AsyncFd wrapping failed: {e}")))
+}
+
+/// Create a UDP socket bound to `client_ip:68` for renewal/rebind/release.
+fn create_udp_renewal_socket(client_ip: Ipv4Addr, interface: &str) -> Result<UdpSocket, BackendError> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|e| BackendError::Internal(format!("socket creation failed: {e}")))?;
+        .map_err(|e| BackendError::Internal(format!("UDP socket creation failed: {e}")))?;
 
     socket
         .set_reuse_address(true)
@@ -670,19 +912,20 @@ fn create_dhcp_socket(interface: &str) -> Result<UdpSocket, BackendError> {
         .set_broadcast(true)
         .map_err(|e| BackendError::Internal(format!("SO_BROADCAST failed: {e}")))?;
 
-    // SO_BINDTODEVICE: Linux-only, restricts socket I/O to the named interface.
+    #[cfg(target_os = "linux")]
+    socket
+        .set_freebind(true)
+        .map_err(|e| BackendError::Internal(format!("IP_FREEBIND failed: {e}")))?;
+
     #[cfg(target_os = "linux")]
     socket
         .bind_device(Some(interface.as_bytes()))
         .map_err(|e| BackendError::Internal(format!("SO_BINDTODEVICE failed: {e}")))?;
 
-    let addr: std::net::SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
-        Ipv4Addr::UNSPECIFIED,
-        DHCP_CLIENT_PORT,
-    ));
+    let addr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(client_ip, DHCP_CLIENT_PORT));
     socket
         .bind(&addr.into())
-        .map_err(|e| BackendError::Internal(format!("bind to 0.0.0.0:{DHCP_CLIENT_PORT} failed: {e}")))?;
+        .map_err(|e| BackendError::Internal(format!("bind to {client_ip}:{DHCP_CLIENT_PORT} failed: {e}")))?;
 
     socket
         .set_nonblocking(true)
@@ -693,13 +936,111 @@ fn create_dhcp_socket(interface: &str) -> Result<UdpSocket, BackendError> {
         .map_err(|e| BackendError::Internal(format!("tokio UdpSocket conversion failed: {e}")))
 }
 
+// ── Packet socket I/O ─────────────────────────────────────────────────────────
+
+/// Send `frame` to the broadcast MAC via the packet socket using `sendto()` with `sockaddr_ll`.
+async fn send_via_packet_socket(
+    async_fd: &AsyncFd<OwnedFd>,
+    ifindex: i32,
+    frame: &[u8],
+) -> Result<(), BackendError> {
+    let mut sockaddr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sockaddr.sll_family = libc::AF_PACKET as u16;
+    sockaddr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+    sockaddr.sll_ifindex = ifindex;
+    sockaddr.sll_halen = 6;
+    sockaddr.sll_addr = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0];
+
+    loop {
+        let mut guard = async_fd.writable().await.map_err(|e| {
+            BackendError::Internal(format!("packet socket writable() error: {e}"))
+        })?;
+
+        let result = guard.try_io(|inner| {
+            let ret = unsafe {
+                libc::sendto(
+                    inner.get_ref().as_raw_fd(),
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                    &sockaddr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as u32,
+                )
+            };
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(ret)
+            }
+        });
+
+        match result {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => {
+                return Err(BackendError::Internal(format!("sendto failed: {e}")));
+            }
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+/// Receive one packet from the packet socket asynchronously.
+async fn recv_from_packet_socket(
+    async_fd: &AsyncFd<OwnedFd>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        let mut guard = async_fd.readable().await?;
+        let result = guard.try_io(|inner| {
+            let ret = unsafe {
+                libc::recv(
+                    inner.get_ref().as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                )
+            };
+            if ret < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        });
+
+        match result {
+            Ok(Ok(n)) => return Ok(n),
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+/// Drain up to `DRAIN_LIMIT` packets from the packet socket (non-blocking).
+/// Called just before closing the packet socket after DHCPACK to discard in-flight data.
+fn drain_packet_socket(async_fd: &AsyncFd<OwnedFd>) {
+    let mut buf = [0u8; 2048];
+    for _ in 0..DRAIN_LIMIT {
+        let fd = async_fd.get_ref().as_raw_fd();
+        let ret = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if ret <= 0 {
+            break;
+        }
+    }
+}
+
 // ── MAC address discovery ─────────────────────────────────────────────────────
 
 /// Read the interface's MAC address via rtnetlink.
 ///
-/// Uses the netlink API instead of `/sys/class/net/` because sysfs is not
+/// Uses netlink instead of `/sys/class/net/` because sysfs is not
 /// network-namespace-aware in all environments (e.g., containers, unshare).
-/// Netlink queries are always scoped to the calling process's network namespace.
 async fn get_interface_mac(interface: &str) -> Result<[u8; 6], BackendError> {
     let (conn, handle, _) = new_connection()
         .map_err(|e| BackendError::Internal(format!("netlink connection failed: {e}")))?;
@@ -715,13 +1056,9 @@ async fn get_interface_mac(interface: &str) -> Result<[u8; 6], BackendError> {
         .try_next()
         .await
         .map_err(|e| {
-            BackendError::Internal(format!(
-                "netlink query failed for {interface}: {e}"
-            ))
+            BackendError::Internal(format!("netlink query failed for {interface}: {e}"))
         })?
-        .ok_or_else(|| {
-            BackendError::Internal(format!("interface not found: {interface}"))
-        })?;
+        .ok_or_else(|| BackendError::Internal(format!("interface not found: {interface}")))?;
 
     for attr in &msg.attributes {
         if let LinkAttribute::Address(bytes) = attr {
