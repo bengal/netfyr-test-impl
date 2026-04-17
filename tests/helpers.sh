@@ -139,3 +139,49 @@ assert_link_up() {
         exit 1
     fi
 }
+
+# assert_not_has_address IFACE PREFIX -- Fail if IFACE has an address containing PREFIX.
+assert_not_has_address() {
+    local iface="$1"
+    local prefix="$2"
+    local output
+    output=$(ip addr show dev "$iface" 2>&1) || true
+    if echo "$output" | grep -qF "$prefix"; then
+        echo "FAIL: interface '$iface' unexpectedly has an address matching '$prefix'" >&2
+        echo "      ip addr output: $output" >&2
+        exit 1
+    fi
+}
+
+# assert_mtu IFACE EXPECTED_MTU -- Fail if IFACE does not have the expected MTU.
+assert_mtu() {
+    local iface="$1"
+    local expected="$2"
+    local output
+    output=$(ip link show dev "$iface" 2>&1) || true
+    if ! echo "$output" | grep -q "mtu $expected"; then
+        echo "FAIL: interface '$iface' does not have mtu $expected" >&2
+        echo "      ip link output: $output" >&2
+        exit 1
+    fi
+}
+
+# wait_for_address IFACE PREFIX TIMEOUT_SECONDS -- Poll until an address matching PREFIX
+# appears on IFACE, or fail after TIMEOUT_SECONDS.
+wait_for_address() {
+    local iface="$1"
+    local prefix="$2"
+    local timeout_sec="$3"
+    local max_iters=$(( timeout_sec * 10 ))
+    local waited=0
+    while ! ip addr show dev "$iface" 2>/dev/null | grep -qF "$prefix"; do
+        if (( waited >= max_iters )); then
+            echo "FAIL: interface '$iface' did not get an address matching '$prefix' within ${timeout_sec}s" >&2
+            echo "      ip addr show $iface:" >&2
+            ip addr show dev "$iface" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+        (( waited++ )) || true
+    done
+}
