@@ -624,6 +624,129 @@ mod tests {
         assert!(map.contains_key("type"));
     }
 
+    // ── varlink_state_to_flat_map tests ──────────────────────────────────────
+
+    use netfyr_varlink::VarlinkState;
+    use netfyr_varlink::types::VarlinkSelector as VarlinkSel;
+
+    fn make_varlink_state(
+        entity_type: &str,
+        fields: Vec<(&str, serde_json::Value)>,
+    ) -> VarlinkState {
+        let mut field_map = serde_json::Map::new();
+        for (k, v) in fields {
+            field_map.insert(k.to_string(), v);
+        }
+        VarlinkState {
+            entity_type: entity_type.to_string(),
+            selector: VarlinkSel::default(),
+            fields: field_map,
+        }
+    }
+
+    /// AC (daemon mode): "type" is first key in flat map from VarlinkState.
+    #[test]
+    fn test_varlink_state_to_flat_map_type_is_first_key() {
+        let vs = make_varlink_state("ethernet", vec![("mtu", serde_json::json!(1500u64))]);
+        let map = varlink_state_to_flat_map(&vs);
+        let first_key = map.keys().next().expect("map must not be empty");
+        assert_eq!(first_key, "type", "\"type\" must be the first key in the flat map");
+    }
+
+    /// AC (daemon mode): "type" value matches entity_type from VarlinkState.
+    #[test]
+    fn test_varlink_state_to_flat_map_type_value_matches_entity_type() {
+        let vs = make_varlink_state("ethernet", vec![("mtu", serde_json::json!(1500u64))]);
+        let map = varlink_state_to_flat_map(&vs);
+        assert_eq!(map["type"], serde_json::json!("ethernet"));
+    }
+
+    /// AC (daemon mode): All fields from VarlinkState appear at top level of flat map.
+    #[test]
+    fn test_varlink_state_to_flat_map_includes_all_fields_at_top_level() {
+        let vs = make_varlink_state(
+            "ethernet",
+            vec![
+                ("mtu", serde_json::json!(1500u64)),
+                ("carrier", serde_json::json!(true)),
+                ("name", serde_json::json!("eth0")),
+            ],
+        );
+        let map = varlink_state_to_flat_map(&vs);
+        assert_eq!(map.get("mtu"), Some(&serde_json::json!(1500u64)));
+        assert_eq!(map.get("carrier"), Some(&serde_json::json!(true)));
+        assert_eq!(map.get("name"), Some(&serde_json::json!("eth0")));
+    }
+
+    /// AC (daemon mode): VarlinkState with no fields yields a flat map with only "type".
+    #[test]
+    fn test_varlink_state_to_flat_map_empty_fields_yields_only_type() {
+        let vs = make_varlink_state("ethernet", vec![]);
+        let map = varlink_state_to_flat_map(&vs);
+        assert_eq!(
+            map.len(),
+            1,
+            "flat map with no fields must have exactly 1 key (\"type\")"
+        );
+        assert!(map.contains_key("type"));
+    }
+
+    // ── daemon_socket_path tests ──────────────────────────────────────────────
+
+    // Env var mutations are serialised to avoid races between parallel test threads.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// AC: socket path defaults to /run/netfyr/netfyr.sock when env var is absent.
+    #[test]
+    fn test_daemon_socket_path_returns_default_when_env_not_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let original = std::env::var("NETFYR_SOCKET_PATH").ok();
+        std::env::remove_var("NETFYR_SOCKET_PATH");
+        let path = daemon_socket_path();
+        match original {
+            Some(v) => std::env::set_var("NETFYR_SOCKET_PATH", v),
+            None => std::env::remove_var("NETFYR_SOCKET_PATH"),
+        }
+        assert_eq!(path, "/run/netfyr/netfyr.sock");
+    }
+
+    /// AC: socket path uses NETFYR_SOCKET_PATH env var when set (enables test overrides).
+    #[test]
+    fn test_daemon_socket_path_uses_env_var_when_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let original = std::env::var("NETFYR_SOCKET_PATH").ok();
+        std::env::set_var("NETFYR_SOCKET_PATH", "/tmp/custom-test.sock");
+        let path = daemon_socket_path();
+        match original {
+            Some(v) => std::env::set_var("NETFYR_SOCKET_PATH", v),
+            None => std::env::remove_var("NETFYR_SOCKET_PATH"),
+        }
+        assert_eq!(path, "/tmp/custom-test.sock");
+    }
+
+    // ── build_varlink_selector: additional field coverage ────────────────────
+
+    use netfyr_state::MacAddr;
+
+    /// AC: Selector.mac (MacAddr) is serialized to a string in VarlinkSelector.mac.
+    #[test]
+    fn test_build_varlink_selector_mac_in_selector_serialized_to_string() {
+        let mac: MacAddr = "aa:bb:cc:dd:ee:ff".parse().expect("valid MAC");
+        let sel = Selector { mac: Some(mac), ..Default::default() };
+        let result = build_varlink_selector(None, Some(&sel));
+        let vs = result.expect("must return Some when selector has mac");
+        assert_eq!(vs.mac, Some("aa:bb:cc:dd:ee:ff".to_string()));
+    }
+
+    /// AC: pci_path field in Selector is forwarded to VarlinkSelector.pci_path.
+    #[test]
+    fn test_build_varlink_selector_pci_path_is_forwarded() {
+        let sel = Selector { pci_path: Some("0000:03:00.0".to_string()), ..Default::default() };
+        let result = build_varlink_selector(None, Some(&sel));
+        let vs = result.expect("must return Some when selector has pci_path");
+        assert_eq!(vs.pci_path, Some("0000:03:00.0".to_string()));
+    }
+
     // ── Serialization / output format tests ──────────────────────────────────
 
     /// AC: YAML output format produces valid parseable YAML (sequence).
