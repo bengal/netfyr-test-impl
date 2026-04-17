@@ -19,7 +19,7 @@ use tempfile::TempDir;
 
 /// Absolute path of the `netfyr-cli` binary produced by this workspace build.
 fn netfyr_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_netfyr-cli"))
+    PathBuf::from(env!("CARGO_BIN_EXE_netfyr"))
 }
 
 /// Write `content` to `<dir>/<filename>` and return the full path.

@@ -8,10 +8,6 @@ name = "netfyr_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "netfyr-cli"
-path = "src/main.rs"
-
-[[bin]]
 name = "netfyr"
 path = "src/main.rs"
 

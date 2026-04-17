@@ -9,7 +9,7 @@ use std::process::Command;
 
 /// Returns the path to the compiled `netfyr-cli` binary.
 fn netfyr_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_netfyr-cli"))
+    PathBuf::from(env!("CARGO_BIN_EXE_netfyr"))
 }
 
 // ---------------------------------------------------------------------------

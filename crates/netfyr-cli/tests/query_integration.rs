@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// Absolute path of the `netfyr-cli` binary produced by this workspace build.
 fn netfyr_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_netfyr-cli"))
+    PathBuf::from(env!("CARGO_BIN_EXE_netfyr"))
 }
 
 /// Combine stdout and stderr into one string for assertion messages.
