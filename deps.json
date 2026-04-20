@@ -1,0 +1,147 @@
+{
+  "stories": [
+    "001-workspace-setup",
+    "002-entity-state-types",
+    "003-selectors",
+    "004-stateset-operations",
+    "005-yaml-serialization",
+    "006-entity-schema-validation",
+    "007-policy-types-static-factory",
+    "008-bare-state-shorthand",
+    "101-backend-trait",
+    "102-rtnetlink-query-ethernet",
+    "103-rtnetlink-apply-ethernet",
+    "201-reconciliation-merge",
+    "202-conflict-detection",
+    "203-diff-generation",
+    "301-cli-apply",
+    "302-cli-query",
+    "401-dhcpv4-factory",
+    "402-policy-store",
+    "403-daemon",
+    "404-varlink-api",
+    "501-man-pages",
+    "502-rpm-packaging",
+    "503-man-page-yaml-reference",
+    "600-end-to-end-tests"
+  ],
+  "dependencies": {
+    "001-workspace-setup": [],
+    "002-entity-state-types": [
+      "001-workspace-setup"
+    ],
+    "003-selectors": [
+      "001-workspace-setup"
+    ],
+    "004-stateset-operations": [
+      "002-entity-state-types",
+      "003-selectors"
+    ],
+    "005-yaml-serialization": [
+      "002-entity-state-types",
+      "003-selectors"
+    ],
+    "006-entity-schema-validation": [
+      "002-entity-state-types",
+      "005-yaml-serialization"
+    ],
+    "007-policy-types-static-factory": [
+      "002-entity-state-types",
+      "004-stateset-operations",
+      "005-yaml-serialization"
+    ],
+    "008-bare-state-shorthand": [
+      "005-yaml-serialization",
+      "007-policy-types-static-factory"
+    ],
+    "101-backend-trait": [
+      "002-entity-state-types",
+      "004-stateset-operations"
+    ],
+    "102-rtnetlink-query-ethernet": [
+      "002-entity-state-types",
+      "101-backend-trait"
+    ],
+    "103-rtnetlink-apply-ethernet": [
+      "101-backend-trait",
+      "102-rtnetlink-query-ethernet"
+    ],
+    "201-reconciliation-merge": [
+      "002-entity-state-types",
+      "004-stateset-operations"
+    ],
+    "202-conflict-detection": [
+      "201-reconciliation-merge"
+    ],
+    "203-diff-generation": [
+      "004-stateset-operations",
+      "201-reconciliation-merge"
+    ],
+    "301-cli-apply": [
+      "007-policy-types-static-factory",
+      "008-bare-state-shorthand",
+      "103-rtnetlink-apply-ethernet",
+      "201-reconciliation-merge",
+      "203-diff-generation",
+      "404-varlink-api"
+    ],
+    "302-cli-query": [
+      "102-rtnetlink-query-ethernet",
+      "301-cli-apply",
+      "404-varlink-api"
+    ],
+    "401-dhcpv4-factory": [
+      "002-entity-state-types",
+      "007-policy-types-static-factory",
+      "101-backend-trait"
+    ],
+    "402-policy-store": [
+      "007-policy-types-static-factory"
+    ],
+    "403-daemon": [
+      "007-policy-types-static-factory",
+      "101-backend-trait",
+      "201-reconciliation-merge",
+      "203-diff-generation",
+      "401-dhcpv4-factory",
+      "402-policy-store",
+      "404-varlink-api"
+    ],
+    "404-varlink-api": [
+      "004-stateset-operations",
+      "007-policy-types-static-factory",
+      "203-diff-generation"
+    ],
+    "501-man-pages": [
+      "301-cli-apply",
+      "302-cli-query"
+    ],
+    "502-rpm-packaging": [
+      "001-workspace-setup",
+      "301-cli-apply",
+      "403-daemon",
+      "501-man-pages",
+      "503-man-page-yaml-reference"
+    ],
+    "503-man-page-yaml-reference": [
+      "002-entity-state-types",
+      "003-selectors",
+      "005-yaml-serialization",
+      "007-policy-types-static-factory",
+      "008-bare-state-shorthand",
+      "501-man-pages"
+    ],
+    "600-end-to-end-tests": [
+      "001-workspace-setup",
+      "103-rtnetlink-apply-ethernet",
+      "201-reconciliation-merge",
+      "202-conflict-detection",
+      "203-diff-generation",
+      "301-cli-apply",
+      "302-cli-query",
+      "401-dhcpv4-factory",
+      "402-policy-store",
+      "403-daemon"
+    ]
+  }
+}

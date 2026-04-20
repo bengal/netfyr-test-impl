@@ -1,0 +1,6 @@
+state.json.lock
+.specs_hash
+.specs-prev/
+stories/*/log/
+stories/*/commit_msg.txt
+output/*.log
