@@ -2,187 +2,151 @@
 
 ## Approach
 
-All Rust implementation is complete: `apply_ethernet`, `dry_run_ethernet`, the `NetworkBackend` trait impl, report types, and Rust integration tests (`crates/netfyr-backend/tests/netlink_apply.rs`) are fully written and cover every acceptance criterion. The only remaining work is creating four shell integration test scripts in `tests/`.
+The implementation is **substantially complete**. Both `apply_ethernet` and `dry_run_ethernet` are fully implemented in `crates/netfyr-backend/src/netlink/apply.rs`, the `NetworkBackend` trait wiring is done in `mod.rs`, all report types exist in `report.rs`, and all four integration test scripts are written. The remaining work is a single behavioral fix and verification.
 
-The shell scripts exercise the **full CLI pipeline end-to-end**: YAML policy file → `load_policy_file` (auto-wraps bare states into static policies) → `StaticFactory::produce` → `merge` → `compute_state_diff` → `registry.apply` → netlink kernel calls. This is a different testing layer than the Rust integration tests, which call `apply_ethernet` directly with hand-built `StateDiff` objects. The shell scripts verify that policy parsing, diff generation, and CLI reporting all compose correctly.
+The one code change required is **reversing the address replacement ordering** in `apply_modify_fields` Phase 2. The spec explicitly requires remove-then-add ordering to ensure the kernel's address list order matches YAML order (the first address in the policy becomes the primary/source address). The current code does add-then-remove, which violates this guarantee: when replacing addresses on an interface that already has addresses, existing addresses occupy earlier positions in the kernel's list, preventing the desired primary address from being first.
 
-Each script runs inside `unshare --user --net --map-root-user` (unprivileged network namespace), creates veth pairs as synthetic ethernet interfaces, writes a temporary YAML policy file, invokes `$NETFYR_BIN apply`, and asserts kernel state via `ip` commands. The daemon socket path is forced to a non-existent path to guarantee daemon-free mode.
-
-The **bare state YAML format** (no `kind:` field) is used for all test policies. When `load_policy_file` encounters a document without `kind: policy`, it auto-wraps it as a static policy with priority 100 and a name derived from the filename. This is the simplest format: `type: ethernet\nname: veth-test0\nmtu: 1400\n` becomes a complete policy. I verified this behavior by reading `crates/netfyr-policy/src/lib.rs:560-588` where the `None | Some("state")` match arm performs the wrapping.
-
-An alternative was to use the explicit `kind: policy` format with `factory: static` and `state:` block, but the bare format is shorter, less error-prone, and exercises a realistic user workflow. Both paths are extensively tested in Rust unit tests.
+No new files, types, traits, or dependencies are needed. The fix is a localized edit within the existing `apply_modify_fields` function in `apply.rs`. All other behaviors — MTU, operstate, routes, read-only field skipping, idempotency, error handling, dry-run, remove operations — are correctly implemented and tested.
 
 ## Design Decisions
 
-1. **Decision**: Use bare state YAML format (no `kind: policy` wrapper) for all test policies.
-   - **Alternatives considered**: Explicit `kind: policy` format with `factory: static` and `state:` block.
-   - **Rationale**: Bare state is shorter, less error-prone, and exercises the auto-wrapping path in `load_policy_file`. The existing 401-DHCP tests use explicit `kind: policy` for `factory: dhcpv4`, but for static ethernet policies, bare state is idiomatic and tests the common user workflow.
+### 1. Address replacement ordering: remove-then-add
 
-2. **Decision**: Force daemon-free mode by setting `export NETFYR_SOCKET_PATH=/nonexistent` in each script.
-   - **Alternatives considered**: Rely on the default socket not existing; add a `--no-daemon` CLI flag (does not exist).
-   - **Rationale**: If a daemon happens to be running on the host, the CLI would connect to it via Unix socket (which passes through the user-net namespace since no mount namespace is used). Setting an invalid path guarantees `VarlinkError::ConnectionFailed` → daemon-free fallback, making the test deterministic. The `daemon_socket_path()` function at `crates/netfyr-cli/src/apply.rs:36-39` reads `NETFYR_SOCKET_PATH` first.
+- **Decision**: Change Phase 2 of `apply_modify_fields` to remove unwanted addresses before adding new ones.
+- **Alternatives considered**: (a) Keep add-then-remove to avoid transient address loss. (b) Flush all addresses first, then add the full desired set.
+- **Rationale**: The spec is explicit: "remove old addresses first, then add new addresses in the order they appear in the desired state list." This guarantees kernel address order matches YAML order and the first address becomes the primary. Option (a) violates the spec. Option (b) would work but is more disruptive (removes even addresses that should be kept). The simple swap is the minimal change that satisfies the spec. Transient address loss during reconfiguration is acceptable — it's a brief window during an intentional configuration change, and routes that depend on those addresses will be re-added in Phase 3.
 
-3. **Decision**: Use MTU 1400 (not 9000) for MTU tests.
-   - **Alternatives considered**: MTU 9000 (jumbo frames) as mentioned in the spec's acceptance criteria.
-   - **Rationale**: veth interfaces in unprivileged namespaces support MTU values below the default 1500 universally. Values above 1500 may fail in some kernel/namespace configurations. MTU 1400 is safe, below default, and produces a visible change.
+### 2. DryRunReport NotFound handling: keep as skipped
 
-4. **Decision**: For address removal test, apply a second bare-state policy with no `addresses` field (not `addresses: []`).
-   - **Alternatives considered**: Use `addresses: []` (explicit empty list); use `addresses` field removal via `removed_fields`.
-   - **Rationale**: The spec scenario says "a second policy without the address is applied". When the desired state from the second policy has no `addresses` field, the diff engine (`crates/netfyr-state/src/diff.rs:146-149`) puts `addresses` into `removed_fields`. The apply engine (`crates/netfyr-backend/src/netlink/apply.rs:545-547`) checks `addr_in_removed` and sets `desired_addrs = vec![]`, which triggers removal of all current addresses. This exercises the `removed_fields` code path — the more realistic scenario where a user removes a field from their policy file. Other fields from the actual state (mtu, mac, carrier, speed, driver, operstate) also go into `removed_fields` but are handled safely: read-only fields get skipped, and mtu/operstate are only processed from `changed_fields` (not `removed_fields`).
+- **Decision**: Keep the current behavior where non-existent interfaces during dry-run are placed in `report.skipped` with reason `"interface not found: {name}"`.
+- **Alternatives considered**: Adding a `failed` field to `DryRunReport` to distinguish "would fail" from "would skip."
+- **Rationale**: The spec acceptance criterion says "the DryRunReport indicates the operation would fail with NotFound." The current implementation achieves this — the skipped entry's reason string clearly indicates a NotFound condition. Adding a `failed` field would change the public API of `DryRunReport`, which is used by the CLI display layer, the varlink types, and the daemon reconciler. The current approach is sufficient and avoids unnecessary API churn. The string-based reason is inspectable in both the CLI output and integration tests.
 
-5. **Decision**: Use `grep -q` with partial string matching for `ip` command output assertions.
-   - **Alternatives considered**: Exact string comparison with `assert_eq`.
-   - **Rationale**: `ip link show` and `ip route` output formats vary across kernel versions (different ordering, annotations like `proto kernel scope link`). Partial matching with `grep -q` is robust and follows the pattern in existing 102-series tests.
+### 3. Update comment in apply_modify_fields to match new ordering
 
-6. **Decision**: Four separate scripts, one per spec Gherkin scenario.
-   - **Alternatives considered**: One combined script; two scripts (apply and round-trip).
-   - **Rationale**: The Makefile discovers tests via `tests/[0-9]*.sh` and runs each independently. Separate scripts provide better error isolation — one failure doesn't block others. This matches the 102-series pattern (five separate scripts for five query scenarios).
-
-7. **Decision**: Route test pre-configures the interface address with `add_address` helper before calling `netfyr apply`, AND includes the address in the policy.
-   - **Alternatives considered**: Rely solely on `netfyr apply` to add the address first; use two sequential apply calls.
-   - **Rationale**: The `add_address` helper ensures the address is present before the apply call, as a safety net. The policy also includes `addresses: ["10.99.0.1/24"]` so the diff engine won't try to remove the address (which would break gateway reachability for the route). The apply engine's idempotent address handling means the pre-existing address is silently skipped. This is more robust than relying on ordering within a single apply (though the spec guarantees addresses are applied before routes).
-
-8. **Decision**: The round-trip test uses `--output json` for query verification, matching the 102-series pattern.
-   - **Alternatives considered**: YAML output; default human-readable format.
-   - **Rationale**: JSON is machine-parseable and `grep`-friendly. The 102-series tests already validate JSON output format, establishing the pattern. Checking for `"mtu": 1400` in JSON output is unambiguous.
+- **Decision**: Update the doc comment on `apply_modify_fields` and the inline comment in Phase 2 to describe remove-then-add ordering.
+- **Rationale**: The comment currently says "add before remove to avoid transient address loss." After the fix, this comment would be wrong and misleading. Comments must reflect actual behavior.
 
 ## File Changes
 
-### `tests/103-apply-set-mtu.sh`
-- **Action**: Create
-- **What**: Shell script that tests setting MTU on a veth interface via `netfyr apply`.
-  - Preamble: set `SCRIPT_DIR`, source `helpers.sh`, set `NETFYR_BIN` with fallback, check binary exists, export `NETFYR_SOCKET_PATH=/nonexistent`, call `netns_setup "$@"`
-  - Body: `create_veth veth-test0 veth-test1`, write bare state YAML to temp file (`type: ethernet`, `name: veth-test0`, `mtu: 1400`), run `$NETFYR_BIN apply $POLICY_FILE`, check exit code 0, assert `ip link show veth-test0` contains `mtu 1400`
-  - Success: emit `PASS: 103-apply-set-mtu`
-- **Why**: Covers spec shell Gherkin scenario "Set MTU on a veth interface in namespace". Validates the simplest end-to-end apply path.
+### File: `crates/netfyr-backend/src/netlink/apply.rs`
+- **Action**: Modify
+- **What**:
+  1. In `apply_modify_fields`, Phase 2 (addresses section, lines 556–674), swap the two code blocks so that address removal happens before address addition. Specifically, move the `if !to_remove.is_empty() { ... }` block (lines 620–673) to come before the `for cidr in &to_add { ... }` loop (lines 595–617).
+  2. Update the inline comment at line 594 from `"Add new addresses first (to avoid transient loss of all addresses)."` to `"Remove unwanted addresses first, then add new ones in desired order."`. Add a second comment before the add loop: `"Add new addresses in the order they appear in the desired state."`.
+  3. Update the inline comment at line 619 from `"Then remove unwanted addresses."` to remove it (or replace with a blank separator) since it no longer follows the add block.
+  4. Update the doc comment on `apply_modify_fields` (lines 442–448): change `"2. Addresses (add before remove to avoid transient address loss)"` to `"2. Addresses (remove before add to preserve YAML ordering)"`.
+- **Why**: Fixes Gap 1 from the understanding analysis — the spec requires remove-then-add to guarantee kernel address order matches YAML list order, ensuring the first YAML address becomes the primary (source) address.
 
-### `tests/103-apply-add-remove-address.sh`
-- **Action**: Create
-- **What**: Shell script that tests adding then removing an IP address across two apply calls.
-  - Preamble: same as above
-  - Phase 1: `create_veth veth-test0 veth-test1`, write bare state with `addresses: ["10.99.0.1/24"]` to temp file, apply, assert `ip addr show veth-test0` contains `10.99.0.1/24`
-  - Phase 2: write bare state with only `type` and `name` (no addresses field) to a DIFFERENT temp file, apply, assert `ip addr show veth-test0` does NOT contain `10.99.0.1/24`
-  - Success: emit `PASS: 103-apply-add-remove-address`
-- **Why**: Covers spec shell Gherkin scenario "Add and remove IP addresses in namespace". Tests address addition via `changed_fields` and address removal via `removed_fields`.
-
-### `tests/103-apply-add-route.sh`
-- **Action**: Create
-- **What**: Shell script that tests adding a static route via `netfyr apply`.
-  - Preamble: same as above
-  - Body: `create_veth veth-test0 veth-test1`, `add_address veth-test0 10.99.0.1/24` (pre-configure for gateway reachability), write bare state with `addresses: ["10.99.0.1/24"]` and `routes: [{destination: "10.100.0.0/24", gateway: "10.99.0.2"}]`, apply, assert `ip route` contains `10.100.0.0/24 via 10.99.0.2`
-  - Success: emit `PASS: 103-apply-add-route`
-- **Why**: Covers spec shell Gherkin scenario "Add a route in namespace". The pre-configured address ensures gateway 10.99.0.2 is reachable via the connected /24 subnet, and including the address in the policy prevents the diff from generating an address removal.
-
-### `tests/103-apply-query-roundtrip.sh`
-- **Action**: Create
-- **What**: Shell script that applies a policy and verifies the result via `netfyr query`.
-  - Preamble: same as above
-  - Body: `create_veth veth-test0 veth-test1`, write bare state with `mtu: 1400` and `addresses: ["10.99.0.1/24"]`, apply, then run `$NETFYR_BIN query --selector type=ethernet --selector name=veth-test0 --output json`, assert output contains `"mtu": 1400`, assert output contains `10.99.0.1/24`
-  - Success: emit `PASS: 103-apply-query-roundtrip`
-- **Why**: Covers spec shell Gherkin scenario "Full round-trip: apply then query". Verifies that applied changes are reflected in the query layer's output.
+No other files require changes.
 
 ## Dependencies
 
-No new crate dependencies are needed. The shell scripts use only system tools (`bash`, `ip`, `grep`, `unshare`, `mktemp`) and the pre-built `netfyr` binary.
+No new crate dependencies needed. The existing dependencies (`rtnetlink`, `netlink-packet-route`, `tokio`, `futures`, `indexmap`, `tracing`) are sufficient.
 
 ## Implementation Order
 
-1. **Create `tests/103-apply-set-mtu.sh`** — Simplest test. Validates that the CLI apply pipeline works end-to-end (policy parsing → diff → apply → kernel). If this doesn't work, nothing else will. Run `make integration-test SPEC=103` to verify.
+### Step 1: Fix address ordering in `apply_modify_fields`
 
-2. **Create `tests/103-apply-add-remove-address.sh`** — Adds address management. Exercises two applies in sequence and the `removed_fields` diff path for field deletion. Independent from step 3-4.
+Modify `crates/netfyr-backend/src/netlink/apply.rs`:
 
-3. **Create `tests/103-apply-add-route.sh`** — Adds route management. More complex setup (pre-existing address for gateway reachability). Independent from step 2.
+1. In the `apply_modify_fields` function, locate Phase 2 (addresses section, starting at line 556 with `let addr_in_changed = ...`).
+2. The `to_add` and `to_remove` vectors are computed at lines 585–592 — these stay in place.
+3. Move the entire `if !to_remove.is_empty() { ... }` block (lines 620–673) to come immediately after the `to_remove` computation (line 592) and **before** the `for cidr in &to_add { ... }` loop.
+4. Update comments to reflect the new ordering (see File Changes above).
+5. Update the function-level doc comment to say remove-before-add.
 
-4. **Create `tests/103-apply-query-roundtrip.sh`** — Combines apply + query CLI paths. Exercises JSON output format. Independent from steps 2-3.
+After this step: `cargo build` and `cargo test -p netfyr-backend` must pass. All existing unit tests are for pure functions (`parse_cidr`, `extract_route_fields`, `build_planned_changes`, `READONLY_FIELDS`) and are unaffected by this ordering change.
 
-Steps 2-4 can be implemented in parallel since they are independent. Each step should be verified with `make integration-test SPEC=103`.
+### Step 2: Verify compilation and unit tests
+
+Run `cargo test -p netfyr-backend` and `cargo clippy -p netfyr-backend` to ensure the change compiles cleanly and doesn't break existing tests.
+
+### Step 3: Run integration tests
+
+Run `make integration-test SPEC=103` to execute all four shell test scripts:
+- `103-apply-set-mtu.sh`
+- `103-apply-add-remove-address.sh`
+- `103-apply-add-route.sh`
+- `103-apply-query-roundtrip.sh`
+
+All must pass. If any fail, diagnose and fix.
+
+### Step 4: Run full test suite
+
+Run `cargo test` across all crates and `cargo clippy` to ensure no regressions.
 
 ## Risks and Mitigations
 
-### R1: Bare state policy triggering excessive field removals
-**Risk**: A bare state policy with only `mtu: 1400` produces a desired state missing all other fields. The diff engine puts ALL actual-state fields not in desired into `removed_fields`, which could trigger unintended side effects.
-**Mitigation**: Verified by reading the apply code that only `addresses` and `routes` are actionable from `removed_fields` (`crates/netfyr-backend/src/netlink/apply.rs:544-547` and `667-669`). Link-level fields (`mtu`, `operstate`) are only processed from `changed_fields` (lines 461-539). Read-only fields (`carrier`, `speed`, `mac`, `driver`, `name`) produce harmless skip entries (lines 448-457). For the route test, the policy includes the `addresses` field to prevent address removal during route application.
+### R1: Transient address loss during remove-then-add
 
-### R2: Route test gateway reachability
-**Risk**: Adding a route with `gateway: 10.99.0.2` requires that 10.99.0.2 be reachable through the interface's connected subnet. If the address 10.99.0.1/24 is not on the interface when the route is added, the kernel rejects with ENETUNREACH.
-**Mitigation**: Two safeguards: (1) The script pre-configures the address via `add_address` before calling `netfyr apply`. (2) The policy includes `addresses: ["10.99.0.1/24"]` so the diff engine sees the address as "desired" and doesn't remove it. The apply engine processes addresses (phase 2) before routes (phase 3), per `apply_modify_fields` at lines 459-782.
+**Risk**: During the brief window between removing old addresses and adding new ones, the interface has no (or fewer) addresses. This could disrupt in-flight connections.
 
-### R3: Daemon socket interference
-**Risk**: If `/run/netfyr/netfyr.sock` exists (daemon running on host), and `unshare --user --net` doesn't create a mount namespace, the CLI connects to the daemon instead of using daemon-free mode.
-**Mitigation**: All scripts set `export NETFYR_SOCKET_PATH=/nonexistent` to force `VarlinkError::ConnectionFailed` → daemon-free fallback.
+**Mitigation**: This is an accepted trade-off per the spec. The alternative (add-then-remove) violates the spec's address ordering guarantee. In practice, apply operations are intentional configuration changes where brief disruption is expected.
 
-### R4: `ip route` output format variability
-**Risk**: `ip route` output format varies across kernel versions (e.g., `10.100.0.0/24 via 10.99.0.2 dev veth-test0 proto static` vs. `10.100.0.0/24 via 10.99.0.2 dev veth-test0`).
-**Mitigation**: Use `grep -q "10.100.0.0/24 via 10.99.0.2"` which matches the prefix regardless of trailing annotations.
+### R2: Address removal query timing
 
-### R5: Connected route removal during address removal test
-**Risk**: When the address is removed in the second phase of `103-apply-add-remove-address.sh`, the kernel auto-removes the connected route for 10.99.0.0/24. The apply engine also tries to remove routes (since `routes` is in `removed_fields` for the bare policy). If the connected route is already gone, a not-found error could occur.
-**Mitigation**: The apply code at `crates/netfyr-backend/src/netlink/apply.rs:745-752` handles not-found routes as skips (`is_not_found_error(e)` → skip with "not present"). So already-removed routes are silently skipped, and the operation succeeds.
+**Risk**: The `query_address_messages` call fetches current kernel addresses. If the query happens at the wrong time relative to mutations, stale data could cause issues.
 
-### R6: Second apply showing "No changes needed" instead of removing address
-**Risk**: If the diff engine doesn't detect the absent `addresses` field as a removal, the second apply would output "No changes needed" and the address would persist.
-**Mitigation**: Verified by reading `crates/netfyr-state/src/diff.rs:146-149`: fields in `from` (actual) absent in `to` (desired) are explicitly added to `removed_fields`. Then `crates/netfyr-backend/src/netlink/apply.rs:544-547`: `addr_in_removed` check triggers the removal path with `desired_addrs = vec![]`. The `compute_state_diff(actual, desired)` call at `crates/netfyr-cli/src/apply.rs:129` correctly passes actual as `from` and desired as `to`.
+**Mitigation**: No risk — the current code structure calls `query_address_messages` **inside** the `if !to_remove.is_empty()` block, before iterating over `to_remove`. Moving this block before the add block doesn't change the query timing relative to the removal loop. The query still happens before any kernel mutations in Phase 2, since removes now come first.
 
-### R7: `netfyr apply` exit code for operations with only skipped entries
-**Risk**: If an apply produces only skipped entries (e.g., read-only field changes) and no succeeded/failed, the exit code logic might not behave as expected.
-**Mitigation**: `determine_exit_code` at `crates/netfyr-cli/src/apply.rs:278-286` returns `ExitCode::SUCCESS` when `!is_total_failure()` and `!is_partial()` and no conflicts. An empty `failed` list means `is_total_failure()` is false and `is_partial()` is false, so exit code is 0. For the MTU and address tests, the report always has at least one `succeeded` entry, so this edge case doesn't apply. But it's worth noting for awareness.
+### R3: Integration test environment requirements
+
+**Risk**: Integration tests require `unshare --user --net` (unprivileged user namespaces). If the build environment has `kernel.unprivileged_userns_clone = 0`, all tests fail with a system error.
+
+**Mitigation**: The Makefile runs `cargo build` first (which will succeed regardless), and the test scripts emit clear `FAIL:` messages with the reason. This is an environment constraint, not a code risk. The `helpers.sh` `netns_setup` function checks for the `unshare` binary and exits 1 with a descriptive message if missing.
+
+### R4: Route test depends on gateway reachability
+
+**Risk**: The `103-apply-add-route.sh` test pre-assigns `10.99.0.1/24` via `add_address` before applying the policy. The policy also includes `addresses: ["10.99.0.1/24"]`. With remove-then-add ordering, the address might be briefly removed and re-added if the diff engine detects a change.
+
+**Mitigation**: The diff engine compares values, and since the pre-assigned address matches the desired address exactly, no address change is generated in the diff — only the route addition appears. The diff is computed between the actual kernel state (which includes `10.99.0.1/24`) and the desired state (which also includes `10.99.0.1/24`), so addresses won't appear in `changed_fields` or `removed_fields`. If somehow the address format differs (e.g., `Value::IpNetwork` vs `Value::String`), the apply engine's `value_to_str` normalizes both to the same string representation, and the idempotency logic (skip on EEXIST for add, skip on not-found for remove) provides a safety net.
+
+### R5: First failure collapses subsequent field failures (pre-existing)
+
+**Risk**: `apply_modify` and `apply_add` only report the **first** `FailedOperation` from `apply_modify_fields`, discarding subsequent ones. If MTU fails AND addresses fail, only the MTU error is reported.
+
+**Mitigation**: This is a pre-existing behavior, not introduced by this change. The spec requires per-operation (per-entity) continue-and-report, not per-field granularity within a single entity. The current behavior satisfies the spec's acceptance criteria. Fixing this would be a separate enhancement.
+
+### R6: IPv6 addresses not guarded (pre-existing)
+
+**Risk**: The spec says "Only IPv4 addresses are supported" but `apply_modify_fields` accepts any CIDR parseable by `parse_cidr`, including IPv6. No explicit IPv4-only guard exists.
+
+**Mitigation**: Pre-existing behavior, not introduced by this change. In practice, YAML policies for ethernet typically contain IPv4 addresses. The kernel handles IPv6 correctly through the same netlink API, so accepting IPv6 is harmless and arguably more capable than the spec requires.
 
 ## Test Strategy
 
-### Shell integration tests (the deliverable)
+### Unit tests (already present — no changes needed)
 
-Four scripts matching the spec's shell-test Gherkin scenarios:
+The existing unit tests in `apply.rs::tests` cover all pure functions:
+- `parse_cidr`: valid IPv4, default route, IPv6, missing slash, invalid IP, invalid prefix
+- `extract_route_fields`: with gateway, without gateway, default route, missing destination, invalid destination, invalid gateway
+- `build_planned_changes`: Modify (existing field → Modify kind, new field → Set kind, removed field → Unset kind), Add (→ Set kind), Remove (→ Unset per current field, empty current → empty changes)
+- `READONLY_FIELDS`: contains all spec-required fields (carrier, speed, mac, driver)
 
-1. **103-apply-set-mtu.sh**: Verifies MTU change via `ip link show` after `netfyr apply`. Assertion: output contains `mtu 1400`.
+These tests are unaffected by the address ordering change since they test pure functions that don't interact with netlink.
 
-2. **103-apply-add-remove-address.sh**: Two-phase test. Phase 1: apply policy with address, verify with `ip addr show` that `10.99.0.1/24` is present. Phase 2: apply policy without address field, verify with `ip addr show` that `10.99.0.1/24` is absent.
+### Integration tests (already present — need verification)
 
-3. **103-apply-add-route.sh**: Verifies route addition via `ip route` after `netfyr apply` with pre-configured address. Assertion: output contains `10.100.0.0/24 via 10.99.0.2`.
+Four shell scripts exercise end-to-end apply behavior:
+1. **103-apply-set-mtu.sh**: Sets MTU to 1400 on a veth, verifies with `ip link show`.
+2. **103-apply-add-remove-address.sh**: Adds `10.99.0.1/24`, verifies presence, then applies policy without addresses to trigger removal, verifies absence.
+3. **103-apply-add-route.sh**: Pre-assigns address, applies policy with route `10.100.0.0/24 via 10.99.0.2`, verifies with `ip route`.
+4. **103-apply-query-roundtrip.sh**: Applies MTU+address policy, queries via `netfyr query --output json`, verifies JSON output contains expected values.
 
-4. **103-apply-query-roundtrip.sh**: Verifies `netfyr query --output json` reflects applied changes. Assertions: output contains `"mtu": 1400` and `10.99.0.1/24`.
+These tests validate the golden path scenarios from the spec's acceptance criteria. The address ordering fix does not affect these tests because they test add-to-empty and remove-all scenarios (not in-place replacement with existing addresses).
 
-### Script structure (common pattern from 102-series)
+### What is NOT tested (acceptable gaps)
 
-Each script follows this exact structure:
-```bash
-#!/bin/bash
-# 103-<name>.sh
-# <one-line description>
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/helpers.sh"
-
-NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"
-if [[ ! -x "$NETFYR_BIN" ]]; then
-    echo "FAIL: 103-<name>: netfyr binary not found at $NETFYR_BIN" >&2
-    exit 1
-fi
-
-export NETFYR_SOCKET_PATH=/nonexistent
-
-netns_setup "$@"
-
-# ---------- Inside the namespace ----------
-# test body...
-
-echo "PASS: 103-<name>"
-```
-
-### What NOT to test in shell scripts (already covered by Rust integration tests)
-
-- Read-only field skipping
-- Idempotent add/remove edge cases
-- Non-existent interface error reporting
-- Partial failure across multiple operations
-- Remove operation (deconfigure)
-- Field ordering correctness
-- Dry-run reporting
-- Permission denied error mapping
+- **In-place address replacement ordering**: No test verifies that after replacing addresses, the kernel's primary address matches the first YAML entry. This would require a test that starts with address A, applies a policy with address B as the first entry, and verifies B is the primary. This is a valid future enhancement but not required by the current acceptance criteria.
+- **Dry-run via CLI**: No integration test exercises `--dry-run`. The spec acceptance criteria include dry-run scenarios, but those are covered by the Rust-level code (the `dry_run_ethernet` function). Shell tests focus on actual apply.
+- **Permission denied**: Cannot be meaningfully tested in unprivileged namespace tests (the namespace gives root-like permissions within itself).
+- **Partial failure across multiple interfaces**: No shell test creates a scenario with one valid and one invalid interface. Could be a future enhancement.
 
 ### Verification command
 
 ```
-make integration-test SPEC=103
+cargo test -p netfyr-backend && cargo clippy -p netfyr-backend && make integration-test SPEC=103
 ```
 
-All four scripts must emit `PASS: 103-*` and exit 0. The Makefile runs `cargo build` first, then each matching script via `bash`.
+All unit tests must pass, no clippy warnings, and all four shell scripts must emit `PASS: 103-*` and exit 0.

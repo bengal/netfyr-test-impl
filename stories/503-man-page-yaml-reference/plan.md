@@ -2,137 +2,117 @@
 
 ## Approach
 
-This story creates a single hand-written troff man page at `man/netfyr.yaml.5` that serves as the definitive offline reference for netfyr's YAML file formats. The file is a pure troff/groff source document — no Rust code, no build system changes, no dependencies.
+The `man/netfyr.yaml.5` troff man page already exists and is structurally complete. It contains all required sections (NAME, DESCRIPTION, BARE STATE FORMAT, POLICY FORMAT, MULTI-DOCUMENT FILES, SELECTORS, FIELDS, VALUE TYPES, FILES, SEE ALSO) with inline examples covering static/single, static/multi, and dhcpv4 factories. The work is a targeted content correction, not a file creation task.
 
-The design follows the conventions already established by the existing hand-written man page `man/netfyr-examples.7`: a comment header marking it as hand-maintained, the same `.TH` header format, identical troff idioms for code blocks (`.RS 4` / `.nf` / `.fi` / `.RE`), tagged-paragraph field lists (`.TP`), and consistent SEE ALSO cross-references using `.BR`. The new page complements `netfyr-examples.7` — the examples page shows "how to use" scenarios while this page provides the exhaustive field-by-field reference.
+Two discrepancies remain between the current file and the specification:
 
-The content is derived directly from the codebase: the `Value` enum in `netfyr-state/src/lib.rs`, the `Selector` struct fields (`name`, `driver`, `pci_path`, `mac`), the ethernet JSON Schema in `netfyr-state/src/schemas/ethernet.json` (which defines `mtu`, `addresses`, `mac`, `carrier`, `speed`, `routes` with sub-fields `destination` [required], `gateway`, `metric`), and the `FactoryType` enum (`Static`, `Dhcpv4`) in `netfyr-policy/src/lib.rs`. The man page documents only the user-writable configuration surface — read-only fields (`mac`, `carrier`, `speed`) appear in query output but are not documented in the FIELDS section since users cannot set them in policies. The SELECTORS section does document `mac` as a selector field, because users can target interfaces by MAC address even though the MAC field itself is read-only in the entity schema.
+1. **IPv6 language in the man page contradicts the spec and the implementation.** The spec states IPv6 is not supported. The implementation confirms this: `deserialize_value` in `crates/netfyr-state/src/yaml.rs` (lines 105-119) only uses `Ipv4Network::from_str` and `Ipv4Addr::from_str` — any IPv6 string falls through to `Value::String` and will fail schema validation when used in address fields. The man page incorrectly claims "Both IPv4 and IPv6 addresses are accepted" (line 265) and lists `::1` as an IpAddr example in the VALUE TYPES section (line 314). These must be corrected to match reality.
 
-An alternative approach would be to auto-generate this page from the JSON Schema and Rust types. This was rejected because: (1) the spec explicitly calls for a hand-written file, (2) format documentation needs narrative prose and contextual examples that auto-generation cannot provide, and (3) the xtask already has a guard for hand-maintained pages.
+2. **The xtask printed note and doc comment only mention `netfyr-examples.7` as hand-maintained**, omitting `netfyr.yaml.5`. While the xtask code is already safe (it never writes to `netfyr.yaml.5`), the documentation should be accurate so developers running `cargo xtask man` know both files exist outside the generation pipeline.
+
+No new files, crates, modules, or dependencies are needed.
 
 ## Design Decisions
 
-1. **Decision**: Document only writable configuration fields (mtu, addresses, routes, state) in the FIELDS section, not read-only query fields (mac, carrier, speed).
-   - **Alternatives considered**: Document all fields with a "read-only" annotation; document read-only fields in a separate subsection.
-   - **Rationale**: The spec's acceptance criteria say "FIELDS section lists mtu, addresses, routes, and state" — exactly the writable fields. This is a policy-format reference, not a query-output reference. Users writing YAML files only need to know what they can set. Read-only fields are surfaced by `netfyr query` and would confuse the reference.
+1. **Decision**: Correct the man page to say IPv4-only, matching both the spec and the actual `deserialize_value` implementation.
+   - **Alternatives considered**: Leaving the man page as-is and changing the implementation to support IPv6 parsing. However, the spec explicitly states IPv6 is not supported, and the `Value` enum only has `IpAddr(Ipv4Addr)` and `IpNetwork(Ipv4Network)` — adding IPv6 support would be a separate feature story.
+   - **Rationale**: Documentation must match behavior. The implementation uses `Ipv4Addr::from_str` (line 115) and `Ipv4Network::from_str` (line 111) exclusively. The spec says IPv4-only. The man page is the outlier.
 
-2. **Decision**: Use `.TH "NETFYR.YAML" 5 "" "" "File Formats Manual"` as the header, matching the section 5 convention for file format man pages.
-   - **Alternatives considered**: `.TH NETFYR.YAML 5` (minimal), `.TH NETFYR.YAML 5 "" "netfyr" "File Formats Manual"` (with source field).
-   - **Rationale**: Matches the pattern used by `netfyr-examples.7` which uses `"Miscellaneous Information Manual"` for section 7. The five-argument `.TH` form with the last argument as the manual title is standard and produces the correct header/footer in rendered output.
+2. **Decision**: Add a note in the VALUE TYPES section explaining that IPv6 address strings are treated as plain `String` values and will fail schema validation if used in address fields.
+   - **Alternatives considered**: Simply removing the IPv6 example without explanation.
+   - **Rationale**: The spec explicitly calls for this note ("IPv6 is not supported. Strings containing IPv6 addresses (e.g., 'fe80::1') are treated as plain strings and will fail schema validation if used in address fields."), and it helps users who might try IPv6 addresses understand why they fail.
 
-3. **Decision**: Use quoted section headers (e.g., `.SH "BARE STATE FORMAT"`) for multi-word section names, unquoted for single-word names (e.g., `.SH SELECTORS`).
-   - **Alternatives considered**: Quote all section names; use no quotes.
-   - **Rationale**: This matches the existing `netfyr-examples.7` convention (e.g., `.SH "STATIC IP ON A SINGLE INTERFACE"` vs `.SH DESCRIPTION`). Quoting is required by troff for multi-word section names; omitting quotes for single-word names is valid and conventional.
+3. **Decision**: Update both the `println!` message (line 89) and the doc comment (line 28) in `xtask/src/main.rs` to list `netfyr.yaml.5` alongside `netfyr-examples.7`.
+   - **Alternatives considered**: Only updating the println. However, the doc comment on the `Man` variant is the developer-facing documentation and should be complete.
+   - **Rationale**: Consistency between runtime output and source documentation. Prevents a developer from wondering why the section-5 page wasn't regenerated.
 
-4. **Decision**: Document the `state` (admin state) ethernet field as a string with values "up" or "down", disambiguating it from the `state:` mapping key in the policy format.
-   - **Alternatives considered**: Rename it or skip it to avoid confusion.
-   - **Rationale**: The spec explicitly lists `state` as an ethernet field to document. The disambiguation is handled by context — the FIELDS section describes configuration properties within a state definition, and the field description clearly states it's the administrative state with specific allowed values.
+4. **Decision**: Keep the man page's `state` field documentation (administrative state: "up"/"down") even though the ethernet JSON schema (`crates/netfyr-state/src/schemas/ethernet.json`) has `operstate` (read-only) but no writable `state` field.
+   - **Alternatives considered**: Removing `state` from the FIELDS section because the schema doesn't have it.
+   - **Rationale**: The spec explicitly lists `state` as a documented ethernet field. The apply layer (`apply_ethernet` in `crates/netfyr-backend/src/netlink/apply.rs`) likely handles administrative state at a level above schema validation. This man page documents the user-facing YAML format, not the internal schema.
 
-5. **Decision**: Include the `routes` sub-field detail (destination required, gateway and metric optional) directly in the FIELDS section rather than in a separate subsection.
-   - **Alternatives considered**: Create a "ROUTE ENTRIES" subsection; use a `.SS` subsection.
-   - **Rationale**: The ethernet schema has only one complex field (routes). A dedicated subsection would be premature structure. The spec's example shows route details inline. The JSON Schema confirms `destination` is required and `gateway`/`metric` are optional.
-
-6. **Decision**: Place the hand-maintained comment on the first line using `.\"` troff comment syntax, identical to `netfyr-examples.7`.
-   - **Alternatives considered**: Use a different comment style or location.
-   - **Rationale**: Direct consistency with the existing hand-written page. The xtask already prints a note about `netfyr-examples.7` being hand-maintained; the same convention applies.
-
-7. **Decision**: Do not modify `xtask/src/main.rs` to add a guard for `netfyr.yaml.5`.
-   - **Alternatives considered**: Add a note line like the `netfyr-examples.7` one.
-   - **Rationale**: The xtask only generates section 1 pages from clap definitions. It has no code path that would touch a section 5 file. Adding a guard/note is unnecessary defensive coding for a case that cannot arise. If/when a second hand-written page is common enough to warrant a general note, that's a separate change.
-
-8. **Decision**: Escape hyphens in YAML string values within troff source as `\-` where they appear in contexts that troff might interpret as typographic dashes (e.g., `eth0\-dhcp` in policy names).
-   - **Alternatives considered**: Use unescaped hyphens everywhere since they're inside `.nf` blocks.
-   - **Rationale**: Consistent with `netfyr-examples.7` which escapes hyphens in policy names (e.g., `eth0\-dhcp`). Inside `.nf` blocks some troff implementations still convert `--` to en-dash; escaping prevents this.
+5. **Decision**: Do not modify the `addresses` field description beyond the IPv6 correction. The spec's language about order preservation and duplicate rejection should be added since the current man page is missing these details.
+   - **Alternatives considered**: Keeping the minimal current description.
+   - **Rationale**: The spec explicitly says "Order is preserved: the first address becomes the primary (source) address. Duplicate addresses are rejected. IPv6 is not supported." These are user-relevant behavioral details.
 
 ## File Changes
 
-### File: `man/netfyr.yaml.5`
-- **Action**: Create
-- **What**: A hand-written troff man page with the following sections in order:
-  1. **Comment header**: `.\" This file is maintained by hand. Do not edit with cargo xtask man.`
-  2. **`.TH "NETFYR.YAML" 5 "" "" "File Formats Manual"`**: Page header with section 5 designation.
-  3. **`.SH NAME`**: `netfyr.yaml \- netfyr policy file formats`
-  4. **`.SH DESCRIPTION`**: Brief intro explaining that netfyr reads YAML files from `/etc/netfyr/policies/`, files may contain multiple YAML documents separated by `---`, and each document is parsed independently. Reference to `netfyr-examples(7)` for worked examples.
-  5. **`.SH "BARE STATE FORMAT"`**: Documents the simplest format — a YAML document with no `kind` field. Explains that `type`, selector properties, and configuration properties are all at the top level. Explains auto-wrapping into a static policy with default priority 100 and filename-derived name. Field list using `.TP` entries for `type` (string, required — currently "ethernet"), selector properties (reference to SELECTORS section), and configuration properties (reference to FIELDS section). One inline example showing `type: ethernet` with `name`, `mtu`, and `addresses`.
-  6. **`.SH "POLICY FORMAT"`**: Documents the `kind: policy` wrapper. Field list with `.TP` entries:
-     - `kind` (string, required — must be "policy")
-     - `name` (string, required — unique policy name)
-     - `factory` (string, required — "static" or "dhcpv4")
-     - `priority` (integer, optional, default 100 — higher wins)
-     - `selector` (mapping, required for dhcpv4 — see SELECTORS)
-     - `state` (mapping, optional — single entity state, mutually exclusive with `states`)
-     - `states` (sequence, optional — multiple entity states, mutually exclusive with `state`)
-     Three examples: static/single-state, static/multiple-states, dhcpv4.
-  7. **`.SH "MULTI-DOCUMENT FILES"`**: Explains `---` separator. One example showing two ethernet states in one file.
-  8. **`.SH SELECTORS`**: Intro explaining AND logic for multiple selectors. `.TP` entries for:
-     - `name` (string — exact interface name)
-     - `driver` (string — kernel driver name)
-     - `pci_path` (string — PCI device path)
-     - `mac` (string — colon-separated hex MAC, case-insensitive comparison)
-     Note about dhcpv4 policies wrapping selectors at the policy level.
-  9. **`.SH FIELDS`**: Intro explaining these are configuration properties. Subsection (`.SS`) for `Ethernet` entity type. `.TP` entries for:
-     - `mtu` (integer — MTU, range 68–65535)
-     - `addresses` (sequence of strings — CIDR notation)
-     - `routes` (sequence of mappings — each with `destination` [required, CIDR], `gateway` [optional, IP], `metric` [optional, integer])
-     - `state` (string — administrative state, "up" or "down")
-  10. **`.SH "VALUE TYPES"`**: Table (using `.TP` entries) mapping YAML types to netfyr types:
-      - YAML boolean → Bool
-      - YAML integer >= 0 → U64
-      - YAML integer < 0 → I64
-      - YAML string matching IP → IpAddr
-      - YAML string matching CIDR → IpNetwork
-      - YAML string (other) → String
-      - YAML sequence → List
-      - YAML mapping → Map
-  11. **`.SH FILES`**: `.TP` entries for `/etc/netfyr/policies/` and `/var/lib/netfyr/policies/`.
-  12. **`.SH "SEE ALSO"`**: `.BR` references to `netfyr(1)`, `netfyr\-apply(1)`, `netfyr\-query(1)`, `netfyr\-examples(7)`.
-- **Why**: This is the sole deliverable of the story. Fulfills the forward references already present in all existing man pages, and provides the offline YAML format reference that the spec requires.
+### 1. `man/netfyr.yaml.5`
+- **Action**: modify
+- **What**: Four targeted edits within the existing troff file:
+
+  **Edit A — Line 265 (FIELDS section, `addresses` description)**: Replace `"Both IPv4 and IPv6 addresses are accepted."` with text matching the spec: addresses are in IPv4 CIDR notation, order is preserved with the first address becoming the primary (source) address, duplicate addresses are rejected, and IPv6 is not supported.
+
+  **Edit B — Lines 309-314 (VALUE TYPES section, IpAddr row)**: Change the tag from `"YAML string (valid IP address)"` to `"YAML string (valid IPv4 address)"` and remove the `::1` example, keeping only the `10.0.0.1` example. The `(e.g., ...)` parenthetical should show only `10.0.0.1`.
+
+  **Edit C — Lines 316-320 (VALUE TYPES section, IpNetwork row)**: Change the tag from `"YAML string (valid CIDR prefix)"` to `"YAML string (valid IPv4 CIDR prefix)"`. The existing `10.0.0.0/24` example is already IPv4-only and stays.
+
+  **Edit D — After the current IpNetwork `.TP` entry and before the "YAML string (other)" entry**: Insert a `.PP` paragraph note stating: IPv6 addresses are not supported. Strings containing IPv6 addresses (e.g., "fe80::1") are treated as plain strings and will fail schema validation if used in address fields.
+
+- **Why**: Corrects the IPv6 inaccuracy to match both the spec and the implementation in `deserialize_value` (which uses only `Ipv4Addr` and `Ipv4Network`). Adds the spec-required IPv6 note.
+
+### 2. `xtask/src/main.rs`
+- **Action**: modify
+- **What**: Two edits:
+
+  **Edit A — Line 28 (doc comment on `Man` variant)**: Change:
+  `/// Does not overwrite man/netfyr-examples.7 (maintained by hand).`
+  to:
+  `/// Does not overwrite man/netfyr.yaml.5 or man/netfyr-examples.7 (maintained by hand).`
+
+  **Edit B — Line 89 (println after generation)**: Change:
+  `"Note: man/netfyr-examples.7 is maintained by hand and was not modified."`
+  to:
+  `"Note: man/netfyr.yaml.5 and man/netfyr-examples.7 are maintained by hand and were not modified."`
+
+- **Why**: Documents that `netfyr.yaml.5` is also a hand-maintained file that xtask does not generate or overwrite.
 
 ## Dependencies
 
-None. This story requires no new crate dependencies. The deliverable is a standalone troff file with no build system integration.
+No new crate dependencies. This story involves only troff content corrections and a Rust string literal change.
 
 ## Implementation Order
 
-1. **Create `man/netfyr.yaml.5`** — Write the complete troff source file. Since this is a single file with no code dependencies, the entire implementation is one step. The file must be syntactically valid troff from the start; there is no compilation step.
+1. **Edit `man/netfyr.yaml.5`** — Apply all four edits (A through D) to correct the IPv6 references, update the addresses description, and add the IPv6 note. The file is self-contained troff with no build dependencies.
 
-2. **Verify rendering** — Run `man ./man/netfyr.yaml.5` (or `mandoc -Tlint man/netfyr.yaml.5` if available) to confirm the page renders without troff warnings and all sections are present and properly formatted. This is a verification step, not a code change.
+2. **Edit `xtask/src/main.rs`** — Update the println message and doc comment. Independent of step 1 but logically secondary since the man page is the primary deliverable.
+
+3. **Verify** — Run `cargo build --package xtask` to confirm the xtask still compiles. Run `cargo test --package xtask` to confirm existing tests pass (the tests check SEE ALSO cross-references and other section content; they don't touch the modified println or doc comment, but compilation must succeed).
+
+Steps 1 and 2 are independent and can be done in parallel. Step 3 depends on step 2.
 
 ## Risks and Mitigations
 
-1. **Risk**: Troff syntax errors silently degrade rendering rather than failing. A missing `.fi` or `.RE` will cause the rest of the page to render in monospace or indented, but `man` won't exit with an error.
-   - **Mitigation**: Use the exact same troff idioms as `netfyr-examples.7` (which is known-good). Every `.nf` must have a matching `.fi`; every `.RS` must have a matching `.RE`. Keep examples short and use consistent indentation in the troff source to make mismatches visually obvious.
+1. **Risk: `state` field not in ethernet JSON schema.** The man page documents a `state` field ("up"/"down") but the JSON schema at `crates/netfyr-state/src/schemas/ethernet.json` has `operstate` (read-only) and no writable `state` field. The `additionalProperties: false` in the schema would reject a `state` field.
+   - **Mitigation**: The spec explicitly requires documenting this field. If the schema needs updating, that's a separate concern. The man page documents what the spec says; the potential schema-vs-spec gap should be noted in the PR description but is out of scope for this documentation story.
 
-2. **Risk**: The `routes` sub-field documentation could diverge from the actual JSON Schema if the schema is updated later.
-   - **Mitigation**: The man page documents what the schema currently defines: `destination` (required), `gateway` (optional), `metric` (optional). This matches the `ethernet.json` schema file exactly. Since this is a hand-maintained file, any schema changes must be accompanied by a man page update — the same is true for `netfyr-examples.7`.
+2. **Risk: Troff rendering warnings from new content.** The edits add a new `.PP` paragraph block in the VALUE TYPES section.
+   - **Mitigation**: Follow the exact troff patterns already used elsewhere in the file. The `.PP` macro is used throughout (e.g., lines 10, 14, 24, 147, 162, 181, 196, 236) and is simple to get right.
 
-3. **Risk**: The `state` field name collision between the ethernet admin state field and the policy-level `state:` mapping could confuse readers.
-   - **Mitigation**: The FIELDS section describes the ethernet `state` field clearly as "Administrative state" with values "up" or "down". The POLICY FORMAT section describes the `state:` key as "A single entity state definition." The two are in different sections with distinct descriptions, matching the spec's structure.
+3. **Risk: No automated content tests for man page.** Troff content correctness is verified manually. There is no CI step for man page rendering.
+   - **Mitigation**: The acceptance criteria call for manual `man ./man/netfyr.yaml.5` rendering verification. The changes are small and surgical — four edits to an existing file. Visual inspection during review is sufficient.
 
-4. **Risk**: No CI validation for man page rendering exists in the repository.
-   - **Mitigation**: Manual verification during review. The troff source is simple enough (no macros, no complex tables) that visual inspection of the source catches most errors. A future CI step could run `mandoc -Tlint` but that's out of scope for this story.
-
-5. **Risk**: The SEE ALSO section references `netfyr-examples(7)` which in turn references `netfyr.yaml(5)` — circular cross-references are normal for man pages but should be verified to use consistent naming.
-   - **Mitigation**: Use the exact same `.BR` formatting as the existing pages: `.BR netfyr\-examples (7)` with escaped hyphen and space before the section number in parentheses.
+4. **Risk: IPv6 regex patterns in JSON schema.** The schema patterns for `addresses` items and route fields include `[0-9a-fA-F:.]` which could theoretically match some IPv6-like strings.
+   - **Mitigation**: Out of scope for this story. The man page documents the YAML-to-Value conversion layer, not the schema regex. The IPv6 note accurately describes behavior at the `deserialize_value` level.
 
 ## Test Strategy
 
-This story has no Rust code, so there are no unit or integration tests to write. Verification is manual/scripted:
+No new tests are needed for this story. The changes are:
 
-1. **File existence**: Confirm `man/netfyr.yaml.5` exists at the expected path.
-2. **Rendering correctness**: Run `man ./man/netfyr.yaml.5` and visually confirm:
-   - No troff warnings on stderr
-   - NAME section shows "netfyr.yaml"
-   - All 8 content sections are present (BARE STATE FORMAT, POLICY FORMAT, MULTI-DOCUMENT FILES, SELECTORS, FIELDS, VALUE TYPES, FILES, SEE ALSO)
-   - All inline examples render as monospaced code blocks
-3. **Content completeness** (can be checked via grep on the troff source):
-   - BARE STATE FORMAT contains at least one example (`.nf` block)
-   - POLICY FORMAT contains "static" and "dhcpv4"
-   - POLICY FORMAT contains three examples (static/single, static/multi, dhcpv4)
-   - SELECTORS lists all four selector fields: `name`, `driver`, `pci_path`, `mac`
-   - FIELDS lists all four writable ethernet fields: `mtu`, `addresses`, `routes`, `state`
-   - VALUE TYPES contains all 7 netfyr types: Bool, U64, I64, IpAddr, IpNetwork, String, List, Map
-   - FILES lists `/etc/netfyr/policies/` and `/var/lib/netfyr/policies/`
-   - SEE ALSO references `netfyr(1)`, `netfyr-apply(1)`, `netfyr-query(1)`, `netfyr-examples(7)`
-4. **No xtask interference**: Run `cargo xtask man` and confirm `man/netfyr.yaml.5` is not modified or overwritten (check mtime or diff).
-5. **Cross-reference consistency**: Confirm the NAME line uses `netfyr.yaml` matching the references in existing man pages.
+1. **Man page content corrections** — Troff is a text format. The existing xtask test suite already verifies SEE ALSO cross-references include `netfyr.yaml(5)`. The content corrections are not programmatically testable in the current test infrastructure.
+
+2. **xtask string changes** — The modified println message and doc comment have no behavioral impact and are not covered by tests.
+
+**Verification steps** (manual, matching the acceptance criteria):
+- `man ./man/netfyr.yaml.5` renders without troff warnings
+- NAME section contains "netfyr.yaml"
+- BARE STATE FORMAT section describes the flat format with type, selector, and config fields at the top level, with at least one example
+- POLICY FORMAT section documents kind, name, factory, priority, selector, state, and states; includes examples for static and dhcpv4
+- MULTI-DOCUMENT FILES section explains "---" separator with at least one example
+- SELECTORS section lists name, driver, pci_path, and mac
+- FIELDS section lists mtu, addresses, routes, and state
+- VALUE TYPES section shows the YAML-to-netfyr type mapping with IPv4-only language (no IPv6 claims)
+- The `::1` example is removed from VALUE TYPES
+- A note about IPv6 strings being treated as plain strings is present
+- FILES section lists `/etc/netfyr/policies/` and `/var/lib/netfyr/policies/`
+- `cargo test --package xtask` passes
+- `cargo xtask man` prints a note mentioning both `netfyr.yaml.5` and `netfyr-examples.7`

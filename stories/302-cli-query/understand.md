@@ -2,104 +2,110 @@
 
 ## Current State
 
-The Rust implementation of `netfyr query` is **fully complete**. All production code and unit tests are already in place:
+The implementation is **complete**. All production code, unit tests, and integration test scripts already exist.
 
-### `crates/netfyr-cli/src/query.rs` (fully implemented)
+### `crates/netfyr-cli/src/query.rs` (826 lines, fully implemented)
 - `pub enum OutputFormat { Yaml, Json }` — clap `ValueEnum`, short flag `-o`, default `"yaml"`.
 - `pub struct QueryArgs` — `selector: Vec<(String, String)>` (short `-s`, value_parser `parse_selector`) and `output: OutputFormat`.
 - `pub async fn run_query(args: QueryArgs) -> Result<ExitCode>` — daemon detection via `NETFYR_SOCKET_PATH` env var (default `/run/netfyr/netfyr.sock`), routes to `run_query_daemon` or `run_query_local`.
-- `fn parse_selector(s: &str) -> Result<(String, String), String>` — validates key against `VALID_SELECTOR_KEYS = ["type", "name", "driver", "mac", "pci_path"]` at clap parse time.
-- `fn extract_type_and_selector(selectors) -> Result<(Option<String>, Option<Selector>)>` — splits `type=X` out; builds `Selector` with public fields (`name`, `driver`, `pci_path`, `mac`); parses MAC via `MacAddr::from_str`.
-- `fn build_varlink_selector(entity_type, selector) -> Option<VarlinkSelector>` — returns `None` when both are `None` (query-all semantics), otherwise merges into a `VarlinkSelector`.
-- `async fn run_query_local(...)` — iterates `registry.supported_entities()` sorted, calls `registry.query(&et, selector)` per entity type, collects `IndexMap<String, serde_json::Value>` via `state_to_flat_map`. Handles `BackendError::UnsupportedEntityType` (exit 2) and `BackendError::NotFound` (empty result, exit 0).
-- `async fn run_query_daemon(...)` — calls `VarlinkClient::query(Option<&VarlinkSelector>)`, converts via `varlink_state_to_flat_map`.
-- `fn state_to_flat_map(state: &State)` — `IndexMap` with `"type"` first, then all fields from `state.fields` (strips `FieldValue` wrapper via `serde_json::to_value(&fv.value)`).
-- `fn varlink_state_to_flat_map(vs: &VarlinkState)` — same shape, from `VarlinkState.fields` which is already `serde_json::Map`.
-- `fn print_output(maps, format)` — YAML via `serde_yaml::to_string`, JSON via `serde_json::to_string_pretty`.
-- Comprehensive unit tests covering: `parse_selector`, `extract_type_and_selector`, `build_varlink_selector`, `state_to_flat_map`, YAML/JSON serialization of empty and non-empty lists.
+- `fn parse_selector` — validates key against `VALID_SELECTOR_KEYS = ["type", "name", "driver", "mac", "pci_path"]` at clap parse time; rejects missing `=` and invalid keys.
+- `fn extract_type_and_selector` — splits `type=X`; builds `Selector` with `name`, `driver`, `pci_path`, `mac` fields; parses MAC via `MacAddr::from_str`.
+- `fn build_varlink_selector` — returns `None` when both args are `None` (query-all), otherwise merges into `VarlinkSelector`.
+- `async fn run_query_local` — iterates `registry.supported_entities()` (sorted), calls `registry.query(&et, selector)` per type, handles `BackendError::UnsupportedEntityType` (exit 2) and `BackendError::NotFound` (empty, exit 0).
+- `async fn run_query_daemon` — calls `VarlinkClient::query(Option<&VarlinkSelector>)`, converts via `varlink_state_to_flat_map`.
+- `fn state_to_flat_map` — `IndexMap` with `"type"` first, then all fields (strips `FieldValue` wrapper).
+- `fn varlink_state_to_flat_map` — same shape from `VarlinkState.fields: serde_json::Map`.
+- `fn print_output` — YAML via `serde_yaml::to_string` (`print!`), JSON via `serde_json::to_string_pretty` (`println!`).
+- Comprehensive unit tests covering all acceptance criteria.
 
 ### `crates/netfyr-cli/src/lib.rs` (fully wired)
 - `mod query` declared; `pub use query::run_query` exported.
 - `Commands::Query(query::QueryArgs)` registered in the clap subcommand enum.
 
-### Supporting infrastructure (already exists)
-- `netfyr_state::Selector` — public fields: `name`, `entity_type`, `driver`, `pci_path`, `mac`, `labels`. Implements `Default`.
-- `netfyr_state::MacAddr` — `FromStr`, `Display` (lowercase colon-separated).
-- `netfyr_backend::BackendRegistry::query(&EntityType, Option<&Selector>)` and `query_all()`.
-- `netfyr_varlink::VarlinkClient::query(Option<&VarlinkSelector>) -> Result<Vec<VarlinkState>, VarlinkError>`.
-- `VarlinkError::ConnectionFailed` variant used for daemon-not-running detection.
-- `Makefile` with `integration-test` target discovering `tests/[0-9]*.sh`.
+### Integration test scripts (all exist)
+- `tests/302-query-all.sh` — `netfyr query -o json` in a namespace with veth pair; asserts both ends appear.
+- `tests/302-query-veth-by-name.sh` — `netfyr query -s name=veth-test0 -o json`; asserts mtu=1400 and address `10.99.0.1/24`.
+- `tests/302-query-yaml.sh` — `netfyr query -s name=veth-test0` (YAML default); asserts `mtu: 1400`.
+- `tests/helpers.sh` — shared helpers providing `netns_setup`, `create_veth`, `add_address`, etc.
 
-### What does NOT exist
-- `tests/` directory — no shell integration test scripts of any kind exist in the project.
-- `tests/helpers.sh` — referenced by the spec as providing `netns_setup`, `create_veth`, `add_address`, `cleanup`, and assertion functions; does not exist.
-- `tests/302-*.sh` — the three integration scenarios required by the spec do not exist.
+All three scripts:
+- Use `NETFYR_BIN="${NETFYR_BIN:-$SCRIPT_DIR/../target/debug/netfyr}"` and `exit 1` if binary missing.
+- Source `helpers.sh`.
+- Call `netns_setup` for namespace entry.
+- Follow the no-skip rule (no `|| exit 0` on prerequisite failures).
 
 ## Requirements
 
-From the acceptance criteria, the following concrete technical requirements apply:
+From the acceptance criteria:
 
-1. **Shell integration test: query veth interface by name** (`tests/302-*.sh`)
-   - `unshare --user --net` namespace with veth pair `veth-test0`/`veth-test1`, mtu 1400, address `10.99.0.1/24` on `veth-test0`.
-   - `netfyr query -s name=veth-test0 -o json` must exit 0, return one entity with `name="veth-test0"`, `mtu=1400`, addresses containing `"10.99.0.1/24"`.
-
-2. **Shell integration test: query all interfaces** (`tests/302-*.sh`)
-   - Same namespace; `netfyr query -o json` must return at least 2 entities (both veth ends).
-
-3. **Shell integration test: YAML output** (`tests/302-*.sh`)
-   - `netfyr query -s name=veth-test0` (default YAML) must produce valid YAML containing `"mtu: 1400"`.
-
-4. **helpers.sh** providing at minimum:
-   - `netns_setup` — enters unprivileged user+net namespace.
-   - `create_veth` — creates a veth pair via `ip link`.
-   - `add_address` — assigns an IP address to an interface.
-   - `cleanup` — teardown/trap.
-   - Assertion functions (e.g., `assert_exit_code`, `assert_json_field`, `assert_contains`).
-
-5. **Binary locator convention**: scripts must use `NETFYR_BIN="${NETFYR_BIN:-$(dirname "$0")/../target/debug/netfyr}"` and fail with `exit 1` if the binary is missing.
-
-6. **No-skip rule**: scripts must `exit 1` on missing prerequisites (unshare, ip), never `exit 0`.
+1. `netfyr query` with no args → all entities in YAML
+2. `--selector type=ethernet` → filter by entity type
+3. `--selector name=eth0` → filter by name
+4. `--selector driver=ixgbe` → filter by driver
+5. Multiple `--selector` flags → AND logic
+6. Default output format is YAML; `--output json` / `-o json` for JSON
+7. No matching entities → empty list, exit 0
+8. Invalid selector key → error listing valid keys, exit 2
+9. Invalid type value → error listing valid entity types, exit 2
+10. JSON output is jq-compatible (pretty-printed array)
+11. Short flags `-s` and `-o` work
+12. Daemon mode: connect to socket, delegate to `VarlinkClient::query`
+13. Integration test scripts: `302-query-all.sh`, `302-query-veth-by-name.sh`, `302-query-yaml.sh`
 
 ## Gap Analysis
 
-### Files to create
+**No gaps found.** All requirements are fully implemented and the integration tests exist.
 
-| File | Status | Notes |
-|------|--------|-------|
-| `tests/helpers.sh` | Missing | Shared shell helpers for all integration tests; must provide netns setup, veth creation, address assignment, cleanup, assertions |
-| `tests/302-query-name.sh` | Missing | Tests `netfyr query -s name=veth-test0 -o json` in a namespace |
-| `tests/302-query-all.sh` | Missing | Tests `netfyr query -o json` returns ≥2 entities |
-| `tests/302-query-yaml.sh` | Missing | Tests default YAML output contains `mtu: 1400` |
+| Requirement | Status |
+|---|---|
+| `QueryArgs` with `-s`/`--selector` and `-o`/`--output` | Complete |
+| `parse_selector` validates keys at parse time | Complete |
+| `extract_type_and_selector` splits `type=` | Complete |
+| Daemon-free mode via `BackendRegistry` per-type iteration | Complete |
+| Daemon mode via `VarlinkClient::query` | Complete |
+| Mode detection via socket connection attempt | Complete |
+| YAML output (default) | Complete |
+| JSON output (pretty-printed) | Complete |
+| Empty result → exit 0 | Complete |
+| Invalid key → exit 2 with valid key list | Complete |
+| Unknown type → exit 2 with valid type list | Complete |
+| `NETFYR_SOCKET_PATH` env var override | Complete |
+| 3 integration test scripts (302-*.sh) | Complete |
+| Unit tests for all acceptance criteria | Complete |
 
-### Files to modify
-None — all Rust production code and unit tests are complete.
-
-### Rust code gaps
-None. The implementation matches the spec precisely:
-- Daemon-free mode: per-entity-type iteration with selector passed to backend.
-- Daemon mode: `VarlinkClient::query` with merged `VarlinkSelector`.
-- Error paths: invalid key (clap-level), invalid MAC (in `extract_type_and_selector`), unsupported type (exit 2), no match (exit 0, empty list).
-- Output: YAML (serde_yaml, `print!`) and JSON (serde_json pretty, `println!`).
-- Env var: `NETFYR_SOCKET_PATH` with `/run/netfyr/netfyr.sock` default.
+**Remaining verification step**: Run `make integration-test SPEC=302` against a built binary to confirm the shell scripts pass end-to-end. The code exists; runtime pass/fail is unknown until executed.
 
 ## Integration Points
 
-- **`netfyr_backend::BackendRegistry`**: `run_query_local` calls `registry.query(&et, selector)` passing an `Option<&Selector>`. The selector's non-`type` fields (`name`, `driver`, `mac`, `pci_path`) are passed directly to the netlink backend which reads sysfs for driver/pci_path matching.
-- **`netfyr_varlink::VarlinkClient::query`**: accepts `Option<&VarlinkSelector>` where `None` means query-all. The `VarlinkSelector` carries `entity_type` (serialized as `"type"` on the wire per the varlink client test), `name`, `driver`, `mac`, `pci_path`.
-- **`netfyr_state::State`**: `state_to_flat_map` reads `state.entity_type` and iterates `state.fields: IndexMap<String, FieldValue>`, accessing `fv.value: Value` which serializes naturally via `serde_json::to_value`.
-- **`netfyr_varlink::VarlinkState`**: `varlink_state_to_flat_map` reads `vs.entity_type: String` and `vs.fields: serde_json::Map<String, serde_json::Value>`.
-- **Makefile**: discovers tests via `tests/[0-9]*.sh` glob; `make integration-test SPEC=302` runs only `tests/302-*.sh`.
+### Backend
+- `BackendRegistry::query(&EntityType, Option<&Selector>)` — per-type query with optional selector; selector's `driver`/`mac`/`pci_path` fields are evaluated by the netlink backend via sysfs reads.
+- `BackendRegistry::supported_entities()` — used to enumerate registered entity types in daemon-free mode.
+- `BackendError::UnsupportedEntityType` — triggers exit 2 with valid-types message.
+- `BackendError::NotFound` — treated as empty result (exit 0), not an error.
+- `NetlinkBackend` — registered as the sole backend via `create_backend_registry()`.
+
+### Varlink
+- `VarlinkClient::connect(socket_path)` — mode detection; `VarlinkError::ConnectionFailed` triggers daemon-free fallback; other errors propagate fatally.
+- `VarlinkClient::query(Option<&VarlinkSelector>)` — daemon query; `None` means query-all.
+- `VarlinkSelector` — `entity_type` serialized as `"type"` on wire via `#[serde(rename = "type")]`.
+- `VarlinkState` — `entity_type: String`, `fields: serde_json::Map<String, serde_json::Value>`.
+
+### State types
+- `Selector` — public fields `name`, `driver`, `mac: Option<MacAddr>`, `pci_path`, `entity_type`, `labels`.
+- `State` — `entity_type`, `fields: IndexMap<String, FieldValue>`.
+- `FieldValue.value: Value` — serialized to `serde_json::Value` via `serde_json::to_value`; IP types serialize as strings.
+
+### CLI wiring
+- `Commands::Query(query::QueryArgs)` in `lib.rs`; `main.rs` / `netfyr_cli_main.rs` dispatch to `run_query`.
 
 ## Risks
 
-1. **`unshare --user --net` privileges**: Integration tests rely on unprivileged user namespaces. Some Linux distros/kernels disable this (`sysctl kernel.unprivileged_userns_clone=0`). The spec mandates `exit 1` (not `exit 0`) if the prerequisite is unavailable, which is correct — tests must not silently pass.
+1. **`unshare --user --net` availability**: Integration tests require unprivileged user namespaces. On kernels with `kernel.unprivileged_userns_clone=0` (some hardened distros), tests will fail rather than skip. The scripts correctly `exit 1` on failure, which is spec-compliant but means CI environments need to support user namespaces.
 
-2. **`serde_json::to_value(&fv.value)` for IP types**: `Value::IpNetwork` and `Value::IpAddr` are serialized by their serde impls as strings (e.g., `"10.99.0.1/24"`, `"10.0.0.1"`). The JSON test scenario expects `addresses` to contain `"10.99.0.1/24"` as a string inside an array — this depends on the backend populating `addresses` as `Value::List(Vec<Value::IpNetwork>)`, which the spec output examples confirm. No mismatch expected, but this is implicit.
+2. **`serde_json::to_value` for IP/network types**: `Value::IpNetwork` and `Value::IpAddr` serialize as strings via their serde impls. The integration test expects `"10.99.0.1/24"` as a string in the `addresses` array — correct if the backend populates `addresses` as `Value::List(Vec<Value::IpNetwork>)`. This is an implicit dependency on the netlink backend's field representation.
 
-3. **`BackendError::NotFound` vs empty result**: `run_query_local` treats `NotFound` as an empty result (exit 0). If the backend returns `NotFound` for a known entity type with a non-matching selector (e.g., `name=eth99`), the correct empty-list behavior is implemented. If the backend raises `NotFound` for other reasons (e.g., sysfs unreadable), the operator may see a silent empty result instead of an error. This is a spec decision, not a bug to fix here.
+3. **Daemon-mode type filtering delegated to daemon**: When daemon mode is active, `entity_type` from `--selector type=X` is sent to the daemon as `VarlinkSelector.entity_type`. If the daemon does not filter by entity type, the selector is silently ignored. This is a SPEC-404 dependency, not a CLI gap.
 
-4. **Daemon-mode type filtering**: When daemon mode is active, the `entity_type` extracted from selectors is encoded as `VarlinkSelector.entity_type` and sent to the daemon. The daemon is responsible for filtering — the CLI does no post-filter. If the daemon does not implement type filtering, `--selector type=ethernet` in daemon mode would return all entity types. This is a dependency on SPEC-404 (Varlink API), not a CLI gap.
+4. **`BackendError::NotFound` vs silent empty result**: `NotFound` is treated as an empty result (exit 0). If the backend raises `NotFound` for reasons other than "no matching entity" (e.g., sysfs unreadable), the operator sees an empty list with no error indication. This is a spec-level decision.
 
-5. **`VarlinkSelector.entity_type` wire serialization**: The varlink client test asserts `sel["type"]` (not `sel["entity_type"]`), confirming the field is renamed to `"type"` in JSON. The `build_varlink_selector` in `query.rs` sets `entity_type: entity_type.map(str::to_string)` — if `VarlinkSelector` renames this to `"type"` via `#[serde(rename = "type")]`, the wire format is correct. This is not visible from the query.rs code alone but is confirmed by the varlink client tests.
-
-6. **Integration test helpers.sh scope**: SPEC-302 is the first story requiring shell integration tests. If `helpers.sh` does not exist yet, it must be created as part of this story. Its API must be stable enough for subsequent integration test stories to reuse — but the spec only requires what 302 needs, so scope it to that.
+5. **No post-filter fallback**: `run_query_local` passes the full selector to each backend's `query()` call. If a future backend does not support selector matching natively, it would need to be handled there or a post-filter layer added. Currently only `NetlinkBackend` is registered; this is a future extensibility concern.

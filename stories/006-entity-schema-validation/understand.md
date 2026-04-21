@@ -2,126 +2,123 @@
 
 ## Current State
 
-### netfyr-state crate (`crates/netfyr-state/`)
+The implementation is substantially complete. All types, methods, and the JSON Schema file exist in the codebase.
 
-**Source files present:**
-- `src/lib.rs` — defines `State`, `Value`, `FieldValue`, `Selector`, `Provenance`, `StateMetadata`, `MacAddr`, `EntityType`
-- `src/diff.rs` — `DiffOp`, `StateDiff`, `diff()`
-- `src/loader.rs` — `load_file()`, `load_dir()`
-- `src/set.rs` — `StateSet`, `Conflict`, `ConflictError`, set operations
-- `src/yaml.rs` — `YamlError`, YAML serialization/deserialization
+### `crates/netfyr-state/src/schema.rs`
 
-**No schema module exists.** There is no `src/schema.rs`, no `src/schemas/` directory, and no schema-related types anywhere in the codebase.
+All spec-required types are implemented:
+- `FieldType` — uses `Integer` (not the spec's `U32`/`U64`; a single variant with a documented rationale)
+- `FieldConstraints` — `min`, `max`, `pattern`
+- `FieldSchemaInfo` — `field_type`, `required`, `writable`, `constraints`, `description`
+- `ValidationErrorKind` — all seven spec variants plus `UnknownEntityType` added to handle the unknown entity type acceptance scenario
+- `ValidationError` — `field`, `message`, `kind`
+- `ValidationErrors` — collection with `Display` and `std::error::Error` impls
+- `EntitySchema` — holds a compiled `jsonschema::Validator`, parsed field metadata, and the raw schema value; exposes `field_info()`
+- `SchemaRegistry` — `new()`, `validate()`, `validate_writable()`, `get_schema()`, `entity_types()`, `field_info()`, `Default`
+- Private helpers: `fields_to_json()`, `value_to_json()`, `json_pointer_to_field_path()`, `classify_error_kind()`, `parse_field_metadata()`, `parse_field_type()`, `parse_constraints()`
+- Unit test suite covering almost all acceptance criteria scenarios (see Gap 3 below)
 
-**Key existing types relevant to this story:**
+### `crates/netfyr-state/src/schemas/ethernet.json`
 
-- `State` (`lib.rs`): has `entity_type: String` and `fields: IndexMap<String, FieldValue>`. The `fields` map stores `FieldValue` (value + provenance), not bare `Value`.
-- `Value` (`lib.rs`): enum with variants `Bool`, `U64`, `I64`, `IpNetwork`, `IpAddr`, `List(Vec<Value>)`, `Map(IndexMap<String, Value>)`, `String`. Has no `Into<serde_json::Value>` conversion.
-- `FieldValue` (`lib.rs`): `{ value: Value, provenance: Provenance }`.
+Present with all spec-required fields (`mtu`, `addresses`, `mac`, `carrier`, `speed`, `routes`) plus two extra fields not in the spec table: `operstate` and `dns_servers`. The schema uses `additionalProperties: false`, correct `x-netfyr-writable` annotations, and the route sub-schema with `required: ["destination"]`.
 
-**Dependencies already present in `Cargo.toml`:**
-- `serde_json = "1"` — already a dependency; usable for JSON Schema handling.
-- `thiserror = "1"` — already available for error derivation.
+The `addresses` items pattern is `^[0-9a-fA-F:.]+/[0-9]{1,3}$`, which accepts both IPv4 and IPv6 CIDR notation because `:` is in the character class.
 
-**Missing dependency:**
-- `jsonschema` — not in `Cargo.toml`. Must be added.
+### `crates/netfyr-state/src/lib.rs`
+
+Re-exports all schema types via `pub use schema::{EntitySchema, FieldConstraints, FieldSchemaInfo, FieldType, SchemaRegistry, ValidationError, ValidationErrorKind, ValidationErrors}`.
+
+### `crates/netfyr-state/Cargo.toml`
+
+`jsonschema = "0.26"` and `serde_json = "1"` are already present.
 
 ---
 
 ## Requirements
 
-### Types to create
+From the acceptance criteria, these behaviors are required:
 
-1. **`SchemaRegistry`** (`src/schema.rs`)
-   - Holds compiled schemas for all known entity types, pre-loaded at construction.
-   - Methods: `new()`, `validate(&State) -> Result<(), ValidationErrors>`, `validate_writable(&State) -> Result<(), ValidationErrors>`, `get_schema(&str) -> Option<&EntitySchema>`, `entity_types() -> Vec<&str>`, `field_info(&str, &str) -> Option<FieldSchemaInfo>`.
-
-2. **`EntitySchema`** (`src/schema.rs`)
-   - Holds the raw `serde_json::Value` for the compiled JSON Schema and a parsed map of `field_name -> FieldSchemaInfo` for programmatic access.
-
-3. **`FieldSchemaInfo`** (`src/schema.rs`)
-   - `field_type: FieldType`, `required: bool`, `writable: bool`, `constraints: Option<FieldConstraints>`, `description: Option<String>`.
-
-4. **`FieldType`** (`src/schema.rs`)
-   - Enum: `String`, `U32`, `U64`, `Bool`, `Array`, `Object`, `IpAddress`, `IpNetwork`, `MacAddress`.
-
-5. **`FieldConstraints`** (`src/schema.rs`)
-   - Holds `min: Option<i64>`, `max: Option<i64>`, `pattern: Option<String>`, and optionally item schema info.
-
-6. **`ValidationErrors`** (`src/schema.rs`)
-   - A collection wrapper around `Vec<ValidationError>`. Implements `std::error::Error`.
-
-7. **`ValidationError`** (`src/schema.rs`)
-   - `field: String`, `message: String`, `kind: ValidationErrorKind`.
-
-8. **`ValidationErrorKind`** (`src/schema.rs`)
-   - Enum: `InvalidType`, `OutOfRange`, `UnknownField`, `MissingRequired`, `ReadOnlyField`, `InvalidFormat`, `ConstraintViolation`, `UnknownEntityType`.
-
-### Schema file to create
-
-- **`src/schemas/ethernet.json`** — JSON Schema (draft 2020-12) with `x-netfyr-writable` extension annotations for: `mtu` (integer, 68–65535, writable), `addresses` (array of CIDR strings, writable), `mac` (string, MAC pattern, read-only), `carrier` (boolean, read-only), `speed` (integer, min 0, read-only), `routes` (array of objects with required `destination`, optional `gateway` and `metric`, writable). Must include `"additionalProperties": false`.
-
-### Conversion to add
-
-- **`Value` → `serde_json::Value`** (`src/lib.rs` or `src/schema.rs`): A function or `impl From<&Value> for serde_json::Value` to convert the internal `Value` enum into JSON for schema validation. Conversion: `IpAddr` and `IpNetwork` → JSON string; all others map naturally.
-
-### File modifications
-
-- **`crates/netfyr-state/Cargo.toml`**: add `jsonschema` dependency.
-- **`crates/netfyr-state/src/lib.rs`**: add `pub mod schema;` and re-export the public schema types.
+1. `SchemaRegistry::new()` loads the embedded ethernet schema; `entity_types()` returns `["ethernet"]`; `get_schema("nonexistent")` returns `None` ✓
+2. `validate()` accepts valid ethernet states and rejects: MTU out of range, unknown fields, missing required route fields, and other structural errors; collects all errors ✓
+3. `validate()` accepts read-only fields (mac, carrier, speed) without error ✓
+4. `validate_writable()` additionally rejects fields where `x-netfyr-writable: false` ✓
+5. `validate()` rejects duplicate entries in `addresses` with a `ConstraintViolation` naming the duplicate — **NOT YET IMPLEMENTED**
+6. `validate()` rejects IPv6 addresses in `addresses` with an `InvalidFormat` error stating IPv6 is not supported — **NOT YET IMPLEMENTED**
+7. `validate()` on an unknown entity type returns `ValidationErrors` with `UnknownEntityType` kind ✓
+8. `field_info()` returns correct metadata; `None` for unknown fields or entity types ✓
 
 ---
 
 ## Gap Analysis
 
-| Item | Status | Action Required |
-|---|---|---|
-| `src/schema.rs` | Does not exist | Create with all schema types |
-| `src/schemas/ethernet.json` | Does not exist | Create with full ethernet schema |
-| `jsonschema` dependency | Missing | Add to `Cargo.toml` |
-| `Value -> serde_json::Value` conversion | Missing | Implement (in `schema.rs` or `lib.rs`) |
-| `lib.rs` module declaration | Missing `schema` | Add `pub mod schema` and re-exports |
+### Gap 1: Custom duplicate-address validation (missing)
+
+**File:** `crates/netfyr-state/src/schema.rs` — `validate()` method
+
+`validate()` delegates all checking to the `jsonschema` crate. The ethernet.json schema has no `"uniqueItems": true` on `addresses`, and even if it did, the jsonschema crate would emit a generic message without identifying the specific duplicate string. The spec requires a `ConstraintViolation` with a message mentioning the exact duplicated CIDR value.
+
+**Required change:** After JSON Schema validation, inspect the `addresses` field value. For each string that appears more than once in the list, append:
+```rust
+ValidationError {
+    field: "addresses".to_string(),
+    kind: ValidationErrorKind::ConstraintViolation,
+    message: format!("duplicate address \"{}\"", addr),
+}
+```
+Guard against the field being absent or not a `Value::List`.
+
+### Gap 2: Custom IPv6-rejection validation (missing)
+
+**File:** `crates/netfyr-state/src/schema.rs` — `validate()` method
+
+The `addresses` pattern `^[0-9a-fA-F:.]+/[0-9]{1,3}$` includes `:` in the character class, so IPv6 CIDRs like `fe80::1/64` match and pass JSON Schema validation. The spec requires an `InvalidFormat` error explicitly stating that IPv6 is not supported.
+
+**Required change:** After JSON Schema validation, inspect the `addresses` field. For each string item containing `:` (before the `/`), append:
+```rust
+ValidationError {
+    field: "addresses".to_string(),
+    kind: ValidationErrorKind::InvalidFormat,
+    message: format!("IPv6 address \"{}\" is not supported; use IPv4 CIDR format", addr),
+}
+```
+Guard against the field being absent or not a `Value::List`.
+
+### Gap 3: Missing tests for the two custom validation scenarios
+
+**File:** `crates/netfyr-state/src/schema.rs` — test module
+
+Two acceptance-criteria scenarios have no corresponding tests:
+
+- **"Duplicate addresses are rejected"** — expects `ConstraintViolation` for field `"addresses"` with a message mentioning the duplicated CIDR string
+- **"IPv6 addresses are rejected"** — expects `InvalidFormat` for field `"addresses"` with a message mentioning IPv6 not supported
+
+All other scenarios from the spec are already covered by the existing test suite.
+
+### Minor: `addresses` JSON Schema pattern accepts IPv6
+
+**File:** `crates/netfyr-state/src/schemas/ethernet.json`
+
+The addresses item pattern `^[0-9a-fA-F:.]+/[0-9]{1,3}$` is too broad. Since the spec explicitly requires a custom code check for IPv6 (not a JSON Schema pattern rejection), this pattern permissiveness may be intentional — the custom code is the authoritative gate. However, if the pattern were tightened to IPv4 only (e.g., `^(\d{1,3}\.){3}\d{1,3}/\d{1,3}$`), the behavior would be consistent: IPv6 would first fail the pattern (emitting an `InvalidFormat` from JSON Schema) AND the custom check would also catch it. The two paths could produce duplicate errors for the same field, so the implementor must decide whether to tighten the pattern or keep the permissive pattern and rely solely on custom code.
 
 ---
 
 ## Integration Points
 
-### `State` struct
-Validation consumes `&State`. The implementation must extract:
-- `state.entity_type` — to look up the schema in the registry.
-- `state.fields` — `IndexMap<String, FieldValue>`. Each `FieldValue.value` must be extracted and converted to `serde_json::Value` to assemble the JSON object passed to the `jsonschema` validator.
-
-### `Value` enum
-The conversion from `Value` to `serde_json::Value` must handle:
-- `Value::IpAddr` and `Value::IpNetwork`: convert to string representation (no native JSON type; the schema uses `"type": "string"` with pattern).
-- `Value::U64` and `Value::I64`: map to `serde_json::Number`.
-- `Value::List` and `Value::Map`: recurse.
-
-### `jsonschema` crate
-The crate returns errors with `instance_path` as a JSON Pointer (e.g., `/routes/0/destination`). These must be converted to the display format required by the spec (e.g., `"routes[0].destination"`). The `kind` field on `jsonschema::ValidationError` must be mapped to `ValidationErrorKind`.
-
-### `x-netfyr-writable` extension
-Standard JSON Schema validators ignore unknown extension keywords. The `validate_writable()` method cannot rely on the JSON Schema engine to enforce writability. It must be implemented as a separate post-validation pass: after standard validation passes, iterate `state.fields` and check each field's `writable` flag in the parsed `EntitySchema` metadata.
-
-### `lib.rs` re-exports
-The schema types must be added to `lib.rs` alongside the existing re-exports from `diff`, `loader`, `set`, and `yaml`.
+- **`State.fields`** (`IndexMap<String, FieldValue>`) — `validate()` already reads this via `fields_to_json()`. The custom duplicate/IPv6 checks will also read it directly, extracting `FieldValue.value` as a `Value::List`.
+- **`Value` enum** — `value_to_json()` handles all variants. Custom validation will additionally need `Value::as_list()` and `Value::as_str()` accessors, both of which already exist.
+- **`validate_writable()`** — calls `validate()` internally and then appends read-only errors. Once Gap 1 and Gap 2 are fixed in `validate()`, `validate_writable()` will inherit those checks automatically.
+- **No callers in the current codebase** wire `validate()` / `validate_writable()` into the apply or dry-run flow. The spec scopes this story to `netfyr-state` only; CLI integration is not required here.
 
 ---
 
 ## Risks
 
-1. **`FieldType::U32` vs `Value::U64`**: The spec defines `FieldType::U32` for `mtu` and `speed`, but the existing `Value` enum has no `U32` variant — only `U64` and `I64`. Integer values from YAML will deserialize as `Value::U64`. The `FieldType` enum should use `U64` (or validate `U32` as a range subset of `U64`) to avoid type mismatches.
+1. **Double-error risk for IPv6 addresses**: If the ethernet.json addresses pattern is left permissive, IPv6 strings pass JSON Schema validation but are caught by the custom check. If the pattern is tightened to IPv4 only, an IPv6 input would produce both a JSON Schema `InvalidFormat` (pattern mismatch) AND a custom `InvalidFormat` (IPv6 not supported) for the same field. The implementor must choose: tighten the pattern and suppress the JSON Schema pattern error for addresses, keep the permissive pattern and use only the custom check, or accept both errors appearing (which may confuse users).
 
-2. **`jsonschema` version API surface**: The `jsonschema` crate has undergone breaking API changes between versions (v0.17 vs v0.18+). The error type structure and compilation API differ. The implementation must pick and pin a version; the validation error `kind` field structure varies significantly between versions.
+2. **Custom check ordering**: The spec says to "run netfyr-specific validation rules beyond what JSON Schema covers." If an `addresses` field fails a type check (e.g., the value is not an array), the JSON Schema will emit a type error. The custom duplicate/IPv6 checks must guard against non-list values to avoid panicking.
 
-3. **JSON Pointer to display path mapping**: `jsonschema` reports paths as JSON Pointers (`/routes/0/destination`). The spec acceptance criteria reference `"routes[0].destination"`. A path conversion function is needed; the exact format should be confirmed before implementation.
+3. **Duplicate detection semantics**: The spec says "report a ConstraintViolation for each duplicate." It is ambiguous whether this means one error per unique duplicated value (if `"10.0.0.1/24"` appears three times, one error) or one error per extra occurrence (two errors). The simpler interpretation — one error per unique duplicated value — is the most user-friendly.
 
-4. **Multiple error collection from `jsonschema`**: The spec requires collecting all errors (not just the first). The `jsonschema` crate's `validate()` returns an iterator of errors, which is suitable, but early-exit patterns must be avoided.
+4. **`operstate` and `dns_servers` in ethernet.json**: These fields exist in the schema but are not in the spec table. Tests that check `entity_types()` or iterate fields must not assume only the six spec-listed fields are present. The extra fields do not break any acceptance criteria but add surface area.
 
-5. **`additionalProperties: false` and field extraction**: The `State.fields` `IndexMap` only contains fields the user/system set. There are no "extra" provenance or metadata fields in the JSON object that gets validated — only the extracted `value` portion of each `FieldValue`. This is correct, but the implementation must ensure the validated JSON object contains only field values, not `FieldValue` wrappers.
-
-6. **Unknown entity type error representation**: The spec requires `validate()` on an unknown entity type to return `ValidationErrors` with an error about the unknown type. The `ValidationErrorKind` enum must include a variant for this (e.g., `UnknownEntityType`), which is not explicitly listed in the spec's `ValidationErrorKind` variants but is implied by the acceptance criteria.
-
-7. **Route sub-object field path in errors**: For `routes[0].destination` errors, the `jsonschema` crate will report these relative to the root object. The path translation must handle both top-level fields and nested array-of-object fields.
-
-8. **Schema embedding with `include_str!`**: The path used in `include_str!("schemas/ethernet.json")` is relative to the source file, which is `src/schema.rs`. The schema file must therefore be at `src/schemas/ethernet.json`. This is consistent with the spec but must be verified during implementation since `include_str!` resolves at compile time relative to the file, not the crate root.
+5. **`FieldType::Integer` vs. spec's `U32`/`U64`**: The spec lists `U32` and `U64` as distinct variants, but the implementation uses a single `Integer`. No downstream consumers exist yet; if future code pattern-matches on `FieldType::U32` or `FieldType::U64`, it will fail at compile time.

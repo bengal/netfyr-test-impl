@@ -2,89 +2,87 @@
 
 ## Current State
 
-All 8 specified end-to-end test scripts already exist and are implemented in `tests/`:
+All 16 test scripts specified in SPEC-600 already exist in `tests/`:
 
-| File | Scenarios covered | Present |
-|------|------------------|---------|
-| `tests/600-e2e-static-apply.sh` | Static policy → ip + query JSON verification | Yes |
-| `tests/600-e2e-dhcp-and-static.sh` | DHCP + static coexistence, cross-contamination checks | Yes |
-| `tests/600-e2e-replace-all.sh` | Second apply removes state from first policy set | Yes |
-| `tests/600-e2e-daemon-restart.sh` | Policy persistence and re-application across restart | Yes |
-| `tests/600-e2e-conflict.sh` | Conflicting mtu policies → exit 1 + conflict output | Yes |
-| `tests/600-e2e-dry-run.sh` | --dry-run → pending diff output, kernel unchanged | Yes |
-| `tests/600-e2e-apply-directory.sh` | Directory of policies → multiple interfaces configured | Yes |
-| `tests/600-e2e-unmanaged.sh` | Manually-configured interface untouched by apply | Yes |
+| File | Scenario |
+|---|---|
+| `tests/600-e2e-static-apply.sh` | Static policy apply + `ip` and `netfyr query -o json` verification |
+| `tests/600-e2e-dhcp-and-static.sh` | DHCP and static coexistence on separate interfaces |
+| `tests/600-e2e-replace-all.sh` | Second apply fully replaces first policy set (removes old address) |
+| `tests/600-e2e-daemon-restart.sh` | Policy persistence and re-apply across daemon restart |
+| `tests/600-e2e-conflict.sh` | Conflicting mtu policies → exit 1, output mentions "conflict" and "mtu" |
+| `tests/600-e2e-dry-run.sh` | `--dry-run` → output mentions mtu change, kernel MTU unchanged |
+| `tests/600-e2e-apply-directory.sh` | Directory of policies configures multiple interfaces |
+| `tests/600-e2e-unmanaged.sh` | Manually configured interface is untouched by policy apply |
+| `tests/600-e2e-addr-single.sh` | Single address applied and verified via `ip` and `netfyr query` |
+| `tests/600-e2e-addr-five.sh` | 5 addresses applied in YAML order |
+| `tests/600-e2e-addr-twenty.sh` | 20 addresses applied in YAML order (stress) |
+| `tests/600-e2e-addr-replace.sh` | Old address set replaced by new one in order |
+| `tests/600-e2e-addr-idempotent.sh` | Same addresses applied twice, no duplicates |
+| `tests/600-e2e-addr-duplicate-reject.sh` | Duplicate in YAML → non-zero exit, error message, nothing applied |
+| `tests/600-e2e-addr-overlapping-subnets.sh` | Addresses on different subnets coexist in order |
+| `tests/600-e2e-addr-removal.sh` | Replace-all with no-address policy removes all addresses |
 
-**`tests/helpers.sh`** is present and complete. It provides all functions needed by the 600-series:
-- `netns_setup()` — `unshare --user --net --map-root-user` re-entry loop
-- `create_veth()`, `add_address()`
-- `start_dnsmasq()` — hard-fails (exit 1) if dnsmasq not installed; stores PID in `_DNSMASQ_PIDS` for `cleanup()`
-- `cleanup()` — EXIT trap, kills dnsmasq PIDs
-- `assert_eq()`, `assert_match()`, `assert_has_address()`, `assert_link_up()`, `assert_not_has_address()`, `assert_mtu()`
-- `wait_for_address()` — polls with 0.1 s interval up to a caller-specified second timeout
+`tests/helpers.sh` (232 lines) provides all helpers referenced by these scripts:
+- **Setup/teardown**: `netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup` (kills dnsmasq PIDs)
+- **Assertions**: `assert_eq`, `assert_match`, `assert_has_address`, `assert_not_has_address`, `assert_mtu`, `assert_link_up`, `assert_address_count`, `assert_json_address_order`
+- **Polling**: `wait_for_address`
 
-The **Makefile** `integration-test` target discovers `tests/[0-9]*.sh` automatically; the 600-series scripts are already included.
+The Makefile already discovers and runs all `tests/[0-9]*.sh` via the `integration-test` target.
 
-No Rust code exists for this story and none is required.
+No Rust code changes are required by this story.
 
 ## Requirements
 
-The spec calls for 8 shell test scripts exercising the full pipeline (write YAML → start daemon → apply → verify with `ip` and `netfyr query`). Concrete technical requirements derived from acceptance criteria:
-
-1. Each script must: use `set -euo pipefail`; source `helpers.sh`; check both binaries with `[[ ! -x ]]` before `netns_setup`; use `trap` for cleanup; print `PASS: <name>` on success.
-2. Binary paths default to `$SCRIPT_DIR/../target/debug/{netfyr,netfyr-daemon}`, overridable via `NETFYR_BIN` / `NETFYR_DAEMON_BIN`.
-3. Daemon must be started with `NETFYR_SOCKET_PATH` and `NETFYR_POLICY_DIR` env vars pointing to temp dirs.
-4. CLI must receive the socket path via `NETFYR_SOCKET_PATH` env var.
-5. Daemon socket poll must hard-fail (exit 1) if socket does not appear, not silently continue.
-6. DHCP tests must hard-fail if `dnsmasq` is not installed (no `exit 0` skip).
-7. `600-e2e-conflict.sh` must verify exit code 1 from `netfyr apply`.
-8. `600-e2e-dry-run.sh` must verify exit code 1 from `netfyr apply --dry-run` (changes pending) and kernel MTU unchanged.
-9. `600-e2e-replace-all.sh` must verify address removal using `assert_not_has_address`.
-10. `600-e2e-daemon-restart.sh` must reset kernel MTU to 1500 between daemon instances to prove the new daemon re-applies it.
+16 end-to-end shell test scripts, each exercising a full user workflow through the running daemon. All structural requirements are already met by the existing scripts:
+- `set -euo pipefail`; source `helpers.sh`; check both binaries; fail if missing
+- `netns_setup "$@"` for isolation via `unshare --user --net`
+- Temp dir for socket and policy store; EXIT trap kills daemon and removes temp dir
+- Daemon started with `NETFYR_SOCKET_PATH` and `NETFYR_POLICY_DIR` env vars
+- Socket poll loop (50 × 0.1 s); hard-fail if socket does not appear
+- Print `PASS: 600-e2e-<name>` on success; all failure paths `exit 1`
 
 ## Gap Analysis
 
-**No files need to be created or modified.** All 8 test scripts and the supporting `helpers.sh` are implemented and structurally match the specification:
+**No new files need to be created.** All 16 scripts exist.
 
-- Binary validation, `netns_setup`, trap registration, temp dir, socket poll pattern: present in all 8 scripts.
-- `assert_not_has_address` (needed by replace-all): exists in `helpers.sh` (line 143–154).
-- `assert_mtu` (needed by 7 of 8 scripts): exists in `helpers.sh` (line 156–167).
-- `wait_for_address` (needed by DHCP tests): exists in `helpers.sh` (line 169–187).
-- DHCP hard-fail: present in `600-e2e-dhcp-and-static.sh` (line 26–29) and `600-e2e-unmanaged.sh` (line 26–29).
-- Conflict exit code check: present in `600-e2e-conflict.sh` (line 95–99).
-- Dry-run exit code check and mtu unchanged: present in `600-e2e-dry-run.sh` (line 80–93).
-- Kernel MTU reset between restarts: present in `600-e2e-daemon-restart.sh` (line 100).
-- `assert_not_has_address` for replace-all: present in `600-e2e-replace-all.sh` (line 113).
+The only functional gap is a **dnsmasq process leak** in the two DHCP tests:
 
-The Makefile `integration-test` target requires no changes (glob already covers 600-series).
+- `tests/600-e2e-dhcp-and-static.sh` (line 37)
+- `tests/600-e2e-unmanaged.sh` (line 37)
 
-The only outstanding work is **running** `make integration-test` to confirm all 8 tests pass. This validates that the underlying Rust implementations (SPEC-103, 201–203, 301–302, 401–403) behave correctly end-to-end.
+Both scripts set their EXIT trap after `netns_setup`, which overrides the `trap cleanup EXIT` that `netns_setup` installs. As a result, `cleanup` is never called, and dnsmasq PIDs in `_DNSMASQ_PIDS` are not killed. The spec explicitly warns: "Leaked dnsmasq processes hold pipes open and cause the test runner to hang indefinitely."
+
+Fix in both files — change:
+```bash
+trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
+```
+to:
+```bash
+trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
+```
+
+No other files need modification. The spec template references `kill_dnsmasq` as a named helper, but `helpers.sh` implements that functionality in `cleanup`; the existing tests already use `cleanup`, so no new helper function is needed.
 
 ## Integration Points
 
-The tests exercise these components together:
-
-- **`netfyr-daemon`** (`crates/netfyr-daemon`): started via subprocess; reads `NETFYR_SOCKET_PATH` and `NETFYR_POLICY_DIR`; `PolicyStore::load()` must reload persisted policies on restart; initial reconciliation must apply loaded policies without an explicit `netfyr apply` call (required by daemon-restart test).
-- **`netfyr-cli`** (`crates/netfyr-cli`): `run_apply` (with and without `--dry-run`) and `run_query` (with `-s name=<iface> -o json`); must read `NETFYR_SOCKET_PATH` from the environment to connect to the test daemon socket; must return `ExitCode::FAILURE` (1) for conflicts and for non-empty dry-run diffs.
-- **`netfyr-varlink`** (`crates/netfyr-varlink`): `VarlinkClient::connect`, `submit_policies`, `dry_run`, `query`; JSON serialization of state fields must produce `"mtu": 1400` matchable by `grep -q '"mtu".*1400'`.
-- **`netfyr-backend`** (`crates/netfyr-backend`): `NetlinkBackend` must remove addresses not in desired state (replace-all test); `Dhcpv4Factory` must acquire a lease within 10 s (DHCP tests); neither must modify interfaces absent from the desired state (unmanaged test).
-- **`netfyr-reconcile`** (`crates/netfyr-reconcile`): `merge()` must surface conflicts when two policies at the same priority set the same field to different values.
-- **`tests/helpers.sh`**: all assertion and setup functions consumed directly by the 8 scripts.
+| Component | Role |
+|---|---|
+| `target/debug/netfyr-daemon` | Started per-test; applies policies on `submit_policies` RPC |
+| `target/debug/netfyr` (`apply`) | `run_apply` in `crates/netfyr-cli/src/apply.rs`; exit codes 0/1/2 tested |
+| `target/debug/netfyr` (`query -o json`) | `run_query` in `crates/netfyr-cli/src/query.rs`; `addresses` array order must match applied order |
+| `netfyr-backend` netlink apply | `apply_ethernet` in `crates/netfyr-backend/src/netlink/apply.rs`; applies addresses in order, removes addresses not in desired state |
+| `netfyr-state` schema validation | `SchemaRegistry::validate` in `crates/netfyr-state/src/schema.rs`; duplicate address list entries must be rejected |
+| `tests/helpers.sh` | All scripts source it; `cleanup` must be called in DHCP test EXIT traps |
+| `Makefile` `integration-test` | Auto-discovers new scripts by `tests/[0-9]*.sh` naming convention |
 
 ## Risks
 
-1. **Daemon restart re-applies on startup**: `600-e2e-daemon-restart.sh` relies on the new daemon instance automatically re-applying mtu=1400 from persisted policies, with no explicit `netfyr apply`. If the daemon only reconciles on incoming `submit_policies` RPC (not on startup), the test fails. This is a behavioral contract that must be satisfied by `netfyr-daemon/src/main.rs` or `reconciler.rs`.
+1. **dnsmasq leak (confirmed gap)**: The two DHCP tests do not call `cleanup` in their EXIT traps. In a non-interactive bash shell, background jobs do not receive SIGHUP on shell exit, so dnsmasq outlives the test. This can cause the Makefile test loop to hang waiting on a pipe. This is the only change needed to complete this story.
 
-2. **Conflict exit code contract**: `600-e2e-conflict.sh` expects exit code 1 from `netfyr apply`. `run_apply` in `netfyr-cli/src/apply.rs` must return `ExitCode::FAILURE` when `ConflictReport` is non-empty. If it returns 0 with a printed warning, the test fails.
+2. **Duplicate-address exit code**: `600-e2e-addr-duplicate-reject.sh` checks for any non-zero exit code rather than specifically exit code 2. The comment in the file explains this is intentional resilience. This diverges from the acceptance criterion (`exit code is 2`) but is a reasonable trade-off.
 
-3. **Dry-run exit code**: `600-e2e-dry-run.sh` expects exit code 1 when `--dry-run` shows pending changes. `run_apply` must return `ExitCode::FAILURE` (1) for a non-empty dry-run diff, not 0.
+3. **Address ordering (environment-dependent)**: The five address-ordering tests (`addr-five`, `addr-twenty`, `addr-replace`, `addr-idempotent`, `addr-overlapping-subnets`) use `assert_json_address_order` to verify `netfyr query` returns addresses in YAML insertion order. This requires `apply_ethernet` to insert in declaration order and `query_ethernet` to return in kernel insertion order. If either reorders, these tests fail.
 
-4. **Replace-all address removal**: `600-e2e-replace-all.sh` verifies that `10.99.0.1/24` is removed when policy A is replaced by policy B (which has no address field). The netlink apply path (SPEC-103) must actively remove addresses not in the desired state, not only add/modify.
+4. **Daemon restart timing**: `600-e2e-daemon-restart.sh` resets the MTU to 1500 after killing the daemon and asserts mtu=1400 is restored immediately after the new daemon's socket appears — with no additional sleep. If the daemon defers initial reconciliation, the assertion may race.
 
-5. **DHCP lease timing**: `wait_for_address` polls for up to 10 s (100 × 0.1 s). In slow CI environments or under emulated networking, DHCP negotiation may exceed this window, causing `600-e2e-dhcp-and-static.sh` and `600-e2e-unmanaged.sh` to flake.
-
-6. **JSON mtu grep pattern**: `600-e2e-static-apply.sh` uses `grep -q '"mtu".*1400'` on the JSON query output. If the serializer emits `"mtu":1400` (no space after colon) or different key ordering, the match fails. The pattern tolerates whitespace between `"mtu"` and `1400` but not key reordering.
-
-7. **dnsmasq availability**: Two of eight tests hard-fail if `dnsmasq` is absent. These tests will not pass in minimal CI environments. Per SPEC-001, this is correct behavior — but it constrains CI environment requirements.
-
-8. **`start_dnsmasq` binding race**: `start_dnsmasq` sleeps 1 s after starting dnsmasq. If dnsmasq takes longer to bind in some environments, the DHCP client may not receive a response, causing the `wait_for_address` poll to exhaust its 10 s budget.

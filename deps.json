@@ -133,6 +133,7 @@
     ],
     "600-end-to-end-tests": [
       "001-workspace-setup",
+      "006-entity-schema-validation",
       "103-rtnetlink-apply-ethernet",
       "201-reconciliation-merge",
       "202-conflict-detection",

@@ -1,4 +1,4 @@
-# UNDERSTAND: 102-rtnetlink-query-ethernet
+# UNDERSTAND: 102-rtnetlink-query-ethernet (updated 2026-04-20)
 
 ## Current State
 

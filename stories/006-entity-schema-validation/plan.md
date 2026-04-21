@@ -1,281 +1,134 @@
-# Plan: SPEC-006 Entity Schema Validation
+# Plan: SPEC-006 — Entity Schema Validation
 
 ## Approach
 
-The implementation adds a `schema` module to `netfyr-state` containing a `SchemaRegistry` that embeds JSON Schema files at compile time and validates `State` instances against them. The core data flow is: `State` -> extract `entity_type` -> look up compiled `Validator` -> convert `State.fields` to `serde_json::Value` -> run JSON Schema validation -> collect errors -> optionally check writable metadata -> return `Result<(), ValidationErrors>`.
+The implementation is nearly complete. All types (`SchemaRegistry`, `EntitySchema`, `FieldSchemaInfo`, `ValidationError`, `ValidationErrors`, `FieldType`, `FieldConstraints`, `ValidationErrorKind`), the JSON Schema file (`ethernet.json`), the core validation flow (`validate`, `validate_writable`), the lib.rs re-exports, and the Cargo.toml dependency on `jsonschema = "0.26"` are already in place and correct. Two spec-required custom validation rules are missing from the `validate()` method:
 
-The design splits into two layers: (1) a JSON Schema validation layer powered by the `jsonschema` crate, which handles structural validation (type checking, range constraints, required fields, unknown field rejection via `additionalProperties: false`), and (2) a metadata layer that parses custom `x-netfyr-writable` extensions from the schema JSON to enforce writable/read-only semantics, which the standard JSON Schema validator ignores. The `SchemaRegistry` pre-parses both layers at construction time — the compiled `Validator` for fast validation, and a `HashMap<String, FieldSchemaInfo>` per entity type for programmatic field queries and writable checks.
+1. **Duplicate address detection** in the `addresses` array field — spec requires a `ConstraintViolation` error naming the specific duplicated CIDR string.
+2. **IPv6 rejection** for entries in the `addresses` array field — spec requires an `InvalidFormat` error stating that IPv6 is not supported.
 
-The alternative of hand-rolling validation without JSON Schema was rejected because it would duplicate constraint logic and miss the extensibility benefits of a standard schema format. The alternative of using JSON Schema for everything (including writability) via a custom keyword validator was rejected because the `jsonschema` crate's custom keyword extension API is complex and unnecessary — a simple post-validation pass over field metadata is cleaner and more maintainable.
+The design adds a post-JSON-Schema validation pass inside `SchemaRegistry::validate()` that inspects the `addresses` field directly from `State.fields` using the existing `Value::as_list()` and `Value::as_str()` accessors. This keeps all validation logic in one method, and `validate_writable()` inherits both checks automatically since it delegates to `validate()` internally. Custom checks run *after* JSON Schema validation and append to the same error vector, so users see all errors (structural + custom) in a single report.
 
-The `Value -> serde_json::Value` conversion is implemented as `impl From<&Value> for serde_json::Value` in `schema.rs` (not in `lib.rs`) to keep the JSON-specific conversion co-located with its only consumer and avoid coupling the core types to `serde_json` semantics beyond what already exists.
+The alternative of encoding these rules in JSON Schema was rejected. JSON Schema's `uniqueItems` produces generic messages without naming the duplicate. Tightening the `addresses` item pattern to IPv4-only would cause double errors for IPv6 inputs (one from JSON Schema pattern mismatch + one from the custom check). The current permissive pattern (`^[0-9a-fA-F:.]+/[0-9]{1,3}$`) lets IPv6 strings pass JSON Schema so that only the custom check produces a single, clear "IPv6 not supported" message.
 
 ## Design Decisions
 
-1. **`jsonschema` crate version: pin to `"0.26"`**
-   - **Decision**: Use `jsonschema = "0.26"` rather than the latest 0.46.x.
-   - **Alternatives considered**: `0.46.x` (latest), `0.18.x`.
-   - **Rationale**: The `0.26.x` line has a stable, well-documented API with `JSONSchema::compile()`, `iter_errors()` returning `ValidationError` with public `instance_path` (a `JSONPointer` type) and `kind` (a `ValidationErrorKind` enum). Version 0.46 underwent major API restructuring (renamed to `Validator`, changed error types to `ValidationError` with methods like `instance_path()` returning `Location`, removed public `kind` field). The 0.26 API is simpler to map to our error types because `ValidationErrorKind` directly tells us whether an error is a type mismatch, range violation, etc. If 0.26 is unavailable or causes dependency issues, fall back to 0.28 which has the same API. **UPDATE**: If the implementer finds 0.26 has dependency conflicts, use the latest available version and adapt — the key requirement is `iter_errors()` + access to instance path + some way to classify error kind.
+1. **Decision**: Keep the permissive `addresses` item pattern in `ethernet.json` unchanged; reject IPv6 only via custom code in `validate()`.
+   - **Alternatives considered**: (a) Tighten the pattern to IPv4-only and also add the custom check. (b) Rely solely on a tighter pattern without custom code.
+   - **Rationale**: Option (a) produces two errors for the same IPv6 input — a pattern-mismatch `InvalidFormat` from JSON Schema and an "IPv6 not supported" `InvalidFormat` from the custom check — confusing users. Option (b) gives a generic "pattern mismatch" message instead of the spec-required "IPv6 is not supported" message. The current permissive pattern lets IPv6 strings pass JSON Schema, and the custom check provides the single, clear error the spec requires.
 
-2. **`FieldType` enum uses `Integer` not `U32`/`U64`**
-   - **Decision**: Define `FieldType` with a single `Integer` variant instead of separate `U32` and `U64`.
-   - **Alternatives considered**: `U32` + `U64` as separate variants (per spec), keeping `U64` only.
-   - **Rationale**: The `Value` enum has `U64` and `I64` but no `U32`. JSON Schema uses `"type": "integer"` for all integers — range is expressed via `minimum`/`maximum` constraints, not type width. Having `FieldType::U32` would be misleading since nothing in the pipeline produces or validates 32-bit specifically. A single `Integer` variant with range constraints in `FieldConstraints` is cleaner and matches how JSON Schema actually works. The spec lists `U32` in the `FieldType` enum, but also says `mtu` has `min: 68, max: 65535` — the constraints do the real work, not the type width.
+2. **Decision**: Run custom validation checks only when the `addresses` field is present and is a `Value::List`. If the field is absent, skip (it's optional). If it has the wrong type, JSON Schema already emitted a type error; skip custom checks to avoid cascading errors.
+   - **Alternatives considered**: Run custom checks unconditionally with defensive type-matching.
+   - **Rationale**: If `addresses` is not an array, JSON Schema already emitted an `InvalidType` error. Adding duplicate/IPv6 checks on a non-list value would either panic or produce confusing secondary errors.
 
-3. **`ValidationErrorKind` includes `UnknownEntityType`**
-   - **Decision**: Add `UnknownEntityType` to the `ValidationErrorKind` enum even though the spec doesn't explicitly list it.
-   - **Alternatives considered**: Using a separate `Result` type for entity type lookup, returning `ValidationErrorKind::ConstraintViolation` for unknown types.
-   - **Rationale**: The acceptance criteria require `validate()` on an unknown entity type to return `ValidationErrors` containing an error about the unknown type. A dedicated variant makes the error programmatically distinguishable. The `field` for this error will be empty string `""` since it's an entity-level error, not field-level.
+3. **Decision**: Emit one `ConstraintViolation` error per unique duplicated address string. If `"10.0.0.1/24"` appears three times, emit one error for that string.
+   - **Alternatives considered**: One error per extra occurrence (two errors for three occurrences of the same address).
+   - **Rationale**: The spec says "report a ConstraintViolation for each duplicate" which is ambiguous. One-per-unique-value is more user-friendly and matches common validator behavior.
 
-4. **`Value` to `serde_json::Value` conversion placed in `schema.rs`**
-   - **Decision**: Implement `From<&Value> for serde_json::Value` in `schema.rs`, not `lib.rs`.
-   - **Alternatives considered**: Adding the impl in `lib.rs` next to the `Value` definition, creating a separate conversion module.
-   - **Rationale**: The conversion is only needed for schema validation. Placing it in `schema.rs` keeps it co-located with its consumer. Rust's orphan rules allow this since both types are foreign but `Value` is defined in the same crate. Actually — `Value` is in this crate and `serde_json::Value` is foreign, so `impl From<&Value> for serde_json::Value` is allowed in any module of this crate.
+4. **Decision**: Detect IPv6 by checking if the address string (the part before `/`, or the whole string if no `/`) contains `:`.
+   - **Alternatives considered**: Parse with `std::net::IpAddr`, use a regex.
+   - **Rationale**: IPv4 addresses never contain colons; all IPv6 addresses do. The `addresses` field is string-typed at this point (MAC addresses are in a separate field), so there's no false-positive risk. The `:` check is trivial and avoids unnecessary parsing overhead.
 
-5. **Fields map conversion strips `FieldValue` wrapper**
-   - **Decision**: When converting `State.fields` for validation, extract `field_value.value` from each `FieldValue` and discard the `provenance`. The JSON object passed to the validator contains only field names mapped to their values.
-   - **Alternatives considered**: Including provenance in the JSON object.
-   - **Rationale**: The JSON Schema defines the shape of configuration data, not metadata. Provenance is orthogonal to validation. Including it would cause `additionalProperties: false` to reject it or require schema changes.
+5. **Decision**: Place custom validation logic in a private helper function `run_custom_checks(state: &State) -> Vec<ValidationError>` that dispatches to `check_ethernet_addresses(state: &State) -> Vec<ValidationError>`.
+   - **Alternatives considered**: Inline the logic directly in `validate()`.
+   - **Rationale**: A dispatch helper keeps `validate()` readable and provides a clean extension point for future entity types without modifying the main validation method.
 
-6. **Error path format: dot-notation with bracket indices**
-   - **Decision**: Convert JSON Pointer paths from `jsonschema` (e.g., `/routes/0/destination`) to dot-bracket notation (e.g., `routes[0].destination`).
-   - **Alternatives considered**: Using JSON Pointer directly, using only dot notation.
-   - **Rationale**: The spec's example output uses `routes[0].gateway` format. JSON Pointer format (`/routes/0/destination`) is not user-friendly. The conversion is a straightforward string transformation: split on `/`, skip leading empty segment, join with `.` but wrap numeric segments in `[]`.
-
-7. **`ValidationErrors` implements `Display` and `std::error::Error`**
-   - **Decision**: Derive `thiserror::Error` on `ValidationErrors` with a `Display` impl that lists all errors.
-   - **Alternatives considered**: Manual `impl Error`, no `Error` impl.
-   - **Rationale**: `ValidationErrors` is used as the `Err` variant of a `Result` — it should implement `Error` for ergonomic `?` propagation and error reporting. `thiserror` is already a dependency.
-
-8. **`FieldConstraints` uses `Option<i64>` for min/max**
-   - **Decision**: Use `Option<i64>` for both `min` and `max` in `FieldConstraints`, even though most constraints are non-negative.
-   - **Alternatives considered**: `Option<u64>`, `Option<f64>`, separate types for integer vs string constraints.
-   - **Rationale**: JSON Schema `minimum`/`maximum` can be negative (though unlikely here). Using `i64` avoids lossy conversions. JSON Schema numbers in the schema file itself will be parsed via `serde_json` which uses `i64`/`f64`. Since all our constraints are integral, `i64` is the right fit.
-
-9. **Schema draft: use draft 2020-12 in the JSON file, but compile with draft auto-detection**
-   - **Decision**: Write the ethernet.json schema with `"$schema": "https://json-schema.org/draft/2020-12/schema"` and let the `jsonschema` crate auto-detect the draft from the `$schema` keyword.
-   - **Alternatives considered**: Forcing draft-07 for broader compatibility, explicitly selecting draft in code.
-   - **Rationale**: The spec explicitly says "draft 2020-12 or 07". Draft 2020-12 is the modern standard. The `jsonschema` crate (both 0.26 and 0.46) supports draft 2020-12. Auto-detection is the simplest code path.
-
-10. **Route sub-object `x-netfyr-writable` inheritance**
-    - **Decision**: Fields inside route objects do not have individual `x-netfyr-writable` annotations. The `routes` field itself is writable, and its sub-fields inherit that status. The `validate_writable()` check only operates on top-level fields of the entity.
-    - **Alternatives considered**: Recursive writable checking on nested fields.
-    - **Rationale**: The spec's field table only assigns writable/read-only at the top level. Route sub-fields (destination, gateway, metric) don't have a writable column — they're implicitly writable because `routes` is writable. Checking only top-level fields is simpler and matches the spec.
+6. **Decision**: Do not modify `ethernet.json`.
+   - **Alternatives considered**: Add `"uniqueItems": true` to `addresses`.
+   - **Rationale**: The `jsonschema` crate's `uniqueItems` produces generic messages without identifying the specific duplicate. The spec requires the message to mention the duplicated CIDR string. Custom code is the only way.
 
 ## File Changes
 
-### 1. `crates/netfyr-state/src/schemas/ethernet.json` — CREATE
+### 1. `crates/netfyr-state/src/schema.rs` — modify
 
-**What**: A JSON Schema file (draft 2020-12) defining the ethernet entity type. Contains:
-- Top-level: `$schema`, `title: "ethernet"`, `description`, `type: "object"`, `additionalProperties: false`
-- Properties:
-  - `mtu`: `{ "type": "integer", "minimum": 68, "maximum": 65535, "x-netfyr-writable": true }`
-  - `addresses`: `{ "type": "array", "items": { "type": "string", "pattern": "<CIDR regex>" }, "x-netfyr-writable": true }`
-  - `mac`: `{ "type": "string", "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", "x-netfyr-writable": false }`
-  - `carrier`: `{ "type": "boolean", "x-netfyr-writable": false }`
-  - `speed`: `{ "type": "integer", "minimum": 0, "x-netfyr-writable": false }`
-  - `routes`: `{ "type": "array", "items": { route object schema }, "x-netfyr-writable": true }`
-- Route object schema (inline in `routes.items`): `type: "object"`, `additionalProperties: false`, `required: ["destination"]`, properties: `destination` (string, CIDR pattern), `gateway` (string, IP pattern), `metric` (integer, minimum 0)
-- CIDR pattern regex: `^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$` — a basic structural check (full IP validation happens at the Value type level; the schema just ensures the string looks like CIDR). For IPv6 support, use a more permissive pattern or two patterns via `anyOf`. Decision: use a permissive pattern that accepts both IPv4 and IPv6 CIDR — `^.+/.+$` is too loose; use a pattern that requires at least a slash: `^[0-9a-fA-F:.]+/[0-9]{1,3}$`.
-- Gateway IP pattern: `^[0-9a-fA-F:.]+$` — accepts both IPv4 dotted-decimal and IPv6 colon-hex.
+**What changes:**
 
-**Why**: The spec requires schemas to be embedded as JSON files. This is the first (and currently only) schema.
+- **Add `use std::collections::HashSet;`** to the existing import block at the top of the file (line 10 area, alongside `HashMap`).
 
-### 2. `crates/netfyr-state/src/schema.rs` — CREATE
+- **New private function `run_custom_checks`**: Signature: `fn run_custom_checks(state: &State) -> Vec<ValidationError>`. Matches on `state.entity_type.as_str()`: for `"ethernet"`, delegates to `check_ethernet_addresses(state)`. For all other entity types, returns an empty `Vec`. This function is only called for known entity types (the unknown-entity-type early return in `validate()` happens before this call).
 
-**What**: The main schema validation module. Contains the following types and functions:
+- **New private function `check_ethernet_addresses`**: Signature: `fn check_ethernet_addresses(state: &State) -> Vec<ValidationError>`. Implements:
+  1. Extract the `addresses` field from `state.fields`. If absent or not `Value::List`, return empty vec.
+  2. Collect all string items from the list using `Value::as_str()` (skip non-string items — JSON Schema already reported type errors for those).
+  3. **Duplicate detection**: Use a `HashSet<&str>` to track seen addresses and a second `HashSet<&str>` for already-reported duplicates. For each address string: if already in `seen`, and not yet in `reported`, push a `ValidationError { field: "addresses".into(), kind: ConstraintViolation, message: format!("duplicate address \"{}\"", addr) }` and add to `reported`. Otherwise add to `seen`.
+  4. **IPv6 rejection**: For each address string, split on `'/'` and check if the prefix part contains `':'`. If so, push a `ValidationError { field: "addresses".into(), kind: InvalidFormat, message: format!("IPv6 address \"{}\" is not supported; use IPv4 CIDR format", addr) }`.
+  5. Return the collected errors.
 
-**Types:**
+  Both functions should be placed after the existing private helpers (after `parse_constraints`, before the `#[cfg(test)]` module), maintaining the existing code organization.
 
-- `pub enum FieldType` — variants: `String`, `Integer`, `Bool`, `Array`, `Object`, `IpAddress`, `IpNetwork`, `MacAddress`. Derives `Debug, Clone, PartialEq`.
+- **Modify `validate()` method** (lines 199-248): Change the `errors` binding on line 220 from `let errors: Vec<ValidationError>` to `let mut errors: Vec<ValidationError>`. After the `.collect()` on line 241, add: `errors.extend(run_custom_checks(state));`. The rest of the method (the empty check and return) remains unchanged.
 
-- `pub struct FieldConstraints` — fields: `pub min: Option<i64>`, `pub max: Option<i64>`, `pub pattern: Option<String>`. Derives `Debug, Clone, PartialEq`.
+**Why**: Closes Gap 1 (duplicate addresses) and Gap 2 (IPv6 rejection) from the understanding analysis. These are the only two acceptance criteria not yet satisfied.
 
-- `pub struct FieldSchemaInfo` — fields: `pub field_type: FieldType`, `pub required: bool`, `pub writable: bool`, `pub constraints: Option<FieldConstraints>`, `pub description: Option<String>`. Derives `Debug, Clone`.
+### 2. `crates/netfyr-state/src/schemas/ethernet.json` — no change
 
-- `pub enum ValidationErrorKind` — variants: `InvalidType`, `OutOfRange`, `UnknownField`, `MissingRequired`, `ReadOnlyField`, `InvalidFormat`, `ConstraintViolation`, `UnknownEntityType`. Derives `Debug, Clone, PartialEq`.
+No modifications. The permissive `addresses` pattern is intentional (see Design Decision 1).
 
-- `pub struct ValidationError` — fields: `pub field: String`, `pub message: String`, `pub kind: ValidationErrorKind`. Derives `Debug, Clone`.
+### 3. `crates/netfyr-state/src/lib.rs` — no change
 
-- `pub struct ValidationErrors` — wraps `Vec<ValidationError>`. Implements `std::fmt::Display` (lists all errors, one per line) and `std::error::Error` via `thiserror`. Has methods:
-  - `pub fn errors(&self) -> &[ValidationError]`
-  - `pub fn len(&self) -> usize`
-  - `pub fn is_empty(&self) -> bool`
+All schema types are already re-exported. No new public types are being added.
 
-- `pub struct EntitySchema` — fields: `validator: jsonschema::JSONSchema` (or `Validator` depending on crate version — the compiled schema), `fields: HashMap<String, FieldSchemaInfo>` (parsed metadata for each field), `raw: serde_json::Value` (the raw schema JSON for reference). Methods:
-  - `fn field_info(&self, field: &str) -> Option<&FieldSchemaInfo>`
+### 4. `crates/netfyr-state/Cargo.toml` — no change
 
-- `pub struct SchemaRegistry` — fields: `schemas: HashMap<String, EntitySchema>`. Methods detailed below.
-
-**Constant:**
-- `const ETHERNET_SCHEMA: &str = include_str!("schemas/ethernet.json");` — embeds the ethernet schema at compile time.
-
-**`SchemaRegistry` methods:**
-
-- `pub fn new() -> Self` — Creates the registry, parses and compiles all embedded schemas. For each schema: parse the JSON string via `serde_json::from_str`, extract the `title` field as the entity type name, compile the JSON Schema via the `jsonschema` crate, parse field metadata from `properties` (extracting `type`, `minimum`, `maximum`, `pattern`, `x-netfyr-writable`, `description`, and checking `required` array), store in the `schemas` map. Panics if an embedded schema is malformed (these are compile-time constants, so a panic is a build-time bug).
-
-- `pub fn validate(&self, state: &State) -> Result<(), ValidationErrors>` — Looks up the schema by `state.entity_type`. If not found, returns `ValidationErrors` with a single `UnknownEntityType` error. Otherwise, converts `state.fields` to a `serde_json::Value` object (a JSON object mapping field names to converted values), runs the compiled validator's `iter_errors()`, maps each `jsonschema` error to a `ValidationError` (converting the instance path and classifying the error kind), and returns all collected errors.
-
-- `pub fn validate_writable(&self, state: &State) -> Result<(), ValidationErrors>` — Calls `validate()` first. If that fails, starts with those errors. Then additionally iterates `state.fields` and checks each field name against the `EntitySchema.fields` metadata: if a field has `writable: false`, adds a `ReadOnlyField` error. Returns all errors combined.
-
-- `pub fn get_schema(&self, entity_type: &str) -> Option<&EntitySchema>` — Simple lookup in the `schemas` map.
-
-- `pub fn entity_types(&self) -> Vec<&str>` — Returns keys of the `schemas` map as `&str` references.
-
-- `pub fn field_info(&self, entity_type: &str, field: &str) -> Option<FieldSchemaInfo>` — Looks up the entity schema, then the field within it. Returns a cloned `FieldSchemaInfo` if found.
-
-**Helper functions (private):**
-
-- `fn fields_to_json(fields: &IndexMap<String, FieldValue>) -> serde_json::Value` — Iterates `fields`, extracts `field_value.value` from each `FieldValue`, converts via `From<&Value> for serde_json::Value`, assembles a `serde_json::Map`.
-
-- `fn json_pointer_to_field_path(pointer: &str) -> String` — Converts a JSON Pointer like `/routes/0/destination` to `routes[0].destination`. Algorithm: split on `/`, skip first empty segment, for each segment check if it's a pure integer (wrap in `[N]` and append to previous) or a field name (join with `.`).
-
-- `fn classify_error(error: &jsonschema::ValidationError) -> ValidationErrorKind` — Maps the `jsonschema` error's kind/type to `ValidationErrorKind`. Mapping: type mismatch -> `InvalidType`, minimum/maximum violation -> `OutOfRange`, pattern mismatch -> `InvalidFormat`, additional properties -> `UnknownField`, required property missing -> `MissingRequired`, everything else -> `ConstraintViolation`.
-
-**`impl From<&Value> for serde_json::Value`:**
-- `Value::String(s)` -> `serde_json::Value::String(s.clone())`
-- `Value::U64(n)` -> `serde_json::Value::Number(n.into())`
-- `Value::I64(n)` -> `serde_json::Value::Number(n.into())`
-- `Value::Bool(b)` -> `serde_json::Value::Bool(b)`
-- `Value::IpAddr(ip)` -> `serde_json::Value::String(ip.to_string())`
-- `Value::IpNetwork(net)` -> `serde_json::Value::String(net.to_string())`
-- `Value::List(v)` -> `serde_json::Value::Array(v.iter().map(|x| x.into()).collect())`
-- `Value::Map(m)` -> `serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), v.into())).collect())`
-
-**Why**: This is the core of the story — all schema validation types and logic live here.
-
-### 3. `crates/netfyr-state/src/lib.rs` — MODIFY
-
-**What**: Add `pub mod schema;` declaration and re-export the public types:
-```
-pub use schema::{
-    EntitySchema, FieldConstraints, FieldSchemaInfo, FieldType, SchemaRegistry,
-    ValidationError, ValidationErrorKind, ValidationErrors,
-};
-```
-
-**Why**: Makes schema types part of the `netfyr-state` public API, consistent with how `diff`, `loader`, `set`, and `yaml` modules are re-exported.
-
-### 4. `crates/netfyr-state/Cargo.toml` — MODIFY
-
-**What**: Add `jsonschema` dependency. Use version `"0.26"` as primary choice; if dependency resolution fails (e.g., due to conflicting `serde_json` version requirements), try `"0.28"` or the latest compatible version.
-
-**Why**: Required for JSON Schema compilation and validation. No std alternative exists for JSON Schema validation.
+`jsonschema = "0.26"` and `serde_json = "1"` are already present.
 
 ## Dependencies
 
-| Crate | Version | Justification |
-|---|---|---|
-| `jsonschema` | `"0.26"` (or latest compatible) | JSON Schema validation — compiling schemas and validating JSON instances against them. The Rust standard library has no JSON Schema support. This is the most widely used JSON Schema crate in the Rust ecosystem. |
-
-All other required crates (`serde_json`, `thiserror`, `indexmap`) are already dependencies.
+No new crate dependencies are needed. The implementation uses only:
+- `std::collections::HashSet` (standard library) — for tracking seen/reported addresses during duplicate detection.
+- Existing `Value::as_list()` and `Value::as_str()` accessors already defined on the `Value` enum in `lib.rs`.
+- Existing `state.fields` `IndexMap<String, FieldValue>` access pattern already used by `fields_to_json()`.
 
 ## Implementation Order
 
-1. **Create `src/schemas/ethernet.json`** — The JSON Schema file. No Rust code depends on this compiling yet, but having it first lets us verify the schema is valid JSON. No compilation step needed.
+1. **Add `HashSet` import and the two private helper functions** (`run_custom_checks` and `check_ethernet_addresses`) in `schema.rs`, placed after the existing private helpers and before the `#[cfg(test)]` module. At this point the functions are dead code — the project compiles but they are unused.
 
-2. **Add `jsonschema` to `Cargo.toml`** — Required before `schema.rs` can reference it. After this step, `cargo check` should still pass (no new Rust code yet).
+2. **Modify `validate()` to call `run_custom_checks`**: Change `let errors` to `let mut errors` and add `errors.extend(run_custom_checks(state))` after the JSON Schema error collection. After this step, all acceptance criteria are satisfied at the code level.
 
-3. **Create `src/schema.rs` with types only** — Define all public types (`FieldType`, `FieldConstraints`, `FieldSchemaInfo`, `ValidationErrorKind`, `ValidationError`, `ValidationErrors`, `EntitySchema`, `SchemaRegistry`) with their struct/enum definitions and basic impls (`Display` for `ValidationErrors`, `From<&Value> for serde_json::Value`). Add the `ETHERNET_SCHEMA` constant. Leave `SchemaRegistry` methods as `todo!()` stubs. This step depends on step 1 (the JSON file must exist for `include_str!` to compile) and step 2 (the `jsonschema` crate must be available).
+3. **Add unit tests** for the two new scenarios in the existing `#[cfg(test)] mod tests` block. These verify the acceptance criteria end-to-end. (Described in Test Strategy below.)
 
-4. **Update `src/lib.rs`** — Add `pub mod schema;` and re-exports. After this step, `cargo check` should pass with `todo!()` stubs.
-
-5. **Implement `SchemaRegistry::new()` and schema parsing** — Parse the embedded JSON, compile via `jsonschema`, extract field metadata from the `properties` object. This is the most complex function — it must correctly parse `type`, `minimum`, `maximum`, `pattern`, `x-netfyr-writable`, `description`, and the `required` array from the JSON Schema.
-
-6. **Implement `validate()` and helper functions** — `fields_to_json()`, `json_pointer_to_field_path()`, `classify_error()`, and `validate()`. Depends on step 5 (needs a constructed registry to validate against).
-
-7. **Implement `validate_writable()`** — Builds on `validate()` from step 6, adds the read-only field check pass.
-
-8. **Implement `get_schema()`, `entity_types()`, `field_info()`** — Simple accessors. Can be done in parallel with steps 6-7 but logically completes the API.
+Each step results in a compilable state. Steps 1 and 2 are the functional changes; step 3 is verification.
 
 ## Risks and Mitigations
 
-1. **`jsonschema` crate API instability across versions**
-   - **Risk**: The `jsonschema` crate has undergone significant API changes. Version 0.26 uses `JSONSchema::compile()` + `ValidationError` with `instance_path: JSONPointer` and `kind: ValidationErrorKind`. Version 0.46 restructured to `Validator` + different error types.
-   - **Mitigation**: Pin to `"0.26"`. If 0.26 has dependency conflicts with the existing `serde_json = "1"`, try 0.28 (same API). If neither works, use the latest version and adapt the `classify_error()` function to work with the available error API — the core validation flow (compile schema, iterate errors, extract path) is conceptually the same across versions. The implementer should check `cargo check` after adding the dependency and adapt if needed.
+1. **Risk: `Value::List` items might not be `Value::String`**.
+   - If an address list item is a non-string value (e.g., `Value::U64(42)`), JSON Schema catches it as an `InvalidType` error. The custom check uses `Value::as_str()`, which returns `None` for non-strings — those items are silently skipped.
+   - **Mitigation**: Guard each item with `if let Some(addr_str) = item.as_str()`.
 
-2. **`Value::IpAddr` and `Value::IpNetwork` serialize as strings but schema expects strings**
-   - **Risk**: The `Value` enum has typed IP variants, but the JSON Schema defines these fields as `"type": "string"` with patterns. The conversion must produce JSON strings, not some other representation.
-   - **Mitigation**: The `From<&Value> for serde_json::Value` impl explicitly calls `.to_string()` for `IpAddr` and `IpNetwork`, producing JSON strings that match the schema's string type and pattern constraints.
+2. **Risk: `FieldValue` wrapper around `Value`**.
+   - `state.fields` is `IndexMap<String, FieldValue>`, not `IndexMap<String, Value>`. The custom check must access `fv.value` to get the `Value`.
+   - **Mitigation**: Access as `state.fields.get("addresses").map(|fv| &fv.value)`, following the pattern already used by `fields_to_json`.
 
-3. **CIDR and IP address regex patterns may be too strict or too loose**
-   - **Risk**: A regex like `^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$` matches `999.999.999.999/99` which isn't valid. But a fully correct IPv4+IPv6 CIDR regex is extremely complex.
-   - **Mitigation**: Use a reasonable structural pattern in the JSON Schema for basic format validation. Deep IP validation happens at the `Value` type level (the YAML parser already produces `Value::IpNetwork` which is validated by the `ipnetwork` crate). The schema pattern is a first line of defense against obviously wrong strings, not a replacement for type-level validation.
+3. **Risk: An address string with no `/` delimiter**.
+   - If someone provides `"10.0.0.1"` (no CIDR prefix), `split_once('/')` returns `None`. The IPv6 check should still work by examining the entire string.
+   - **Mitigation**: Use `addr.split_once('/').map_or(addr, |(prefix, _)| prefix).contains(':')` to handle both cases.
 
-4. **`jsonschema` error kind mapping may be incomplete**
-   - **Risk**: The `jsonschema` crate may produce error kinds not anticipated in `classify_error()`, leading to unexpected `ConstraintViolation` fallback.
-   - **Mitigation**: The `ConstraintViolation` variant serves as a catch-all. The most important kinds to map correctly are: type mismatch (`InvalidType`), min/max violation (`OutOfRange`), additional properties (`UnknownField`), required (`MissingRequired`), and pattern (`InvalidFormat`). Log or include the original error message in the `ValidationError.message` field so users still get useful information even if the kind mapping is imprecise.
+4. **Risk: Interaction between JSON Schema errors and custom errors for the same field**.
+   - If `addresses` has an item that fails the JSON Schema pattern AND is IPv6, the user could see two errors. However, because the addresses pattern is permissive (accepts `:`), IPv6 strings actually *pass* the pattern check. Only the custom "IPv6 not supported" error appears. This is the intended behavior.
+   - **Mitigation**: No action needed — the permissive pattern prevents double errors.
 
-5. **`include_str!` path resolution**
-   - **Risk**: `include_str!("schemas/ethernet.json")` resolves relative to the source file (`src/schema.rs`), so the JSON file must be at `src/schemas/ethernet.json`.
-   - **Mitigation**: This is straightforward — just ensure the directory structure is correct. The compiler will produce a clear error if the file doesn't exist.
-
-6. **Empty `State.fields` validation**
-   - **Risk**: A `State` with no fields should pass validation (no fields are required in the ethernet schema). But if the `fields_to_json()` function produces something unexpected for an empty map, it could fail.
-   - **Mitigation**: An empty `IndexMap` converts to an empty JSON object `{}`, which is valid against the ethernet schema since no fields are marked as required.
-
-7. **`validate_writable()` interaction with `validate()` errors**
-   - **Risk**: If `validate()` returns errors (e.g., type mismatch on `mtu`), `validate_writable()` should still report read-only field errors in addition. If it short-circuits on validation failure, it would miss reporting `ReadOnlyField` errors.
-   - **Mitigation**: `validate_writable()` collects validation errors from the JSON Schema pass AND read-only field errors independently, then combines them. It does not short-circuit.
+5. **Risk: `operstate` and `dns_servers` fields in ethernet.json are not in the spec table**.
+   - These extra fields are already present and do not affect any acceptance criteria. They should not be removed as they may be used by other parts of the system.
+   - **Mitigation**: Do not modify `ethernet.json`. Tests should not assume only the six spec-listed fields exist.
 
 ## Test Strategy
 
-### Unit tests (in `schema.rs` `#[cfg(test)]` module)
+**Unit tests** in `crates/netfyr-state/src/schema.rs` (inside the existing `mod tests` block). All tests use the existing `make_state` helper function. No new test infrastructure is needed.
 
-**SchemaRegistry construction:**
-- `new()` returns a registry where `entity_types()` includes `"ethernet"`
-- `get_schema("ethernet")` returns `Some`
-- `get_schema("nonexistent")` returns `None`
+Tests to add for the two missing acceptance-criteria scenarios:
 
-**Value to JSON conversion:**
-- Each `Value` variant converts to the expected `serde_json::Value`
-- `IpAddr` and `IpNetwork` produce JSON strings
-- Nested `List` and `Map` values convert recursively
+1. **Duplicate addresses are rejected**: Create a state with `addresses: ["10.0.1.50/24", "10.0.1.50/24"]`. Call `validate()`. Assert `Err`. Assert errors contain an error with `field == "addresses"`, `kind == ConstraintViolation`, and `message` containing the string `"10.0.1.50/24"`.
 
-**JSON pointer path conversion:**
-- `/mtu` -> `mtu`
-- `/routes/0/destination` -> `routes[0].destination`
-- `/routes/0` -> `routes[0]`
-- Empty path -> empty string
+2. **IPv6 addresses are rejected**: Create a state with `addresses: ["fe80::1/64"]`. Call `validate()`. Assert `Err`. Assert errors contain an error with `field == "addresses"`, `kind == InvalidFormat`, and `message` containing "IPv6" and "not supported".
 
-**Ethernet validation — valid states:**
-- State with only `mtu: 1500` passes
-- State with `addresses: ["10.0.1.50/24"]` passes
-- State with all writable fields passes
-- State with `mac` and `carrier` (read-only) passes `validate()` (read-only is allowed in regular validation)
-- State with routes containing valid route objects passes
-- Empty fields state passes (no required fields)
+3. **Non-duplicate IPv4 addresses pass**: Create a state with `addresses: ["10.0.1.50/24", "10.0.1.51/24"]`. Call `validate()`. Assert `Ok`.
 
-**Ethernet validation — invalid states:**
-- `mtu: 10` (below minimum 68) -> `OutOfRange` error for "mtu"
-- `mtu: 99999` (above maximum 65535) -> `OutOfRange` error for "mtu"
-- `mtu: "not a number"` (wrong type) -> `InvalidType` error for "mtu"
-- Unknown field `"mtt": 1500` -> `UnknownField` error for "mtt"
-- Route missing required `destination` -> `MissingRequired` error
-- Multiple errors collected simultaneously (e.g., bad `mtu` + unknown field)
+4. **Mixed custom and JSON Schema errors collected together**: Create a state with `mtu: 99999` (out of range) and `addresses: ["10.0.1.50/24", "10.0.1.50/24"]` (duplicate). Call `validate()`. Assert errors contain both an `OutOfRange` for `mtu` and a `ConstraintViolation` for `addresses`.
 
-**Writable validation:**
-- State with `mac: "aa:bb:cc:dd:ee:ff"` fails `validate_writable()` with `ReadOnlyField`
-- State with `carrier: true` fails `validate_writable()` with `ReadOnlyField`
-- State with only writable fields passes `validate_writable()`
-- Read-only errors combined with structural errors (e.g., bad `mtu` + `mac` present)
+5. **Empty addresses list passes**: Create a state with `addresses: []`. Call `validate()`. Assert `Ok`.
 
-**Unknown entity type:**
-- `validate()` on entity_type `"nonexistent"` returns `ValidationErrors` with `UnknownEntityType`
+6. **IPv6 in `validate_writable()` also caught**: Create a state with `addresses: ["fe80::1/64"]`. Call `validate_writable()`. Assert errors include `InvalidFormat` for `addresses` (inherited from `validate()`).
 
-**Field info queries:**
-- `field_info("ethernet", "mtu")` returns `Some` with `FieldType::Integer`, writable: true, required: false, constraints with min=68, max=65535
-- `field_info("ethernet", "carrier")` returns `Some` with `FieldType::Bool`, writable: false
-- `field_info("ethernet", "mac")` returns `Some` with `FieldType::MacAddress` (or `String` if we can't distinguish — see note), writable: false, pattern constraint present
-- `field_info("ethernet", "nonexistent")` returns `None`
-- `field_info("nonexistent_type", "mtu")` returns `None`
+7. **Triple duplicate emits one error**: Create a state with `addresses: ["10.0.0.1/24", "10.0.0.1/24", "10.0.0.1/24"]`. Call `validate()`. Assert exactly one `ConstraintViolation` error for `addresses` (not two).
 
-### Integration-level behaviors to verify
-- A `State` constructed via `parse_yaml()` (from SPEC-005) can be validated by `SchemaRegistry::validate()` — this verifies the two systems compose correctly. (This can be a test in a later story or tested manually.)
-
-### Test infrastructure needed
-- A helper function to construct a `State` with given entity_type and fields for concise test setup (e.g., `fn make_state(entity_type: &str, fields: Vec<(&str, Value)>) -> State`). This avoids boilerplate around `Selector`, `StateMetadata`, `FieldValue`, and `Provenance` in every test.
-
-### What NOT to test
-- The `jsonschema` crate's own correctness — we trust it validates JSON Schema correctly.
-- Serialization/deserialization of schema types — these are internal, not serialized over the wire.
+8. **Duplicate and IPv6 combined**: Create a state with `addresses: ["fe80::1/64", "fe80::1/64"]`. Call `validate()`. Assert errors include both a `ConstraintViolation` (duplicate) and an `InvalidFormat` (IPv6) for `addresses`.

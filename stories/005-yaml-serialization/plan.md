@@ -1,300 +1,147 @@
 # Plan: SPEC-005 YAML Serialization
 
+## Status: Implementation Complete
+
+All functional requirements from SPEC-005 are already implemented and tested. The `netfyr-state` crate contains fully working YAML serialization/deserialization in `src/yaml.rs`, file/directory loading in `src/loader.rs`, and correct re-exports in `src/lib.rs`. All 225 unit tests pass (verified via `cargo test -p netfyr-state --lib`). The only remaining work is cleaning up two stale test comments that describe a bug that has already been fixed.
+
 ## Approach
 
-The implementation adds two new modules to the `netfyr-state` crate: `yaml.rs` for custom flat-format serialization/deserialization logic, and `loader.rs` for file/directory loading. These are re-exported from `lib.rs`.
+The implementation uses a raw `serde_yaml::Value` conversion layer in `src/yaml.rs` to bridge the flat user-facing YAML format and the nested internal `State` struct. This avoids conflicting with the existing `#[derive(Serialize, Deserialize)]` on `State` (which produces a nested JSON-style representation). Top-level YAML keys are classified into entity type (`type`), selector properties (`name`, `driver`, `mac`, `pci_path`), meta properties (`kind`), and configuration fields (everything else). Value deserialization uses a heuristic: bool → Bool, int≥0 → U64, int<0 → I64, string with `/` → try IpNetwork, string without `/` → try IpAddr, fallback String, sequence → List, mapping → Map.
 
-The core design challenge is that the YAML user-facing format is *flat* (all keys at the top level) while the internal `State` struct is *nested* (entity_type, selector, fields are separate). The existing `#[derive(Serialize, Deserialize)]` on `State` produces a nested JSON-style representation — it cannot be reused for YAML. Similarly, `Value`'s `#[serde(untagged)]` derive doesn't handle the IP-address-vs-string ambiguity in YAML (where IPs arrive as plain YAML strings, not typed values). Therefore, we build a manual conversion layer that operates on raw `serde_yaml::Value` objects, classifying keys by role (entity type, selector, meta, config) and applying type-inference heuristics for values. This avoids fighting serde's derive system and keeps the existing JSON serialization entirely untouched.
+The alternative of implementing custom `Serialize`/`Deserialize` traits on `State` was correctly rejected — it would risk breaking the existing JSON serialization path. A separate `YamlState` DTO was also rejected to avoid type duplication. The raw-value approach is simpler, testable, and isolated.
 
-The alternative — implementing custom `Serialize`/`Deserialize` traits on `State` with format-switching logic — would be more complex and risk breaking the existing JSON path. Another alternative — creating a separate `YamlState` DTO struct — would add unnecessary type duplication. The raw-value approach is simpler: parse YAML into `serde_yaml::Value`, manually extract fields by classification, and construct `State` directly.
-
-For directory loading, `walkdir` provides recursive traversal with `DirEntry`-level filtering for hidden files. Since `StateSet::insert()` silently replaces duplicates, `load_dir` must pre-check with `StateSet::get()` before each insert to detect and error on duplicate entity keys across files.
+Directory loading in `src/loader.rs` uses `walkdir` for recursive traversal with `filter_entry` to skip hidden files/directories. Duplicate entity detection uses `StateSet::get()` before `insert()` since `insert()` silently replaces.
 
 ## Design Decisions
 
 1. **Module naming: `yaml` not `serde`**
-   - **Decision**: Name the module `yaml` (file: `src/yaml.rs`), not `serde` as the spec suggests.
-   - **Alternatives considered**: `serde.rs` (spec suggestion), `yaml_serde.rs`, `serde_yaml_support.rs`.
-   - **Rationale**: `pub mod serde;` in `lib.rs` conflicts with the external `serde` crate name that is used extensively via `use serde::{Serialize, Deserialize}`. Rust's module resolution would shadow the crate. `yaml` is short, clear, and idiomatic.
+   - **Decision**: The module is named `yaml` (file: `src/yaml.rs`), not `serde` as the spec's implementation details section suggests.
+   - **Alternatives considered**: `serde.rs` (spec suggestion), `yaml_serde.rs`.
+   - **Rationale**: `pub mod serde;` in `lib.rs` would conflict with the external `serde` crate name used via `use serde::{Serialize, Deserialize}`. Rust's module resolution would shadow the crate. `yaml` is clear and idiomatic. This deviation from the spec is cosmetic — all public API signatures match.
 
 2. **Raw `serde_yaml::Value` conversion instead of custom Deserialize impl**
-   - **Decision**: Parse YAML into `serde_yaml::Value`, then manually convert to `State` via `parse_raw_to_state()`. Do not implement `serde::Deserialize` for a YAML-specific `State` representation.
-   - **Alternatives considered**: Custom `Deserialize` impl on `State` (or a `FlatState` DTO).
-   - **Rationale**: A custom `Deserialize` on `State` would break JSON deserialization or require `#[serde(deserialize_with)]` gymnastics. A DTO adds type duplication. Raw value conversion is straightforward, testable, and isolated from the existing serde derives.
+   - **Decision**: Parse YAML into `serde_yaml::Value`, then manually convert to `State` via `parse_raw_to_state()`.
+   - **Alternatives considered**: Custom `Deserialize` impl on `State`, `FlatState` DTO.
+   - **Rationale**: A custom `Deserialize` on `State` would break JSON deserialization. A DTO adds type duplication. Raw value conversion is straightforward and testable.
 
 3. **Error type: `YamlError` enum using `thiserror`**
-   - **Decision**: Define `pub enum YamlError` in `yaml.rs` with variants for parse errors, IO errors, missing fields, invalid kind, MAC parse failures, and duplicate keys. Use `thiserror` (already a dependency) for `Display`/`Error` derives.
-   - **Alternatives considered**: A single struct with an error kind enum; `anyhow::Error`.
-   - **Rationale**: `thiserror` enum is idiomatic for library crates. Distinct variants allow callers to match on error types. `anyhow` is inappropriate for a library crate — it erases error types.
+   - **Decision**: `pub enum YamlError` in `yaml.rs` with 9 variants: `Parse`, `Io`, `MissingType`, `InvalidKind`, `InvalidMac`, `DuplicateKey`, `InvalidValue`, `ExpectedMapping`, `ExpectedString`.
+   - **Alternatives considered**: Single struct with kind enum; `anyhow::Error`.
+   - **Rationale**: `thiserror` enum is idiomatic for library crates. Distinct variants allow callers to match on error types. Already a dependency.
 
 4. **Unknown `kind` values are errors**
-   - **Decision**: If `kind` is present and is not `"state"`, `parse_yaml` returns an error.
-   - **Alternatives considered**: Skip unknown kinds silently (to be forwards-compatible with SPEC-007's `kind: policy`).
-   - **Rationale**: The spec says "return error (or skip, depending on context)" and SPEC-007 is not yet implemented. Erroring is safer — when SPEC-007 lands, it can adjust `parse_yaml` to handle `kind: policy` or the caller can pre-filter documents. Silent skipping could mask typos like `kind: stat`.
+   - **Decision**: If `kind` is present and not `"state"`, `parse_yaml` returns `InvalidKind` error.
+   - **Alternatives considered**: Skip unknown kinds silently.
+   - **Rationale**: Erroring is safer — prevents typos like `kind: stat`. When SPEC-007 (policies) needs `kind: policy`, the policy loader handles its own parsing path, not `parse_yaml`.
 
-5. **Explicit format serialization via a boolean parameter**
-   - **Decision**: Provide `pub fn serialize_state(state: &State) -> serde_yaml::Value` (bare, no `kind`) and `pub fn serialize_state_explicit(state: &State) -> serde_yaml::Value` (with `kind: state`). Alternatively, a single function `pub fn state_to_yaml(state: &State, explicit: bool) -> String` that calls the appropriate internal function and renders to a YAML string.
-   - **Alternatives considered**: A format enum (`YamlFormat::Bare | Explicit`), builder pattern.
-   - **Rationale**: Two use cases exist (bare for user output, explicit for policy embedding). A boolean or two functions is the simplest representation. A format enum is overkill for a two-option toggle. Choose two functions for clarity and to avoid boolean-argument ambiguity.
+5. **Two separate serialization functions instead of a boolean parameter**
+   - **Decision**: `state_to_yaml()` for bare format, `state_to_yaml_explicit()` for `kind: state` format. Internal helpers `serialize_state_to_value()` (public, for policy embedding) and `serialize_state_to_value_explicit()` (private).
+   - **Alternatives considered**: Single function with boolean `explicit` parameter.
+   - **Rationale**: Two functions avoids boolean-argument ambiguity. `serialize_state_to_value()` is public so `netfyr-policy` can embed flat-format states in policy YAML.
 
-6. **`Selector.mac` stored as `Option<MacAddr>`, parsed from YAML string**
-   - **Decision**: When the YAML contains `mac: "aa:bb:cc:dd:ee:ff"`, parse it via `MacAddr::from_str()` and store in `selector.mac`. Propagate parse errors as `YamlError::InvalidMac`.
-   - **Alternatives considered**: Store MAC as a string in the selector.
-   - **Rationale**: `Selector.mac` is already `Option<MacAddr>`, so we must parse. The existing `MacAddr::from_str` handles validation.
+6. **`parse_state_value` as public entry point**
+   - **Decision**: `pub fn parse_state_value(raw: serde_yaml::Value) -> Result<State, YamlError>` wraps `parse_raw_to_state` as a public API for SPEC-007 policy embedding.
+   - **Alternatives considered**: Making `parse_raw_to_state` public directly.
+   - **Rationale**: Provides a stable public API name distinct from the internal implementation function, even though they're currently identical. SPEC-007's policy parser needs to convert embedded `state:` sub-documents without re-serializing to strings.
 
-7. **`Selector.entity_type` left as `None` in YAML deserialization**
-   - **Decision**: The flat YAML `type` key maps to `State.entity_type` only. `Selector.entity_type` is not populated from YAML.
-   - **Alternatives considered**: Copy `type` into both `State.entity_type` and `Selector.entity_type`.
-   - **Rationale**: The understanding analysis identifies that `Selector.entity_type` is for runtime matching, not user configuration. The spec's `SELECTOR_KEYS` constant deliberately excludes `entity_type`. Populating it would conflate two distinct uses.
+7. **`Selector.entity_type` not populated from YAML**
+   - **Decision**: The flat YAML `type` key maps only to `State.entity_type`. `Selector.entity_type` remains `None`.
+   - **Alternatives considered**: Copy `type` into both.
+   - **Rationale**: `Selector.entity_type` is for runtime matching, not user configuration. The spec's `SELECTOR_KEYS` constant deliberately excludes `entity_type`.
 
-8. **`Selector.labels` not populated from YAML**
-   - **Decision**: YAML deserialization does not populate `Selector.labels`. Labels are not in `SELECTOR_KEYS`.
-   - **Alternatives considered**: Treating a top-level `labels` key as selector labels.
-   - **Rationale**: The spec defines the selector keys as `["name", "driver", "mac", "pci_path"]`. A `labels` key in YAML would go into `fields`, not the selector. This matches the property classification rules.
+8. **IP address heuristic: `/` guard prevents bare IPs from matching IpNetwork**
+   - **Decision**: Before attempting `Ipv4Network::from_str`, check if the string contains `/`. Only attempt IpNetwork parse if `/` is present.
+   - **Alternatives considered**: Always try IpNetwork first (the `ipnetwork` crate accepts bare IPs as /32 host routes).
+   - **Rationale**: Without the guard, `"10.0.1.1"` would parse as `IpNetwork(10.0.1.1/32)` instead of `IpAddr(10.0.1.1)`, violating the spec. The `/` guard ensures bare IPs fall through to the `IpAddr` branch. This is implemented at `yaml.rs:110`.
 
-9. **Hidden file filtering applies to file names and directory names**
-   - **Decision**: Skip any `walkdir` entry whose file name (final path component) starts with `.`. This applies to both files and directories, effectively skipping hidden directories entirely.
-   - **Alternatives considered**: Only skip hidden files, descend into hidden directories.
-   - **Rationale**: Hidden directories (`.git`, `.backup/`) are conventionally excluded from configuration loading. `walkdir` supports `filter_entry` which skips entire subtrees, which is both correct and efficient.
+9. **Empty YAML documents silently skipped**
+   - **Decision**: In `parse_yaml`, `serde_yaml::Value::Null` documents (from `---` separators with nothing between them) are skipped.
+   - **Alternatives considered**: Error on empty documents.
+   - **Rationale**: Users commonly have trailing `---` separators. Erroring would be annoying. Skipping is harmless.
 
-10. **Floating-point YAML numbers produce an error**
-    - **Decision**: If a YAML number is floating-point (e.g., `1500.0`), return a `YamlError` indicating that float values are not supported.
-    - **Alternatives considered**: Truncate to integer, store as string, add a `Float` variant.
-    - **Rationale**: The `Value` enum has no float variant. Silently truncating could lose data. The spec doesn't mention floats. Erroring is the safest behavior and guides users to use integers.
-
-11. **YAML null values produce an error**
-    - **Decision**: A YAML `null` value in a field position returns an error.
-    - **Alternatives considered**: Skip null fields, map to an empty string.
-    - **Rationale**: `Value` has no null/none variant. Skipping silently could mask user intent. An explicit error is clearer.
-
-12. **Duplicate key error in `load_dir` includes filenames**
-    - **Decision**: Track which file each state came from. On duplicate, the error message includes both the entity key and the file path where the duplicate was found.
-    - **Alternatives considered**: Just report the entity key without file paths.
-    - **Rationale**: Users need to know which files conflict to fix the issue. We track `(entity_type, selector_key) -> PathBuf` in a HashMap during loading.
+10. **Hidden file filtering: depth-0 root always included**
+    - **Decision**: `filter_entry` in `load_dir` always returns `true` for `entry.depth() == 0`. Hidden-name filtering only applies at depth > 0.
+    - **Alternatives considered**: Filter at all depths.
+    - **Rationale**: If the user explicitly names a hidden directory (e.g., `load_dir(".policies/")`), they intend to load it. Only skip hidden entries found during recursion.
 
 ## File Changes
 
 ### `crates/netfyr-state/Cargo.toml`
-- **Action**: modify
-- **What**: Add two new dependencies:
-  - `serde_yaml = "0.9"` — YAML parsing and emission
-  - `walkdir = "2"` — recursive directory traversal
-- **Why**: These are required by the spec. `serde_yaml` 0.9 provides `serde_yaml::Deserializer::from_str` for multi-document parsing and `serde_yaml::Value` for raw value manipulation. `walkdir` provides `WalkDir` with `filter_entry` for hidden-file skipping.
+- **Action**: no change needed (already has `serde_yaml = "0.9"` and `walkdir = "2"`)
 
 ### `crates/netfyr-state/src/yaml.rs`
-- **Action**: create
-- **What**: This module contains all YAML-specific serialization and deserialization logic.
-
-  **Constants**:
-  - `const SELECTOR_KEYS: &[&str] = &["name", "driver", "mac", "pci_path"];`
-  - `const META_KEYS: &[&str] = &["kind", "type"];`
-
-  **Error type**:
-  - `pub enum YamlError` with variants:
-    - `Parse(serde_yaml::Error)` — YAML syntax error
-    - `Io { path: PathBuf, source: std::io::Error }` — file read error
-    - `MissingType` — document has no `type` key
-    - `InvalidKind(String)` — `kind` is present but not `"state"`
-    - `InvalidMac { value: String, source: MacAddrParseError }` — `mac` key can't be parsed
-    - `DuplicateKey { entity_type: String, selector_key: String, path: PathBuf }` — duplicate entity in directory load
-    - `InvalidValue(String)` — unsupported YAML value (null, float)
-    - `ExpectedMapping` — document is not a YAML mapping
-    - `ExpectedString { key: String }` — a selector key or `type` is not a string
-  - Implement `std::fmt::Display` and `std::error::Error` via `#[derive(thiserror::Error)]`.
-
-  **Value conversion functions**:
-  - `pub fn deserialize_value(v: &serde_yaml::Value) -> Result<Value, YamlError>` — Converts a `serde_yaml::Value` to the crate's `Value` enum using the heuristic:
-    1. `Value::Bool` if YAML bool
-    2. `Value::Number` → check `as_u64()` first (returns `Value::U64`), then `as_i64()` (returns `Value::I64`), then error if float
-    3. YAML string → try `IpNetwork::from_str()`, then `IpAddr::from_str()`, fall back to `Value::String`
-    4. YAML sequence → `Value::List` (recurse on each element)
-    5. YAML mapping → `Value::Map` (recurse on each value; keys must be strings)
-    6. YAML null → error
-    7. YAML tagged → error (not expected)
-
-  - `pub fn serialize_value(v: &Value) -> serde_yaml::Value` — Converts the crate's `Value` to a `serde_yaml::Value`:
-    - `Value::Bool(b)` → `serde_yaml::Value::Bool(b)`
-    - `Value::U64(n)` → `serde_yaml::Value::Number(n.into())`
-    - `Value::I64(n)` → `serde_yaml::Value::Number(n.into())`
-    - `Value::String(s)` → `serde_yaml::Value::String(s.clone())`
-    - `Value::IpAddr(ip)` → `serde_yaml::Value::String(ip.to_string())`
-    - `Value::IpNetwork(net)` → `serde_yaml::Value::String(net.to_string())`
-    - `Value::List(items)` → `serde_yaml::Value::Sequence(items.iter().map(serialize_value).collect())`
-    - `Value::Map(map)` → `serde_yaml::Value::Mapping(...)` (recurse on values)
-
-  **State parsing**:
-  - `fn parse_raw_to_state(raw: serde_yaml::Value) -> Result<State, YamlError>` — Takes a single YAML document as a `serde_yaml::Value`:
-    1. Verify it's a Mapping, else return `ExpectedMapping`.
-    2. Check for `kind` key: if present and not `"state"`, return `InvalidKind`.
-    3. Extract `type` key as string → `entity_type`. Return `MissingType` if absent.
-    4. Build `Selector`: iterate `SELECTOR_KEYS`, extract each if present. For `mac`, call `MacAddr::from_str()`. For others, extract as string. Leave `entity_type`, `labels` as defaults on Selector.
-    5. Build `fields: IndexMap<String, FieldValue>`: iterate all mapping entries, skip those whose key is in `META_KEYS` or `SELECTOR_KEYS`. For each remaining entry, call `deserialize_value()` on the value, wrap in `FieldValue { value, provenance: Provenance::UserConfigured { policy_ref: "".to_string() } }`.
-    6. Construct and return `State { entity_type, selector, fields, metadata: StateMetadata::new(), policy_ref: None, priority: 100 }`.
-
-  **Multi-document parsing**:
-  - `pub fn parse_yaml(input: &str) -> Result<Vec<State>, YamlError>` — Uses `serde_yaml::Deserializer::from_str(input)` to iterate over YAML documents. For each document, deserialize into `serde_yaml::Value`, then call `parse_raw_to_state()`. Collect results into a `Vec<State>`. Return empty vec for empty input.
-
-  **State serialization**:
-  - `pub fn state_to_yaml(state: &State) -> Result<String, YamlError>` — Calls `serialize_state_to_value(state)` and renders to a YAML string via `serde_yaml::to_string()`.
-  - `pub fn state_to_yaml_explicit(state: &State) -> Result<String, YamlError>` — Same but inserts `kind: state` as the first key.
-  - `fn serialize_state_to_value(state: &State) -> serde_yaml::Value` — Builds a `serde_yaml::Mapping`:
-    1. Insert `"type"` → entity_type.
-    2. For each selector field (`name`, `driver`, `mac`, `pci_path`): if `Some`, insert the key with the string value. For `mac`, use `MacAddr::to_string()`.
-    3. For each entry in `state.fields`: insert the key with `serialize_value(&fv.value)`.
-    4. Return as `serde_yaml::Value::Mapping`.
-  - `fn serialize_state_to_value_explicit(state: &State) -> serde_yaml::Value` — Same as above but inserts `"kind": "state"` before `"type"`.
-
-- **Why**: This module encapsulates the flat-format YAML logic, keeping it separate from the existing serde derives. The raw-value approach avoids conflicting with `State`'s existing `Serialize`/`Deserialize` impls.
+- **Action**: modify (cleanup only)
+- **What**: Fix two stale test comments that describe a bug that has already been fixed by the `/` guard at line 110:
+  1. `test_deserialize_value_ip_addr_string_becomes_ip_addr` (line ~467-475): Remove the "BUG:" comment block that says "will fail until the heuristic is fixed." The heuristic IS fixed. The test passes.
+  2. `test_round_trip_yaml_ip_addr_becomes_ip_network_bug` (line ~962-969): Remove the "BUG:" comment and rename the test to `test_round_trip_yaml_ip_addr_preserves_correctly` (or similar). The comment claims the result is `Value::IpNetwork` but the assertion correctly expects `Value::IpAddr`, and the test passes. Also update the comment in `test_round_trip_yaml_various_field_types` (line ~905-912) that references this "bug" — remove the mention since it's not a bug anymore.
+- **Why**: Stale comments claiming bugs exist in working code mislead future developers. The tests themselves are correct and pass; only the comments are wrong.
 
 ### `crates/netfyr-state/src/loader.rs`
-- **Action**: create
-- **What**: File and directory loading functions.
-
-  - `pub fn load_file(path: &Path) -> Result<Vec<State>, YamlError>` — Reads the file contents via `std::fs::read_to_string()`, wraps IO errors with the file path (using `YamlError::Io`), then calls `parse_yaml()` on the contents.
-
-  - `pub fn load_dir(path: &Path) -> Result<StateSet, YamlError>` — Recursively loads a directory:
-    1. Create `WalkDir::new(path)` with `filter_entry` that skips entries whose file name starts with `.` (hidden files/directories). This uses `entry.file_name().to_str().map_or(false, |s| !s.starts_with('.'))` as the filter predicate. Note: the root directory itself should not be filtered (it's the path the user specified), so the filter only applies to entries below the root — `walkdir` handles this correctly since the root entry's file name is the directory name, which typically doesn't start with `.`.
-    2. For each file entry (skip directories): check if the extension is `"yaml"` or `"yml"`. Skip others.
-    3. Call `load_file()` on each matching file.
-    4. For each `State` returned, compute the key `(entity_type, selector.key())`. Check if `StateSet::get(entity_type, selector_key)` returns `Some` — if so, return `YamlError::DuplicateKey` with the entity key and the current file path. Otherwise, call `StateSet::insert()`.
-    5. Return the populated `StateSet`.
-
-  - Note on WalkDir error handling: `walkdir` entries can themselves be errors (permission denied, broken symlinks). These should be propagated as IO errors with path context.
-
-- **Why**: Separating file I/O from parsing logic keeps `yaml.rs` focused on data transformation and `loader.rs` focused on filesystem interaction. This separation makes `yaml.rs` independently testable without filesystem fixtures.
+- **Action**: no change needed (fully implemented)
 
 ### `crates/netfyr-state/src/lib.rs`
-- **Action**: modify
-- **What**:
-  1. Add `pub mod yaml;` and `pub mod loader;` module declarations after the existing `pub mod set;`.
-  2. Add re-exports:
-     - `pub use yaml::{parse_yaml, state_to_yaml, state_to_yaml_explicit, deserialize_value, serialize_value, YamlError};`
-     - `pub use loader::{load_file, load_dir};`
-- **Why**: Makes the YAML parsing and loading functions part of the crate's public API, accessible as `netfyr_state::parse_yaml(...)` etc.
+- **Action**: no change needed (all re-exports present)
 
 ## Dependencies
 
-| Crate | Version | Justification |
-|-------|---------|---------------|
-| `serde_yaml` | `"0.9"` | Required for YAML parsing and emission. Provides `serde_yaml::Deserializer::from_str` for multi-document iteration, `serde_yaml::Value` for raw value manipulation, and `serde_yaml::to_string` for rendering. No std alternative exists. |
-| `walkdir` | `"2"` | Required for recursive directory traversal in `load_dir`. `std::fs::read_dir` is not recursive and would require manual recursion with hidden-file filtering. `walkdir` provides `filter_entry` for efficient subtree pruning and handles symlinks and permission errors. |
+No new dependencies needed. Both required crates are already in `Cargo.toml`:
+
+| Crate | Version | Status |
+|-------|---------|--------|
+| `serde_yaml` | `"0.9"` | Already present |
+| `walkdir` | `"2"` | Already present |
 
 ## Implementation Order
 
-1. **Add dependencies to `Cargo.toml`** — Add `serde_yaml` and `walkdir`. This enables all subsequent steps to compile.
+1. **Fix stale test comment in `test_deserialize_value_ip_addr_string_becomes_ip_addr`** — Remove the misleading "BUG:" comment block (lines ~468-475). The heuristic works correctly with the `/` guard at line 110.
 
-2. **Create `src/yaml.rs` with error type and constants** — Define `YamlError`, `SELECTOR_KEYS`, `META_KEYS`. These are prerequisites for all functions. Compilable: yes (the error type stands alone).
+2. **Fix stale test name and comment in `test_round_trip_yaml_ip_addr_becomes_ip_network_bug`** — Rename to `test_round_trip_yaml_ip_addr_round_trips_correctly`. Remove the "BUG:" comment block (lines ~962-969) that claims the result is `IpNetwork`. The assertion already correctly expects `Value::IpAddr`.
 
-3. **Implement `deserialize_value` and `serialize_value` in `yaml.rs`** — The value conversion functions. These depend on the `Value` enum from `lib.rs` and `serde_yaml::Value`. No dependency on `State`. Compilable: yes.
+3. **Fix reference to the "bug" in `test_round_trip_yaml_various_field_types`** — Update the doc comment (lines ~905-912) that says IpAddr is omitted "because of the IpNetwork heuristic bug." Add IpAddr to the test's field set since round-trip now works correctly.
 
-4. **Implement `parse_raw_to_state` and `parse_yaml` in `yaml.rs`** — These depend on step 3 for value conversion and on `State`, `Selector`, `FieldValue`, `Provenance`, `StateMetadata`, `MacAddr` from `lib.rs`. Compilable: yes.
+4. **Run `cargo test -p netfyr-state --lib`** — Verify all tests still pass after the comment/name changes.
 
-5. **Implement `state_to_yaml` and `state_to_yaml_explicit` in `yaml.rs`** — These depend on step 3 for `serialize_value`. Compilable: yes.
-
-6. **Create `src/loader.rs` with `load_file` and `load_dir`** — Depends on steps 2-4 for `parse_yaml`, `YamlError`, and `StateSet`. Compilable: yes.
-
-7. **Update `src/lib.rs` with module declarations and re-exports** — Depends on steps 2-6 (all modules must exist). Compilable: yes. This step can be partially done earlier (adding `pub mod yaml;` after step 2, `pub mod loader;` after step 6) or done all at once at the end.
+Each step results in a compilable, test-passing state.
 
 ## Risks and Mitigations
 
-### 1. `serde_yaml` 0.9 API stability
-**Risk**: `serde_yaml` 0.9 is marked as a pre-1.0 release. Some APIs (particularly around `Value::Number` internals) may differ between 0.9.x patch versions.
-**Mitigation**: Pin to `"0.9"` (any 0.9.x). The APIs used (`Deserializer::from_str`, `Value` enum, `to_string`) are stable across 0.9.x. The `Number` type's `as_u64()` and `as_i64()` methods are stable.
+### 1. False confidence from stale comments
+**Risk**: The stale "BUG" comments could lead a developer to "fix" working code, thinking it's broken.
+**Mitigation**: This is exactly what the cleanup addresses. Removing the misleading comments prevents this.
 
-### 2. `serde_yaml` Number type details
-**Risk**: `serde_yaml` 0.9 uses `serde_yaml::Number` which wraps `serde_json::Number` internally (in some versions). The behavior of `as_u64()` for large numbers or `as_f64()` for integers needs care.
-**Mitigation**: Check `as_u64()` first (returns `Some` for non-negative integers that fit), then `as_i64()` (returns `Some` for negative integers that fit). If both return `None`, the number is a float — return an error. This covers all integer cases correctly.
+### 2. IpAddr round-trip precision
+**Risk**: `Value::IpAddr(10.0.1.1)` serializes as string `"10.0.1.1"`, re-parses as `Value::IpAddr` thanks to the `/` guard. If the guard were removed, this would break.
+**Mitigation**: The guard at `yaml.rs:110` is well-commented explaining why it exists. Tests explicitly verify this behavior.
 
-### 3. YAML boolean vs. string ambiguity
-**Risk**: YAML 1.1 (which `serde_yaml` 0.9 uses) treats `yes`, `no`, `on`, `off`, `y`, `n` as booleans. A user writing `mode: on` would get `Value::Bool(true)` instead of `Value::String("on")`.
-**Mitigation**: This is a known YAML 1.1 behavior. Users must quote such values: `mode: "on"`. Document this in error messages or user-facing docs if needed. No code mitigation is required — the heuristic correctly processes the `serde_yaml::Value` as-is.
+### 3. `kind` boundary with SPEC-007
+**Risk**: `parse_yaml` errors on `kind: policy`. Policy files must NOT be passed to `parse_yaml`.
+**Mitigation**: SPEC-007's policy loader already uses its own parsing path (`parse_policy_from_value` in `netfyr-policy`), calling `parse_state_value()` only for embedded state sub-documents. The boundary is clean.
 
-### 4. Round-trip fidelity for IP addresses
-**Risk**: After round-tripping, a plain string like `"10.0.1.1"` will be deserialized as `Value::IpAddr` rather than `Value::String`. This is by design (the heuristic), but means `Value::String("10.0.1.1")` cannot survive a YAML round-trip.
-**Mitigation**: This is the intended behavior per spec. The spec explicitly states: "a string value is first attempted as IpNetwork, then as IpAddr, and falls back to String." When schema validation is available (SPEC-006), it provides type hints to disambiguate. No code change needed.
+### 4. Intra-file duplicate detection
+**Risk**: Two states with identical selectors within a single multi-document file result in the second silently replacing the first via `StateSet::insert`. The spec only requires cross-file duplicate detection.
+**Mitigation**: Acceptable per spec. Intra-file duplicates are an edge case that could be addressed in a future story if needed.
 
-### 5. `walkdir` root entry filtering
-**Risk**: If the user passes a path like `/etc/netfyr/.policies/`, the directory name starts with `.`, and naive hidden-file filtering would skip the root directory itself.
-**Mitigation**: The `filter_entry` predicate should only skip hidden entries at depth > 0, or more simply, `walkdir` processes the root entry first and hidden-name filtering on the root is safe because `WalkDir::new` always yields the root regardless. Actually, the cleanest approach: apply the hidden-file filter only to the file name component. If the root directory name starts with `.`, the user explicitly asked to load it, so we should process it. The `filter_entry` callback receives entries including the root — only apply the hidden check to non-root entries (check `entry.depth() > 0`).
-
-### 6. File ordering in `load_dir` affecting duplicate detection
-**Risk**: `walkdir` iteration order is not guaranteed to be deterministic across platforms. If two files have the same entity key, which one is reported as the "duplicate" depends on traversal order.
-**Mitigation**: The error reports the path of the file that triggered the duplicate detection. The first file processed "wins" and the second triggers the error. Since both files are incorrect (they shouldn't both exist), the exact ordering of the error message is acceptable. For fully deterministic behavior, sort file paths before processing — but this is not required by the spec.
-
-### 7. Empty YAML documents
-**Risk**: A YAML file might contain `---` separators with empty documents between them (e.g., `---\n---`). `serde_yaml::Deserializer` yields `Value::Null` for these.
-**Mitigation**: In `parse_yaml`, check if the deserialized value is `Value::Null` and skip it silently (an empty document is not an error, just nothing to parse). This prevents confusing errors when users have trailing `---` separators.
-
-### 8. Large files or deeply nested values
-**Risk**: Very large YAML files or deeply nested structures could cause stack overflow in the recursive `deserialize_value`.
-**Mitigation**: Practical network config files are shallow (routes have 2-3 levels max). No mitigation needed for the MVP. If this becomes a concern, an iterative approach can be added later.
+### 5. YAML 1.1 boolean ambiguity
+**Risk**: `serde_yaml` 0.9 uses YAML 1.1 which treats `yes`, `no`, `on`, `off` as booleans. A user writing `mode: on` gets `Value::Bool(true)`.
+**Mitigation**: Known YAML 1.1 behavior. Users must quote: `mode: "on"`. No code change needed.
 
 ## Test Strategy
 
-### Unit tests for `yaml.rs`
+All tests are already implemented and passing. The existing test suite covers:
 
-**Value deserialization heuristic** (most important to test exhaustively):
-- YAML bool `true`/`false` → `Value::Bool`
-- YAML non-negative integer → `Value::U64`
-- YAML negative integer → `Value::I64`
-- YAML string that is a valid IP → `Value::IpAddr`
-- YAML string that is a valid CIDR → `Value::IpNetwork`
-- YAML string that is not an IP → `Value::String`
-- YAML sequence → `Value::List` with recursion
-- YAML mapping → `Value::Map` with recursion
-- YAML null → error
-- YAML float → error
-- Nested structures (list of maps, map of lists)
-- Edge cases: `"0.0.0.0"` (valid IP), `"::1"` (IPv6), `"10.0.0.0/8"` (IPv4 network), `"802.3ad"` (looks numeric-ish but is a string), empty string
+### Unit tests in `yaml.rs` (35+ tests)
+- **Value deserialization heuristic**: bool true/false, positive/negative integers, zero, IP addresses, CIDR networks, plain strings, null (error), sequences, mappings
+- **State parsing**: bare format, explicit `kind: state`, multi-document, driver selector, route objects, selector exclusion from fields, missing type error, invalid kind error, trailing separator skip, provenance verification
+- **State serialization**: flat format contains type/name/mtu at top level, no `kind:` in bare format, no `selector:`/`fields:` nesting, explicit format has `kind: state` before `type:`
+- **Round-trip**: preserves entity_type, selector.name, field values; metadata.id regenerated; various field types (string, U64, bool, IpNetwork, list, map); IpAddr round-trip
 
-**Value serialization**:
-- Each `Value` variant round-trips correctly through serialize → deserialize
-- `IpAddr` and `IpNetwork` serialize as strings
-- Nested structures serialize correctly
+### Unit tests in `loader.rs` (7 tests)
+- `load_dir`: three files (.yaml + .yml), multi-document file, hidden file skip, duplicate key error, invalid YAML error, empty directory, non-YAML file ignore
+- `load_file`: single document, nonexistent path error
 
-**State parsing (`parse_yaml`)**:
-- Bare state (no `kind`) with `type`, `name`, and config fields
-- Explicit state (`kind: state`) produces identical result to bare
-- Multi-document YAML (two documents separated by `---`)
-- Missing `type` → error
-- Invalid `kind` (e.g., `kind: policy`) → error
-- Selector properties (`name`, `driver`, `mac`, `pci_path`) go into `Selector`, not `fields`
-- MAC address parsing (valid and invalid)
-- `entity_type` key in YAML goes to `State.entity_type`, not `Selector.entity_type`
-- Empty document (just `---`) is skipped
-- Fields get `Provenance::UserConfigured { policy_ref: "" }`
-- `metadata` is freshly generated
-- `priority` is 100
+### After cleanup (step 3)
+- `test_round_trip_yaml_various_field_types` should be extended to include `Value::IpAddr` in its field set, since the IpAddr round-trip now works correctly. This validates the fix that was already applied.
 
-**State serialization (`state_to_yaml`)**:
-- Output is flat YAML (no `selector:`, `fields:`, `metadata:` keys)
-- Contains `type`, selector fields, and config fields at top level
-- `kind` is absent in bare format
-- `kind: state` is present in explicit format
-- MAC address serializes as string
-- Field order: `type` first, then selectors, then config fields
-
-**Round-trip tests**:
-- Parse → serialize → parse produces equivalent data (except metadata, which is regenerated)
-
-### Unit tests for `loader.rs`
-
-These require filesystem fixtures (temp directories with YAML files). Use `std::fs` and `tempfile` (or `std::env::temp_dir` + manual cleanup) to create test directories.
-
-- `load_file` with a valid single-document YAML file
-- `load_file` with a multi-document YAML file
-- `load_file` with a nonexistent path → IO error
-- `load_file` with invalid YAML → parse error with filename context
-- `load_dir` with multiple `.yaml` and `.yml` files
-- `load_dir` skips hidden files (`.backup.yaml`)
-- `load_dir` skips hidden directories (`.git/`)
-- `load_dir` skips non-YAML files (`.txt`, `.json`)
-- `load_dir` with multi-document files in directory
-- `load_dir` with duplicate entity keys across files → `DuplicateKey` error
-- `load_dir` with empty directory → empty `StateSet`
-- `load_dir` recursive traversal (nested subdirectories)
-
-### Test infrastructure
-- A helper function similar to `set.rs`'s `make_state()` for constructing test `State` values
-- `tempfile` crate (or manual temp dir management) for filesystem tests in `loader.rs`. If `tempfile` is not desired as a dev-dependency, use `std::env::temp_dir()` with unique directory names and cleanup in a `Drop` guard. The `tempfile` crate is cleaner — add it as a `[dev-dependencies]` entry.
-- No mocking needed — all I/O is filesystem-based and easily tested with real temp files
+### No additional test infrastructure needed
+- Tests use `std::env::temp_dir()` with unique names (PID + atomic counter) for filesystem tests — no `tempfile` dev-dependency needed
+- Helper function `make_state()` and `make_fv()` already exist for constructing test fixtures

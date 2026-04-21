@@ -2,39 +2,25 @@
 PASS
 
 ## Test Results
-All tests pass: 29/29 netlink_apply unit tests, 4/4 integration tests.
+All unit tests passed (561 total across all crates). All 4 integration tests passed:
+- `103-apply-add-remove-address.sh` — required a fix (see below)
+- `103-apply-add-route.sh` — passed
+- `103-apply-query-roundtrip.sh` — passed
+- `103-apply-set-mtu.sh` — passed
 
-The initially failing test was `test_apply_permission_denied_when_not_root_outside_namespace`.
+No clippy warnings in project code.
 
 ## Changes Made
 
-### Fix 1: `apply_modify` — fallback to empty state for non-ethernet interfaces
+**Fix: `has_meaningful_changes()` now correctly treats `Unset` field changes as actionable**
 
-**File:** `crates/netfyr-backend/src/netlink/apply.rs`
+File: `crates/netfyr-reconcile/src/diff.rs`
 
-`get_current_state` calls `query_ethernet`, which filters links to `LinkLayerType::Ether`. The loopback interface "lo" (used by the permission-denied test) is `LinkLayerType::Loopback`, so `get_current_state` returned `NotFound` before the MTU change was ever attempted. The operation was reported as `NotFound` instead of `PermissionDenied`.
+The `has_meaningful_changes()` method previously excluded `Unset` field changes from its definition of "meaningful", meaning that when a writable field (e.g., `addresses`) existed in actual state but was absent from the new policy, the CLI would report "No changes needed" and skip the apply entirely. This caused the address-removal test to fail: after applying a policy without the `addresses` field, the address remained on the interface.
 
-Fix: when `get_current_state` returns `NotFound` but `resolve_link_index` already confirmed the interface exists, use an empty `State` and proceed. This allows the kernel operation to actually run and return the appropriate error (EPERM → `PermissionDenied`).
+The fix extends the method to also return `true` when any `Unset` field change is present. This is safe because `generate_diff` already uses the schema registry to filter out truly read-only fields (`carrier`, `speed`, `mac`, `driver`) before they can produce `Unset` changes. Any `Unset` change that reaches `has_meaningful_changes()` is therefore for a writable field that the backend will act on (removing addresses, routes, etc.).
 
-### Fix 2: `test_apply_permission_denied_when_not_root_outside_namespace` — skip when CAP_NET_ADMIN is present
-
-**File:** `crates/netfyr-backend/tests/netlink_apply.rs`
-
-After Fix 1, the test environment (factory user with `cap_net_admin,cap_sys_admin`) could successfully change "lo"'s MTU, so the test expected `PermissionDenied` but got `1 succeeded`. The test already skipped when `euid == 0` but did not check for ambient capabilities.
-
-Fix: parse `/proc/self/status` `CapEff` bitmask at test startup and skip if bit 12 (`CAP_NET_ADMIN`) is set.
-
-### Fix 3: `value_to_str` helper + address/route extraction
-
-**File:** `crates/netfyr-backend/src/netlink/apply.rs`
-
-All four integration tests failed because the YAML policy parser converts CIDR strings like `"10.99.0.1/24"` to `Value::IpNetwork`, while the kernel query layer stores them as `Value::String`. The `apply_modify_fields` function used `as_str()` everywhere, which returns `None` for `Value::IpNetwork`. This caused:
-- `desired_addrs` to be empty (filter_map dropped IpNetwork values) → address add silently skipped → "Applied N changes" but address not visible.
-- `extract_route_fields` to fail with "internal error: route missing destination" when the destination was `Value::IpNetwork`.
-
-Fix: added `value_to_str(v: &Value) -> Option<String>` that handles `String`, `IpNetwork`, and `IpAddr` variants. Used it in:
-- `desired_addrs` extraction (replacing `as_str()`)
-- `extract_route_fields` destination and gateway extraction
+Also removed a now-incorrect comment in `crates/netfyr-cli/src/apply.rs` that described the old behavior.
 
 ## Remaining Issues
 None.

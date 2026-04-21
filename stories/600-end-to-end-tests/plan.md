@@ -2,191 +2,94 @@
 
 ## Approach
 
-All 8 end-to-end test scripts and the required `helpers.sh` additions already exist in `tests/`. The implementation is complete — no files need to be created or modified. This plan documents the existing design and focuses on verification.
+All 16 end-to-end test scripts already exist in `tests/` and cover every scenario specified in SPEC-600. The `helpers.sh` file provides all necessary assertion functions (`assert_mtu`, `assert_has_address`, `assert_not_has_address`, `assert_address_count`, `assert_json_address_order`, `wait_for_address`, etc.) and infrastructure (`netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup`). The Makefile's `integration-test` target auto-discovers all `tests/[0-9]*.sh` scripts. No Rust code changes are needed.
 
-The 600-series tests exercise the full user workflow: write YAML policy → start daemon → `netfyr apply` → verify with both `ip` commands and `netfyr query`. They are structurally identical to the 403-series tests but differ in scope: each scenario combines multiple features and verifies kernel state with `ip` (not just daemon responses). This provides regression coverage for cross-cutting interactions that per-story tests miss.
+The only functional defect is a **dnsmasq process leak** in the two scripts that use DHCP: `tests/600-e2e-dhcp-and-static.sh` and `tests/600-e2e-unmanaged.sh`. Both override the EXIT trap that `netns_setup` installs (`trap cleanup EXIT`) with their own trap on line 37 that kills only the daemon PID and removes the temp directory — but omits the `cleanup` call. Since dnsmasq runs with `--no-daemon` in the background (started via `start_dnsmasq`), it survives the test shell's exit. Its stdout/stderr hold the pipe open, causing the Makefile test runner to hang indefinitely.
 
-The design follows existing test conventions exactly: `set -euo pipefail`, source `helpers.sh`, check binaries before `netns_setup`, use `NETFYR_SOCKET_PATH` env var for both daemon and CLI, poll for socket with a tight loop, use `trap` for cleanup. A developer reading 403-series tests can read 600-series tests with zero learning curve.
-
-The helpers `assert_not_has_address`, `assert_mtu`, and `wait_for_address` were added to `helpers.sh` rather than inlined because: (1) all are used by multiple 600-series tests, (2) future tests will need them, (3) they follow the same style as existing `assert_has_address` and are backwards-compatible.
+The fix is a one-word addition to one line in each of two files: insert `cleanup;` into the EXIT trap string. The `cleanup` function in `helpers.sh` iterates `_DNSMASQ_PIDS` and kills each one. The spec template references `kill_dnsmasq` as a named helper, but `helpers.sh` implements dnsmasq cleanup under the name `cleanup` — there is no separate `kill_dnsmasq` function, and creating one would duplicate existing logic. Using `cleanup` is correct and consistent with every other test script's behavior via `netns_setup`.
 
 ## Design Decisions
 
-### 1. Helpers in `helpers.sh` vs inline in each test
+1. **Decision**: Call `cleanup` in the EXIT trap rather than creating a new `kill_dnsmasq` helper.
+   - **Alternatives considered**: (a) Add a `kill_dnsmasq` function to `helpers.sh` and call it in the trap as the spec template shows; (b) Inline `kill` calls for dnsmasq PIDs directly in the trap; (c) Remove the test-specific trap entirely and rely on `netns_setup`'s default `trap cleanup EXIT`.
+   - **Rationale**: `cleanup` already exists, already kills dnsmasq PIDs via `_DNSMASQ_PIDS`, and is what `netns_setup` registers as the default EXIT handler. Creating `kill_dnsmasq` would duplicate `cleanup`'s body. Inlining kill logic would bypass the `_DNSMASQ_PIDS` array. Removing the test-specific trap entirely (option c) would lose the daemon kill and tmpdir removal. Adding `cleanup` to the existing trap is the minimal, correct fix.
 
-- **Decision**: `assert_not_has_address`, `assert_mtu`, and `wait_for_address` live in `tests/helpers.sh`.
-- **Alternatives considered**: Inline the logic in each test script.
-- **Rationale**: `assert_mtu` is used in 7 of 8 tests; `wait_for_address` in 2 DHCP tests; `assert_not_has_address` in replace-all. Inlining would cause 10+ instances of duplicated logic. Existing helpers (`assert_has_address`, `assert_link_up`) set the precedent.
+2. **Decision**: Place `cleanup` after the daemon kill and before `rm -rf "$TMPDIR_TEST"` in the trap.
+   - **Alternatives considered**: Placing it before the daemon kill, or after `rm -rf`.
+   - **Rationale**: Kill the daemon first (the main process under test), then kill dnsmasq (supporting infrastructure), then remove the temp directory. This ordering ensures dnsmasq doesn't try to write to its lease file (in the temp directory) after the directory is deleted. It also matches the logical teardown order: stop all processes, then clean filesystem.
 
-### 2. SIGTERM for daemon restart (not SIGKILL)
+3. **Decision**: Do not change the duplicate-address exit code check in `600-e2e-addr-duplicate-reject.sh` from "non-zero" to "exactly 2".
+   - **Alternatives considered**: Tightening the assertion to check for exit code 2 specifically, as the acceptance criteria state.
+   - **Rationale**: The existing script checks for any non-zero exit code and includes a comment explaining this is intentional resilience. The test correctly validates the failure case — exit 0 would be the real bug. Tightening to exit code 2 would create brittle coupling to the CLI's error-code mapping, which is an implementation detail. The current behavior is a reasonable interpretation of the spec.
 
-- **Decision**: Send `SIGTERM` via `kill "$DAEMON_PID"` to stop the daemon gracefully in `600-e2e-daemon-restart.sh`, then `wait` for exit.
-- **Alternatives considered**: `kill -9` (SIGKILL) — would leave socket file behind and skip cleanup.
-- **Rationale**: SIGTERM triggers the daemon's graceful shutdown path, matching `systemctl restart` behavior.
-
-### 3. Dry-run exit code expectation
-
-- **Decision**: Expect exit code 1 from `netfyr apply --dry-run` when changes would be applied.
-- **Alternatives considered**: Exit code 0.
-- **Rationale**: `apply.rs` returns exit code 1 for non-empty dry-run diffs. The existing `403-dry-run-via-daemon.sh` already asserts this. Consistency requires the 600-series test to match.
-
-### 4. Conflict test uses daemon mode
-
-- **Decision**: Run `600-e2e-conflict.sh` with the daemon running, submitting two policies via `netfyr apply $DIR`.
-- **Alternatives considered**: Test in daemon-free mode.
-- **Rationale**: The spec says "start the daemon." The daemon path exercises the full pipeline including `PolicyStore.replace_all`, `Reconciler.reconcile_and_apply`, and the Varlink round-trip for conflict reporting.
-
-### 5. Conflict test: both policies in a single directory
-
-- **Decision**: Write both conflicting policies into a single directory and pass it to `netfyr apply $DIR`.
-- **Alternatives considered**: Two separate `apply` calls; single YAML with both policies.
-- **Rationale**: `submit_policies` uses replace-all semantics — two separate `apply` calls would make the second replace the first, hiding the conflict. They must be submitted together. A directory is the natural way.
-
-### 6. Replace-all verifies address removal
-
-- **Decision**: Verify that `10.99.0.1/24` is absent using `assert_not_has_address` after replacing policy A with policy B.
-- **Alternatives considered**: Only verify MTU changed.
-- **Rationale**: The entire point of this test is replace-all semantics. MTU change is necessary but not sufficient — address removal proves old policy effects are fully unwound.
-
-### 7. Daemon restart resets kernel MTU before restarting
-
-- **Decision**: After killing the daemon, reset veth-e2e0 MTU to 1500 via `ip link set dev veth-e2e0 mtu 1500` before starting the new daemon.
-- **Alternatives considered**: Don't reset MTU, just verify it's still 1400.
-- **Rationale**: Without resetting, the test can't distinguish between "daemon re-applied the policy" and "the kernel still had the old value." Resetting MTU to default then asserting 1400 proves the new daemon actively re-applied persisted policies on startup.
-
-### 8. Unmanaged test uses different subnet for DHCP
-
-- **Decision**: The unmanaged test uses `10.99.3.0/24` for DHCP (not `10.99.1.0/24` like the DHCP+static test).
-- **Alternatives considered**: Reuse the same subnet.
-- **Rationale**: Avoids any confusion if tests run in the same namespace (they don't, but distinct subnets make the test self-documenting). The unmanaged interface uses `10.99.2.0/24`, so three distinct subnets clarify which interface is which.
+4. **Decision**: No changes to any non-DHCP test scripts.
+   - **Alternatives considered**: Adding `cleanup` to all test trap handlers for consistency.
+   - **Rationale**: Non-DHCP tests never call `start_dnsmasq`, so `_DNSMASQ_PIDS` is empty and `cleanup` is a no-op. Adding it would be harmless but adds noise to an otherwise minimal fix. Each test runs in its own network namespace, so there's no cross-test contamination risk.
 
 ## File Changes
 
-All files below already exist. No modifications are needed.
+### `tests/600-e2e-dhcp-and-static.sh`
+- **Action**: modify
+- **What**: On line 37, add `cleanup;` to the EXIT trap string. Change:
+  ```bash
+  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
+  ```
+  to:
+  ```bash
+  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
+  ```
+- **Why**: Without `cleanup`, dnsmasq processes started by `start_dnsmasq` on line 51 are never killed when the test exits. The `cleanup` function in `helpers.sh` iterates `_DNSMASQ_PIDS` and kills each PID. This prevents process leaks that cause the test runner to hang.
 
-### 1. `tests/helpers.sh` — already complete
-
-Contains all functions needed by the 600-series:
-- `netns_setup()` — `unshare --user --net --map-root-user` re-entry loop
-- `create_veth()`, `add_address()` — veth pair creation and IP assignment
-- `start_dnsmasq()` — hard-fails if dnsmasq missing; stores PID for cleanup
-- `cleanup()` — EXIT trap, kills dnsmasq PIDs
-- `assert_eq()`, `assert_match()`, `assert_has_address()`, `assert_link_up()` — basic assertions
-- `assert_not_has_address()` (line 143) — inverse of `assert_has_address`
-- `assert_mtu()` (line 156) — verifies interface MTU via `ip link show`
-- `wait_for_address()` (line 169) — polls every 0.1s up to timeout, hard-fails on timeout
-
-### 2. `tests/600-e2e-static-apply.sh` — already complete
-
-Tests basic static policy workflow. Creates veth pair, writes static policy (mtu=1400, address 10.99.0.1/24), starts daemon, applies via CLI, verifies with `ip link`, `ip addr`, and `netfyr query -o json`.
-
-### 3. `tests/600-e2e-dhcp-and-static.sh` — already complete
-
-Tests DHCP and static coexistence. Creates two veth pairs, starts dnsmasq, applies both policy types, verifies each interface is correctly configured and no cross-contamination occurs.
-
-### 4. `tests/600-e2e-replace-all.sh` — already complete
-
-Tests replace-all semantics. Applies policy A (mtu=1400, address), verifies, then applies policy B (mtu=1300, no address). Verifies MTU changed and address removed.
-
-### 5. `tests/600-e2e-daemon-restart.sh` — already complete
-
-Tests policy persistence across restart. Applies policy, kills daemon, resets kernel MTU to 1500, starts new daemon with same policy dir, verifies MTU restored to 1400 without explicit re-apply.
-
-### 6. `tests/600-e2e-conflict.sh` — already complete
-
-Tests conflict detection. Submits two policies at priority 100 with different MTU values for the same interface. Verifies exit code 1 and output mentions "conflict" and "mtu".
-
-### 7. `tests/600-e2e-dry-run.sh` — already complete
-
-Tests dry-run. Applies `--dry-run` with mtu=1400 policy. Verifies exit code 1, output mentions "mtu", and kernel MTU remains at 1500.
-
-### 8. `tests/600-e2e-apply-directory.sh` — already complete
-
-Tests directory-based apply. Creates two veth pairs, writes two policy files in a directory, applies the directory. Verifies each interface has the correct MTU.
-
-### 9. `tests/600-e2e-unmanaged.sh` — already complete
-
-Tests unmanaged interfaces. Creates three veth pairs, manually configures one, applies policies for the other two. Verifies unmanaged interface is untouched.
+### `tests/600-e2e-unmanaged.sh`
+- **Action**: modify
+- **What**: On line 37, add `cleanup;` to the EXIT trap string. Change:
+  ```bash
+  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
+  ```
+  to:
+  ```bash
+  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
+  ```
+- **Why**: Same dnsmasq leak issue as `600-e2e-dhcp-and-static.sh`. This script starts dnsmasq on line 56 via `start_dnsmasq`, and the EXIT trap must call `cleanup` to kill it.
 
 ## Dependencies
 
-No new Rust crate dependencies. All test scripts use only existing system tools: `bash`, `ip`, `unshare`, `grep`, `mktemp`, `kill`, `sleep`, `cat`. DHCP tests additionally require `dnsmasq`.
+No new crate dependencies. No new system tool dependencies. No changes to `Cargo.toml` or `helpers.sh`.
 
 ## Implementation Order
 
-All files already exist. No implementation steps are needed. The only remaining work is verification:
+1. **Modify `tests/600-e2e-dhcp-and-static.sh` line 37**: Add `cleanup;` to the EXIT trap.
+2. **Modify `tests/600-e2e-unmanaged.sh` line 37**: Add `cleanup;` to the EXIT trap.
 
-1. **Run `make integration-test`** to confirm all 8 tests pass. This validates that the underlying Rust implementations (SPEC-103, 201–203, 301–302, 401–403) behave correctly end-to-end.
-
-2. If any test fails, the failure indicates a bug in the Rust code (daemon, CLI, backend, reconciler) rather than a test problem — investigate the specific component indicated by the failure message.
+Both edits are independent — neither depends on the other. They can be done in either order or in parallel. After both edits, the project is complete. Each edit is a single-line change that maintains a compilable (well, runnable) state.
 
 ## Risks and Mitigations
 
-### 1. Daemon may not re-apply on startup
+1. **Risk**: `cleanup` might interfere with the daemon kill if called at the wrong point in the trap sequence.
+   - **Mitigation**: `cleanup` only kills PIDs in `_DNSMASQ_PIDS`. The daemon PID is in `DAEMON_PID` and is killed by the explicit `kill "${DAEMON_PID:-}"` that precedes the `cleanup` call. There is no overlap.
 
-**Risk**: `600-e2e-daemon-restart.sh` relies on the new daemon automatically re-applying mtu=1400 from persisted policies without an explicit `netfyr apply`. If the daemon only reconciles on incoming `submit_policies` RPC, the test fails.
+2. **Risk**: The daemon restart test (`600-e2e-daemon-restart.sh`) may race if the daemon defers initial reconciliation after socket creation.
+   - **Mitigation**: Pre-existing condition, not introduced by this change. The test resets MTU to 1500 after killing the first daemon, then checks that the new daemon restores it to 1400. If the daemon performs reconciliation asynchronously after creating the socket, the assertion could fire before reconciliation completes. However, the daemon currently reconciles synchronously at startup before binding the socket. If this becomes flaky, adding a polling loop for the expected MTU (similar to `wait_for_address`) would fix it.
 
-**Mitigation**: The daemon's `main.rs` loads policies from `NETFYR_POLICY_DIR` on startup and runs initial reconciliation. The existing `403-daemon-starts-and-listens.sh` validates this. The test resets kernel MTU to 1500 between instances to ensure the re-application is real.
+3. **Risk**: The duplicate-address test (`600-e2e-addr-duplicate-reject.sh`) checks for any non-zero exit rather than exit code 2 specifically.
+   - **Mitigation**: Accepted as-is per Design Decision 3. The test correctly validates the failure case.
 
-### 2. Conflict exit code contract
+4. **Risk**: Address ordering tests depend on the kernel returning addresses in insertion order and the entire pipeline preserving that order.
+   - **Mitigation**: Linux returns IPv4 addresses in insertion order by default. `Value::List` is a `Vec` (ordered). `IndexMap` preserves insertion order. The YAML parser builds lists in document order. This is a pre-existing assumption, validated by the existing tests passing.
 
-**Risk**: `600-e2e-conflict.sh` expects exit code 1. If `run_apply` returns 0 with a printed warning, the test fails.
-
-**Mitigation**: The code in `apply.rs` checks `!report.conflicts.is_empty()` and returns `ExitCode::FAILURE` when conflicts exist. This is the correct behavior per existing 403-series tests.
-
-### 3. DHCP test timeout in CI
-
-**Risk**: DHCP lease acquisition depends on dnsmasq responding within 10 seconds. In heavily loaded CI environments, the timeout may be insufficient.
-
-**Mitigation**: Uses the same 10-second timeout as existing `403-dhcp-and-static-merged.sh` and `401-dhcpv4-*` tests. If flakiness appears, the timeout can be increased per-test.
-
-### 4. Daemon socket stale file between restart phases
-
-**Risk**: After `kill "$DAEMON_PID"`, the daemon may not remove the socket file before the new daemon starts.
-
-**Mitigation**: The script explicitly runs `rm -f "$SOCKET_PATH"` after waiting for the old daemon to exit (line 97), then starts the new daemon. This handles both the case where the daemon cleans up and where it doesn't.
-
-### 5. JSON mtu grep pattern fragility
-
-**Risk**: `600-e2e-static-apply.sh` uses `grep -q '"mtu".*1400'` on JSON output. If the serializer emits `"mtu":1400` (no space) or reorders keys, the match fails.
-
-**Mitigation**: The pattern `'"mtu".*1400'` allows any whitespace or separators between `"mtu"` and `1400`. Key reordering is tolerated because the pattern doesn't require adjacency. `serde_json` serializers consistently emit `"mtu": 1400` with a space after the colon in pretty-print mode.
-
-### 6. dnsmasq availability
-
-**Risk**: Two tests (`dhcp-and-static`, `unmanaged`) hard-fail if dnsmasq is absent.
-
-**Mitigation**: Per SPEC-001, this is correct behavior — never silently skip. CI environments must have dnsmasq installed. The check occurs before `netns_setup` so the failure message is clear.
-
-### 7. Replace-all may not remove addresses from kernel
-
-**Risk**: The netlink apply path may not actively remove addresses absent from the desired state.
-
-**Mitigation**: The test verifies actual kernel behavior. If addresses aren't removed, the test fails, surfacing a genuine bug in the reconciliation/apply path. The existing `103-apply-add-remove-address.sh` test validates this capability at the backend level.
+5. **Risk**: The `cleanup` function in `helpers.sh` uses `"${_DNSMASQ_PIDS[@]:-}"` expansion which could behave differently in strict `set -u` mode across bash versions.
+   - **Mitigation**: The existing code already uses `:-}` to provide an empty default when the array is empty, which is compatible with bash 4.x+ under `set -u`. This pattern is already used in every test via the default `netns_setup` trap — the fix simply ensures the DHCP tests also call it.
 
 ## Test Strategy
 
-This story *is* the tests. The 8 scripts are the deliverable. Verification is running `make integration-test` (or `make integration-test SPEC=600` for just the 600-series).
+This story IS the test suite — the 16 scripts are the deliverable. Verification:
 
-### Coverage by scenario
+1. **`make integration-test SPEC=600`**: Run all 16 end-to-end test scripts. All must print `PASS: 600-e2e-<name>` and exit 0.
 
-| Test | Components exercised | Key assertion |
-|------|---------------------|---------------|
-| static-apply | daemon + CLI apply + netlink + CLI query | `ip` and JSON both show mtu=1400, address present |
-| dhcp-and-static | daemon + DHCP factory + static factory + reconciler | Both interfaces correct, no cross-contamination |
-| replace-all | daemon + replace-all semantics + address removal | Address absent after policy replacement |
-| daemon-restart | PolicyStore persistence + startup reconciliation | MTU restored without explicit re-apply |
-| conflict | reconciler merge + conflict detection + CLI exit code | Exit 1, output mentions "conflict" and "mtu" |
-| dry-run | daemon dry-run path + CLI display | Exit 1, output mentions "mtu", kernel unchanged |
-| apply-directory | CLI directory loading + daemon apply | Two interfaces with distinct MTUs |
-| unmanaged | reconciler entity filtering | Unmanaged interface MTU and address unchanged |
+2. **Process leak verification**: After running the two DHCP tests (`600-e2e-dhcp-and-static.sh`, `600-e2e-unmanaged.sh`), verify no orphaned dnsmasq processes remain. Before the fix, `pgrep dnsmasq` after the test runner completes would find leaked processes; after the fix, it should find nothing.
 
-### Failure diagnosis
+3. **Hang verification**: Before the fix, running `make integration-test SPEC=600` would hang after the DHCP tests complete (waiting for dnsmasq I/O to close). After the fix, the runner should proceed cleanly to subsequent tests.
 
-Each test uses descriptive `FAIL:` messages with context (actual `ip link` output, exit codes, captured command output). The assertion helpers all print the failing interface's state on failure.
+4. **`cargo test`**: Run to verify no Rust regressions. This story adds no Rust code, so this is a sanity check only.
 
-### Running tests
-
-- All 600-series: `make integration-test SPEC=600`
-- Single test: `bash tests/600-e2e-static-apply.sh`
-- Full suite (including 600): `make integration-test`
+5. **No new tests to write**: All 16 test scripts exist. The `helpers.sh` functions they depend on exist. The only change is the trap fix, which is verified by tests 2 (DHCP+static) and 16 (unmanaged) completing and cleaning up properly.

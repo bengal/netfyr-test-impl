@@ -2,19 +2,17 @@
 PASS
 
 ## Test Results
-All 322 tests passed (0 failed, 0 ignored).
+237 tests passed in `netfyr-state`, 0 failed. 1 test required a fix:
+- `schema::tests::test_unknown_field_error_references_field_name`
 
-Two tests required fixes:
-
-1. `schema::tests::test_route_without_destination_error_references_destination` — was failing because the `MissingRequired` error field path was `"routes[0]"` instead of the expected `"routes[0].destination"`.
-
-2. `test_no_extraneous_source_files_in_library_crates` — was failing because the expected file list for `netfyr-state/src/` did not include `schema.rs` and `schemas/` added by SPEC-006.
+Total across all crates: all tests pass (237 + other crates).
 
 ## Changes Made
+**Fix: `AdditionalProperties` errors now carry the correct field name**
 
-1. **`crates/netfyr-state/src/schema.rs`** — Fixed `Required` error field path in the `validate` method. The `jsonschema` crate reports `Required` errors at the parent object's `instance_path` (e.g., `/routes/0`), not at the missing property's path. Added logic to detect `ValidationErrorKind::Required { property }` and append the missing property name (e.g., `.destination`) to the field path, producing `"routes[0].destination"` as the spec requires.
+In `crates/netfyr-state/src/schema.rs`, the validation loop used `.map()` over `iter_errors()` and extracted the field path solely from `err.instance_path`. For `AdditionalProperties` errors, `instance_path` points to the parent object (the root `{}`), yielding an empty string instead of the unknown field name.
 
-2. **`crates/netfyr-test-utils/tests/workspace_setup.rs`** — Updated the expected source file list for `netfyr-state` to include `"schema.rs"` and `"schemas"`, reflecting the files added by SPEC-006. Added a comment noting that SPEC-006 introduced these files.
+The fix replaces `.map()` with `.flat_map()` and adds a match arm for `JsKind::AdditionalProperties { unexpected }`. The `unexpected` `Vec<String>` contains the actual unknown field names; each is emitted as a separate `ValidationError` with the correct `field` value (prefixed by the parent path if nested). The existing `Required` handling was moved into a match arm for clarity, and all other error kinds fall through unchanged.
 
 ## Remaining Issues
 None.
