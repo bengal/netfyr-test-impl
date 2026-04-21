@@ -16,6 +16,10 @@
     "203-diff-generation",
     "301-cli-apply",
     "302-cli-query",
+    "351-journal-infrastructure",
+    "352-history-cli",
+    "353-external-change-detection",
+    "354-state-revert",
     "401-dhcpv4-factory",
     "402-policy-store",
     "403-daemon",
@@ -87,6 +91,31 @@
     ],
     "302-cli-query": [
       "102-rtnetlink-query-ethernet",
+      "301-cli-apply",
+      "404-varlink-api"
+    ],
+    "351-journal-infrastructure": [
+      "001-workspace-setup",
+      "002-entity-state-types",
+      "004-stateset-operations",
+      "203-diff-generation",
+      "301-cli-apply",
+      "403-daemon"
+    ],
+    "352-history-cli": [
+      "351-journal-infrastructure",
+      "302-cli-query",
+      "404-varlink-api"
+    ],
+    "353-external-change-detection": [
+      "351-journal-infrastructure",
+      "102-rtnetlink-query-ethernet",
+      "403-daemon"
+    ],
+    "354-state-revert": [
+      "351-journal-infrastructure",
+      "203-diff-generation",
+      "103-rtnetlink-apply-ethernet",
       "301-cli-apply",
       "404-varlink-api"
     ],

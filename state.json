@@ -1927,6 +1927,326 @@
           "timestamp": "2026-04-21T07:28:26.536899"
         }
       }
+    },
+    "351-journal-infrastructure": {
+      "spec_hash": "593745584cf9be3efab255182e015cc73cbaf6df2b6046c8c0c87ba778d290f2",
+      "status": "done",
+      "phases": {
+        "understand": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:07:16.949411"
+        },
+        "plan": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:11:49.033514"
+        },
+        "implement": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:24:40.097823"
+        },
+        "write_tests": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:33:04.517652"
+        },
+        "verify": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:35:42.296145"
+        },
+        "commit": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:35:58.721148"
+        }
+      },
+      "costs": {
+        "understand": {
+          "input_tokens": 1662,
+          "output_tokens": 8442,
+          "cache_creation_tokens": 78657,
+          "cache_read_tokens": 544585,
+          "num_turns": 13,
+          "model": "claude-sonnet-4-6"
+        },
+        "plan": {
+          "input_tokens": 19782,
+          "output_tokens": 11849,
+          "cache_creation_tokens": 114234,
+          "cache_read_tokens": 493749,
+          "num_turns": 14,
+          "model": "claude-opus-4-6"
+        },
+        "implement": {
+          "input_tokens": 1570,
+          "output_tokens": 38920,
+          "cache_creation_tokens": 142259,
+          "cache_read_tokens": 5345130,
+          "num_turns": 46,
+          "model": "claude-sonnet-4-6"
+        },
+        "write_tests": {
+          "input_tokens": 319,
+          "output_tokens": 32689,
+          "cache_creation_tokens": 81416,
+          "cache_read_tokens": 928102,
+          "num_turns": 18,
+          "model": "claude-sonnet-4-6"
+        },
+        "verify": {
+          "input_tokens": 14,
+          "output_tokens": 1838,
+          "cache_creation_tokens": 12513,
+          "cache_read_tokens": 315729,
+          "num_turns": 13,
+          "model": "claude-sonnet-4-6"
+        },
+        "commit": {
+          "input_tokens": 14,
+          "output_tokens": 847,
+          "cache_creation_tokens": 28025,
+          "cache_read_tokens": 27160,
+          "num_turns": 2,
+          "model": "claude-haiku-4-5"
+        }
+      }
+    },
+    "352-history-cli": {
+      "spec_hash": "ba8b996637e6fd0f215384744fce51b133967e0cde61aa5c9e22b20474124cee",
+      "status": "done",
+      "phases": {
+        "understand": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:38:03.536329"
+        },
+        "plan": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:41:33.066978"
+        },
+        "implement": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:49:47.099148"
+        },
+        "write_tests": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:56:11.031380"
+        },
+        "verify": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:58:00.600047"
+        },
+        "commit": {
+          "status": "done",
+          "timestamp": "2026-04-21T08:58:13.004364"
+        }
+      },
+      "costs": {
+        "understand": {
+          "input_tokens": 3511,
+          "output_tokens": 4770,
+          "cache_creation_tokens": 64630,
+          "cache_read_tokens": 349692,
+          "num_turns": 11,
+          "model": "claude-sonnet-4-6"
+        },
+        "plan": {
+          "input_tokens": 16556,
+          "output_tokens": 9023,
+          "cache_creation_tokens": 99190,
+          "cache_read_tokens": 326548,
+          "num_turns": 14,
+          "model": "claude-opus-4-6"
+        },
+        "implement": {
+          "input_tokens": 4786,
+          "output_tokens": 28102,
+          "cache_creation_tokens": 103280,
+          "cache_read_tokens": 2551675,
+          "num_turns": 31,
+          "model": "claude-sonnet-4-6"
+        },
+        "write_tests": {
+          "input_tokens": 3510,
+          "output_tokens": 27529,
+          "cache_creation_tokens": 71027,
+          "cache_read_tokens": 271947,
+          "num_turns": 8,
+          "model": "claude-sonnet-4-6"
+        },
+        "verify": {
+          "input_tokens": 6,
+          "output_tokens": 709,
+          "cache_creation_tokens": 12631,
+          "cache_read_tokens": 90592,
+          "num_turns": 5,
+          "model": "claude-sonnet-4-6"
+        },
+        "commit": {
+          "input_tokens": 14,
+          "output_tokens": 607,
+          "cache_creation_tokens": 27564,
+          "cache_read_tokens": 26932,
+          "num_turns": 2,
+          "model": "claude-haiku-4-5"
+        }
+      }
+    },
+    "353-external-change-detection": {
+      "spec_hash": "418f6f56dbdbd7227e086607f8f9685b1313bd0f29af89de942c9186417d778f",
+      "status": "done",
+      "phases": {
+        "understand": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:01:11.284585"
+        },
+        "plan": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:05:03.734324"
+        },
+        "implement": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:24:46.664309"
+        },
+        "write_tests": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:40:33.875308"
+        },
+        "verify": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:42:14.205493"
+        },
+        "commit": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:42:28.025571"
+        }
+      },
+      "costs": {
+        "understand": {
+          "input_tokens": 120,
+          "output_tokens": 7092,
+          "cache_creation_tokens": 64706,
+          "cache_read_tokens": 551236,
+          "num_turns": 14,
+          "model": "claude-sonnet-4-6"
+        },
+        "plan": {
+          "input_tokens": 23125,
+          "output_tokens": 8899,
+          "cache_creation_tokens": 109452,
+          "cache_read_tokens": 589583,
+          "num_turns": 17,
+          "model": "claude-opus-4-6"
+        },
+        "implement": {
+          "input_tokens": 12078,
+          "output_tokens": 65023,
+          "cache_creation_tokens": 242796,
+          "cache_read_tokens": 2732088,
+          "num_turns": 45,
+          "model": "claude-sonnet-4-6"
+        },
+        "write_tests": {
+          "input_tokens": 1727,
+          "output_tokens": 57172,
+          "cache_creation_tokens": 153142,
+          "cache_read_tokens": 2854978,
+          "num_turns": 29,
+          "model": "claude-sonnet-4-6"
+        },
+        "verify": {
+          "input_tokens": 13,
+          "output_tokens": 1309,
+          "cache_creation_tokens": 15665,
+          "cache_read_tokens": 254454,
+          "num_turns": 12,
+          "model": "claude-sonnet-4-6"
+        },
+        "commit": {
+          "input_tokens": 14,
+          "output_tokens": 754,
+          "cache_creation_tokens": 27626,
+          "cache_read_tokens": 26861,
+          "num_turns": 2,
+          "model": "claude-haiku-4-5"
+        }
+      }
+    },
+    "354-state-revert": {
+      "spec_hash": "55f7f3be63c7b7aff1ac9cbf486e44b4d114d4dc1b14a84b89c1cb6ea19b2e7e",
+      "status": "done",
+      "phases": {
+        "understand": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:44:47.570735"
+        },
+        "plan": {
+          "status": "done",
+          "timestamp": "2026-04-21T09:54:11.931386"
+        },
+        "implement": {
+          "status": "done",
+          "timestamp": "2026-04-21T10:03:30.382623"
+        },
+        "write_tests": {
+          "status": "done",
+          "timestamp": "2026-04-21T10:12:14.534239"
+        },
+        "verify": {
+          "status": "done",
+          "timestamp": "2026-04-21T10:14:57.024933"
+        },
+        "commit": {
+          "status": "done",
+          "timestamp": "2026-04-21T10:15:15.442764"
+        }
+      },
+      "costs": {
+        "understand": {
+          "input_tokens": 9,
+          "output_tokens": 5368,
+          "cache_creation_tokens": 63260,
+          "cache_read_tokens": 272625,
+          "num_turns": 9,
+          "model": "claude-sonnet-4-6"
+        },
+        "plan": {
+          "input_tokens": 33911,
+          "output_tokens": 21210,
+          "cache_creation_tokens": 108374,
+          "cache_read_tokens": 496478,
+          "num_turns": 9,
+          "model": "claude-opus-4-6"
+        },
+        "implement": {
+          "input_tokens": 17133,
+          "output_tokens": 23941,
+          "cache_creation_tokens": 140067,
+          "cache_read_tokens": 5036504,
+          "num_turns": 45,
+          "model": "claude-sonnet-4-6"
+        },
+        "write_tests": {
+          "input_tokens": 10207,
+          "output_tokens": 28972,
+          "cache_creation_tokens": 107833,
+          "cache_read_tokens": 1806486,
+          "num_turns": 27,
+          "model": "claude-sonnet-4-6"
+        },
+        "verify": {
+          "input_tokens": 3943,
+          "output_tokens": 1870,
+          "cache_creation_tokens": 22432,
+          "cache_read_tokens": 225188,
+          "num_turns": 11,
+          "model": "claude-sonnet-4-6"
+        },
+        "commit": {
+          "input_tokens": 14,
+          "output_tokens": 1168,
+          "cache_creation_tokens": 28333,
+          "cache_read_tokens": 27144,
+          "num_turns": 2,
+          "model": "claude-haiku-4-5"
+        }
+      }
     }
   }
 }
