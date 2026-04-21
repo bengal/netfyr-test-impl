@@ -169,6 +169,9 @@
       "203-diff-generation",
       "301-cli-apply",
       "302-cli-query",
+      "351-journal-infrastructure",
+      "352-history-cli",
+      "354-state-revert",
       "401-dhcpv4-factory",
       "402-policy-store",
       "403-daemon"

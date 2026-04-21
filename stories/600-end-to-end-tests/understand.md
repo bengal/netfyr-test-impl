@@ -1,88 +1,124 @@
-# Understand: SPEC-600 End-to-End Integration Tests
+# Understand: SPEC-600 — End-to-End Integration Tests
 
 ## Current State
 
-All 16 test scripts specified in SPEC-600 already exist in `tests/`:
+### Test infrastructure
+- `tests/helpers.sh` (232 lines) — shared library providing: `netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup` (kills all dnsmasq PIDs in `_DNSMASQ_PIDS[]`), `wait_for_address`, and assertion functions (`assert_eq`, `assert_match`, `assert_has_address`, `assert_not_has_address`, `assert_mtu`, `assert_link_up`, `assert_address_count`, `assert_json_address_order`).
+- `Makefile` — `integration-test` target discovers tests via `tests/[0-9]*.sh`. This glob matches 600-*.sh files (the leading `6` is a digit), so all 600 tests are in the default run.
 
-| File | Scenario |
+### Existing 600-series test scripts (16 of 26 required)
+| File | Status |
 |---|---|
-| `tests/600-e2e-static-apply.sh` | Static policy apply + `ip` and `netfyr query -o json` verification |
-| `tests/600-e2e-dhcp-and-static.sh` | DHCP and static coexistence on separate interfaces |
-| `tests/600-e2e-replace-all.sh` | Second apply fully replaces first policy set (removes old address) |
-| `tests/600-e2e-daemon-restart.sh` | Policy persistence and re-apply across daemon restart |
-| `tests/600-e2e-conflict.sh` | Conflicting mtu policies → exit 1, output mentions "conflict" and "mtu" |
-| `tests/600-e2e-dry-run.sh` | `--dry-run` → output mentions mtu change, kernel MTU unchanged |
-| `tests/600-e2e-apply-directory.sh` | Directory of policies configures multiple interfaces |
-| `tests/600-e2e-unmanaged.sh` | Manually configured interface is untouched by policy apply |
-| `tests/600-e2e-addr-single.sh` | Single address applied and verified via `ip` and `netfyr query` |
-| `tests/600-e2e-addr-five.sh` | 5 addresses applied in YAML order |
-| `tests/600-e2e-addr-twenty.sh` | 20 addresses applied in YAML order (stress) |
-| `tests/600-e2e-addr-replace.sh` | Old address set replaced by new one in order |
-| `tests/600-e2e-addr-idempotent.sh` | Same addresses applied twice, no duplicates |
-| `tests/600-e2e-addr-duplicate-reject.sh` | Duplicate in YAML → non-zero exit, error message, nothing applied |
-| `tests/600-e2e-addr-overlapping-subnets.sh` | Addresses on different subnets coexist in order |
-| `tests/600-e2e-addr-removal.sh` | Replace-all with no-address policy removes all addresses |
+| `tests/600-e2e-static-apply.sh` | exists |
+| `tests/600-e2e-dhcp-and-static.sh` | exists |
+| `tests/600-e2e-replace-all.sh` | exists |
+| `tests/600-e2e-daemon-restart.sh` | exists |
+| `tests/600-e2e-conflict.sh` | exists |
+| `tests/600-e2e-dry-run.sh` | exists |
+| `tests/600-e2e-apply-directory.sh` | exists |
+| `tests/600-e2e-addr-single.sh` | exists |
+| `tests/600-e2e-addr-five.sh` | exists |
+| `tests/600-e2e-addr-twenty.sh` | exists |
+| `tests/600-e2e-addr-replace.sh` | exists |
+| `tests/600-e2e-addr-idempotent.sh` | exists |
+| `tests/600-e2e-addr-duplicate-reject.sh` | exists |
+| `tests/600-e2e-addr-overlapping-subnets.sh` | exists |
+| `tests/600-e2e-addr-removal.sh` | exists |
+| `tests/600-e2e-unmanaged.sh` | exists |
+| `tests/600-e2e-journal-apply.sh` | **missing** |
+| `tests/600-e2e-journal-seq.sh` | **missing** |
+| `tests/600-e2e-history-list.sh` | **missing** |
+| `tests/600-e2e-history-show.sh` | **missing** |
+| `tests/600-e2e-history-json.sh` | **missing** |
+| `tests/600-e2e-history-filter.sh` | **missing** |
+| `tests/600-e2e-revert.sh` | **missing** |
+| `tests/600-e2e-revert-dry-run.sh` | **missing** |
+| `tests/600-e2e-revert-noent.sh` | **missing** |
+| `tests/600-e2e-revert-addr.sh` | **missing** |
 
-`tests/helpers.sh` (232 lines) provides all helpers referenced by these scripts:
-- **Setup/teardown**: `netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup` (kills dnsmasq PIDs)
-- **Assertions**: `assert_eq`, `assert_match`, `assert_has_address`, `assert_not_has_address`, `assert_mtu`, `assert_link_up`, `assert_address_count`, `assert_json_address_order`
-- **Polling**: `wait_for_address`
+### NETFYR_JOURNAL_DIR support
+`Journal::open_default()` (`crates/netfyr-journal/src/journal.rs:46`) reads `NETFYR_JOURNAL_DIR`, falling back to `/var/lib/netfyr/journal/`. The daemon's `reconciler.rs:67` and `server.rs:305,378,422` all call `Journal::open_default()`, so setting this env var on the daemon process redirects all journal writes. The `history` CLI (`crates/netfyr-cli/src/history.rs:583`) and `revert` CLI (`crates/netfyr-cli/src/revert.rs:98`) also read this env var through the same function.
 
-The Makefile already discovers and runs all `tests/[0-9]*.sh` via the `integration-test` target.
+### Journal file layout
+`Journal::open` creates `current.ndjson` and an `archive/` subdirectory inside the configured journal directory. Each apply/revert/startup event appends one JSON line to `current.ndjson`.
 
-No Rust code changes are required by this story.
+### helpers.sh naming vs spec template
+The spec template shows `kill_dnsmasq; cleanup` in EXIT traps. The actual `helpers.sh` merges both roles into a single `cleanup()` function. Existing 600 tests (e.g., `600-e2e-dhcp-and-static.sh`) call `cleanup` in their EXIT traps. There is no `kill_dnsmasq` function in `helpers.sh`.
+
+---
 
 ## Requirements
 
-16 end-to-end shell test scripts, each exercising a full user workflow through the running daemon. All structural requirements are already met by the existing scripts:
-- `set -euo pipefail`; source `helpers.sh`; check both binaries; fail if missing
-- `netns_setup "$@"` for isolation via `unshare --user --net`
-- Temp dir for socket and policy store; EXIT trap kills daemon and removes temp dir
-- Daemon started with `NETFYR_SOCKET_PATH` and `NETFYR_POLICY_DIR` env vars
-- Socket poll loop (50 × 0.1 s); hard-fail if socket does not appear
-- Print `PASS: 600-e2e-<name>` on success; all failure paths `exit 1`
+The 10 missing scripts cover three functional areas: journal recording, history CLI, and revert CLI.
+
+### Journal tests
+- **600-e2e-journal-apply.sh**: After `netfyr apply`, `current.ndjson` must exist; the relevant entry must have a trigger indicating policy apply, reference the target interface and mtu in the diff, include `state_after` with correct mtu, and have an outcome indicating success.
+- **600-e2e-journal-seq.sh**: Two sequential applies produce 2 entries in `current.ndjson`; the second entry has a higher seq number; the first entry's timestamp is earlier than the second.
+
+### History CLI tests
+- **600-e2e-history-list.sh**: `netfyr history -n 5` after two applies lists 2 entries in reverse chronological order showing SEQ, TIMESTAMP, TRIGGER, OUTCOME columns.
+- **600-e2e-history-show.sh**: `netfyr history --show 1` displays trigger, diff, and outcome detail for entry 1.
+- **600-e2e-history-json.sh**: `netfyr history -n 5 -o json` emits a valid JSON array with 2 elements each containing `seq`, `timestamp`, `trigger`, `outcome`; parseable by `jq`.
+- **600-e2e-history-filter.sh**: `netfyr history -s name=veth-a0` after applies on two different interfaces shows only the entry for `veth-a0`.
+
+### Revert CLI tests
+- **600-e2e-revert.sh**: After mtu=1400 (seq=1) then mtu=1300 (seq=2), `netfyr revert 1` restores mtu=1400 and creates a new journal entry with a revert trigger.
+- **600-e2e-revert-dry-run.sh**: `netfyr revert 1 --dry-run` outputs the planned mtu change but does not modify the interface or add a journal entry (entry count stays at 2).
+- **600-e2e-revert-noent.sh**: `netfyr revert 9999` exits with code 1 and output contains "not found".
+- **600-e2e-revert-addr.sh**: After addresses [10.99.0.1/24, 10.99.0.2/24] (seq=1) then [10.99.0.3/24] (seq=2), `netfyr revert 1` restores the two original addresses and removes 10.99.0.3/24.
+
+---
 
 ## Gap Analysis
 
-**No new files need to be created.** All 16 scripts exist.
+### Files to create (10 new shell scripts)
+| File | What to implement |
+|---|---|
+| `tests/600-e2e-journal-apply.sh` | Apply policy, parse `current.ndjson` with `jq`, assert trigger/diff/state_after/outcome fields |
+| `tests/600-e2e-journal-seq.sh` | Apply twice, count lines in `current.ndjson`, assert seq progression and timestamp ordering |
+| `tests/600-e2e-history-list.sh` | Apply twice, run `netfyr history -n 5`, assert 2 rows with required columns |
+| `tests/600-e2e-history-show.sh` | Apply once, run `netfyr history --show 1`, assert trigger/diff/outcome in output |
+| `tests/600-e2e-history-json.sh` | Apply twice, run `netfyr history -n 5 -o json`, pipe to `jq`, assert array length and fields |
+| `tests/600-e2e-history-filter.sh` | Apply to two interfaces, run `netfyr history -s name=veth-a0`, assert only veth-a0 entry shown |
+| `tests/600-e2e-revert.sh` | Apply A then B, run `netfyr revert 1`, assert mtu restored and new journal entry present |
+| `tests/600-e2e-revert-dry-run.sh` | Apply A then B, run `netfyr revert 1 --dry-run`, assert diff in output but mtu unchanged and no new entry |
+| `tests/600-e2e-revert-noent.sh` | Run `netfyr revert 9999` (no prior applies needed), assert exit=1 and "not found" in output |
+| `tests/600-e2e-revert-addr.sh` | Apply addr-set-A then addr-set-B, revert to 1, assert correct addresses present/absent |
 
-The only functional gap is a **dnsmasq process leak** in the two DHCP tests:
+### Files to modify
+- **None** — no Rust code changes, no Makefile changes, no helpers.sh changes required.
 
-- `tests/600-e2e-dhcp-and-static.sh` (line 37)
-- `tests/600-e2e-unmanaged.sh` (line 37)
-
-Both scripts set their EXIT trap after `netns_setup`, which overrides the `trap cleanup EXIT` that `netns_setup` installs. As a result, `cleanup` is never called, and dnsmasq PIDs in `_DNSMASQ_PIDS` are not killed. The spec explicitly warns: "Leaked dnsmasq processes hold pipes open and cause the test runner to hang indefinitely."
-
-Fix in both files — change:
-```bash
-trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
-```
-to:
-```bash
-trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
-```
-
-No other files need modification. The spec template references `kill_dnsmasq` as a named helper, but `helpers.sh` implements that functionality in `cleanup`; the existing tests already use `cleanup`, so no new helper function is needed.
+---
 
 ## Integration Points
 
-| Component | Role |
+| Component | How the new tests interact |
 |---|---|
-| `target/debug/netfyr-daemon` | Started per-test; applies policies on `submit_policies` RPC |
-| `target/debug/netfyr` (`apply`) | `run_apply` in `crates/netfyr-cli/src/apply.rs`; exit codes 0/1/2 tested |
-| `target/debug/netfyr` (`query -o json`) | `run_query` in `crates/netfyr-cli/src/query.rs`; `addresses` array order must match applied order |
-| `netfyr-backend` netlink apply | `apply_ethernet` in `crates/netfyr-backend/src/netlink/apply.rs`; applies addresses in order, removes addresses not in desired state |
-| `netfyr-state` schema validation | `SchemaRegistry::validate` in `crates/netfyr-state/src/schema.rs`; duplicate address list entries must be rejected |
-| `tests/helpers.sh` | All scripts source it; `cleanup` must be called in DHCP test EXIT traps |
-| `Makefile` `integration-test` | Auto-discovers new scripts by `tests/[0-9]*.sh` naming convention |
+| `target/debug/netfyr-daemon` | Started with `NETFYR_SOCKET_PATH`, `NETFYR_POLICY_DIR`, and `NETFYR_JOURNAL_DIR` env vars; all 10 journal/history/revert tests need daemon writes to journal |
+| `target/debug/netfyr apply` | `crates/netfyr-cli/src/apply.rs::run_apply` — triggers journal write via daemon Varlink on each apply |
+| `target/debug/netfyr history` | `crates/netfyr-cli/src/history.rs::run_history` — reads `NETFYR_JOURNAL_DIR` directly from filesystem, no daemon needed for the read |
+| `target/debug/netfyr revert` | `crates/netfyr-cli/src/revert.rs::run_revert` — reads journal for `state_after`, applies diff via daemon Varlink; needs daemon running |
+| `Journal::open_default()` | `crates/netfyr-journal/src/journal.rs:46` — creates `current.ndjson` and `archive/` in `NETFYR_JOURNAL_DIR` |
+| `tests/helpers.sh` — `cleanup` | New DHCP tests (if any) must call `cleanup` in EXIT trap |
+
+---
 
 ## Risks
 
-1. **dnsmasq leak (confirmed gap)**: The two DHCP tests do not call `cleanup` in their EXIT traps. In a non-interactive bash shell, background jobs do not receive SIGHUP on shell exit, so dnsmasq outlives the test. This can cause the Makefile test loop to hang waiting on a pipe. This is the only change needed to complete this story.
+### Daemon startup journal entry
+`reconciler.rs:67` calls `Journal::open_default()` on `Trigger::DaemonStartup`. This means `current.ndjson` may already contain seq=1 as a startup entry before the first `netfyr apply`. The journal-seq test and revert tests that reference specific seq numbers (e.g., "seq=1 is the first apply") must account for the startup entry being seq=1, pushing the first apply to seq=2. This needs verification against actual daemon behavior before writing the assertions.
 
-2. **Duplicate-address exit code**: `600-e2e-addr-duplicate-reject.sh` checks for any non-zero exit code rather than specifically exit code 2. The comment in the file explains this is intentional resilience. This diverges from the acceptance criterion (`exit code is 2`) but is a reasonable trade-off.
+### jq availability
+The history-json and journal-apply tests require `jq` to parse JSON. If `jq` is not installed, scripts fail with a cryptic "command not found" error. Each script that uses `jq` must check `command -v jq` at startup and `exit 1` with a clear FAIL message if absent.
 
-3. **Address ordering (environment-dependent)**: The five address-ordering tests (`addr-five`, `addr-twenty`, `addr-replace`, `addr-idempotent`, `addr-overlapping-subnets`) use `assert_json_address_order` to verify `netfyr query` returns addresses in YAML insertion order. This requires `apply_ethernet` to insert in declaration order and `query_ethernet` to return in kernel insertion order. If either reorders, these tests fail.
+### Journal archive subdirectory
+`Journal::open` creates `archive/` inside the journal directory. If the journal directory does not exist, the open fails. Tests must create `TMPDIR_TEST/journal` (or similar) before starting the daemon. The revert-noent test uses no daemon, so it must either pre-create `archive/` itself or use the CLI's own handling of a missing journal (exit code 1 with "not found" or similar).
 
-4. **Daemon restart timing**: `600-e2e-daemon-restart.sh` resets the MTU to 1500 after killing the daemon and asserts mtu=1400 is restored immediately after the new daemon's socket appears — with no additional sleep. If the daemon defers initial reconciliation, the assertion may race.
+### Trigger field name in serialized JSON
+The spec references `trigger.type` in `current.ndjson`. The actual serialized field names depend on the serde configuration of `Trigger` in `crates/netfyr-journal/src/entry.rs`. Tests must use the actual emitted field names, verified empirically. Using `jq` with flexible queries (e.g., `jq '.trigger | has("type")'`) is safer than hardcoding the exact field path.
 
+### revert-dry-run output format
+The spec expects the dry-run output to contain "mtu: 1300 -> 1400". The exact format comes from `DryRunReport::summary()` in `crates/netfyr-backend/src/report.rs`. Tests should match with a flexible pattern (e.g., `assert_match "$OUTPUT" "mtu"`) rather than requiring exact formatting.
+
+### helpers.sh `kill_dnsmasq` naming
+The spec template uses `kill_dnsmasq` in EXIT traps. The actual helpers.sh uses `cleanup`. New scripts must use `cleanup`, not `kill_dnsmasq`, to match the existing convention and avoid `command not found` errors.

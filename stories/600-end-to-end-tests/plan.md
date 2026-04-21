@@ -2,94 +2,236 @@
 
 ## Approach
 
-All 16 end-to-end test scripts already exist in `tests/` and cover every scenario specified in SPEC-600. The `helpers.sh` file provides all necessary assertion functions (`assert_mtu`, `assert_has_address`, `assert_not_has_address`, `assert_address_count`, `assert_json_address_order`, `wait_for_address`, etc.) and infrastructure (`netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup`). The Makefile's `integration-test` target auto-discovers all `tests/[0-9]*.sh` scripts. No Rust code changes are needed.
+16 of the 26 specified test scripts already exist. The remaining 10 scripts cover three functional areas: journal recording (2 scripts), history CLI (4 scripts), and revert CLI (4 scripts). All 10 follow the same structural pattern as existing scripts — boilerplate header, `netns_setup`, daemon startup with temp dirs, policy apply, then verification — with the addition of journal-specific env vars and `jq`-based JSON parsing.
 
-The only functional defect is a **dnsmasq process leak** in the two scripts that use DHCP: `tests/600-e2e-dhcp-and-static.sh` and `tests/600-e2e-unmanaged.sh`. Both override the EXIT trap that `netns_setup` installs (`trap cleanup EXIT`) with their own trap on line 37 that kills only the daemon PID and removes the temp directory — but omits the `cleanup` call. Since dnsmasq runs with `--no-daemon` in the background (started via `start_dnsmasq`), it survives the test shell's exit. Its stdout/stderr hold the pipe open, causing the Makefile test runner to hang indefinitely.
+The key architectural decision is how to handle the **daemon startup journal entry**. The daemon writes a `Trigger::DaemonStartup` entry (seq=1) during initial reconciliation before any user-initiated apply. This means the first `netfyr apply` produces seq=2, not seq=1. Rather than hardcoding seq offsets (brittle if daemon behavior changes), the tests dynamically extract seq numbers from the journal file using `jq` to filter by trigger type. For example, to find the first policy-apply entry's seq: `jq -r 'select(.trigger.type == "policy_apply") | .seq' current.ndjson | head -n 1`. This makes tests robust against any number of daemon-internal entries.
 
-The fix is a one-word addition to one line in each of two files: insert `cleanup;` into the EXIT trap string. The `cleanup` function in `helpers.sh` iterates `_DNSMASQ_PIDS` and kills each one. The spec template references `kill_dnsmasq` as a named helper, but `helpers.sh` implements dnsmasq cleanup under the name `cleanup` — there is no separate `kill_dnsmasq` function, and creating one would duplicate existing logic. Using `cleanup` is correct and consistent with every other test script's behavior via `netns_setup`.
+All journal/history/revert tests set `NETFYR_JOURNAL_DIR` on both the daemon process and every CLI invocation. The daemon writes journal entries to this directory; the CLI reads from it (either directly in local mode, or by connecting to the daemon which also reads from it). Setting it on both is redundant when the daemon is running (the CLI goes through the daemon Varlink API) but harmless and necessary for the `revert-noent` test where the daemon may not be reachable in some fallback paths.
+
+The tests use flexible pattern matching for output verification — `grep -qi "not found"` rather than exact string comparison, `grep -q "mtu"` rather than matching the full `mtu: 1300 -> 1400` format string. This insulates tests from cosmetic output changes.
 
 ## Design Decisions
 
-1. **Decision**: Call `cleanup` in the EXIT trap rather than creating a new `kill_dnsmasq` helper.
-   - **Alternatives considered**: (a) Add a `kill_dnsmasq` function to `helpers.sh` and call it in the trap as the spec template shows; (b) Inline `kill` calls for dnsmasq PIDs directly in the trap; (c) Remove the test-specific trap entirely and rely on `netns_setup`'s default `trap cleanup EXIT`.
-   - **Rationale**: `cleanup` already exists, already kills dnsmasq PIDs via `_DNSMASQ_PIDS`, and is what `netns_setup` registers as the default EXIT handler. Creating `kill_dnsmasq` would duplicate `cleanup`'s body. Inlining kill logic would bypass the `_DNSMASQ_PIDS` array. Removing the test-specific trap entirely (option c) would lose the daemon kill and tmpdir removal. Adding `cleanup` to the existing trap is the minimal, correct fix.
+1. **Decision**: Dynamically extract seq numbers from `current.ndjson` rather than hardcoding expected seq values.
+   - **Alternatives considered**: (a) Hardcode seq=2 for first apply (accounting for startup entry at seq=1); (b) Suppress the daemon startup entry via a flag; (c) Filter by trigger type in the test assertions.
+   - **Rationale**: Option (a) breaks if the daemon adds or removes internal events. Option (b) requires Rust code changes, which the spec prohibits. Option (c) — dynamic extraction — is robust and self-documenting. Using `jq 'select(.trigger.type == "policy_apply")'` explicitly states what we're testing.
 
-2. **Decision**: Place `cleanup` after the daemon kill and before `rm -rf "$TMPDIR_TEST"` in the trap.
-   - **Alternatives considered**: Placing it before the daemon kill, or after `rm -rf`.
-   - **Rationale**: Kill the daemon first (the main process under test), then kill dnsmasq (supporting infrastructure), then remove the temp directory. This ordering ensures dnsmasq doesn't try to write to its lease file (in the temp directory) after the directory is deleted. It also matches the logical teardown order: stop all processes, then clean filesystem.
+2. **Decision**: Require `jq` and check for it at the top of each script that uses it, failing with `exit 1` (not skip).
+   - **Alternatives considered**: (a) Parse JSON with `grep`/`sed`; (b) Use Python for JSON parsing; (c) Skip tests if `jq` is absent.
+   - **Rationale**: The spec rule is "No skip: if a prerequisite is missing, exit 1." `jq` is the standard CLI JSON tool and is available in the CI environment. Parsing JSON with `grep` is fragile for nested structures. Python adds a heavier dependency. Six of the 10 scripts need `jq`; the other four (history-list, history-show, revert, revert-noent) can verify text output with `grep` alone.
 
-3. **Decision**: Do not change the duplicate-address exit code check in `600-e2e-addr-duplicate-reject.sh` from "non-zero" to "exactly 2".
-   - **Alternatives considered**: Tightening the assertion to check for exit code 2 specifically, as the acceptance criteria state.
-   - **Rationale**: The existing script checks for any non-zero exit code and includes a comment explaining this is intentional resilience. The test correctly validates the failure case — exit 0 would be the real bug. Tightening to exit code 2 would create brittle coupling to the CLI's error-code mapping, which is an implementation detail. The current behavior is a reasonable interpretation of the spec.
+3. **Decision**: Set `NETFYR_JOURNAL_DIR` on every CLI command invocation, not just the daemon.
+   - **Alternatives considered**: Only set it on the daemon and rely on the daemon Varlink API for all reads.
+   - **Rationale**: The `history` CLI falls back to direct journal reads if the daemon connection fails. While this shouldn't happen in our tests (daemon is running), setting `NETFYR_JOURNAL_DIR` on CLI commands too is defensive and costs nothing.
 
-4. **Decision**: No changes to any non-DHCP test scripts.
-   - **Alternatives considered**: Adding `cleanup` to all test trap handlers for consistency.
-   - **Rationale**: Non-DHCP tests never call `start_dnsmasq`, so `_DNSMASQ_PIDS` is empty and `cleanup` is a no-op. Adding it would be harmless but adds noise to an otherwise minimal fix. Each test runs in its own network namespace, so there's no cross-test contamination risk.
+4. **Decision**: The `revert-noent` test starts a daemon even though the spec template doesn't show daemon setup.
+   - **Alternatives considered**: Run `netfyr revert 9999` without a daemon (standalone mode).
+   - **Rationale**: In standalone mode, `run_revert_standalone` reads the journal directly and prints "Error: Entry #9999 not found". But the journal directory must exist and contain a valid journal (with `.seq` file). It's simpler and more realistic to start a daemon (which creates the journal and writes a startup entry) and test through the daemon path — this is how users actually invoke revert. The daemon path returns `VarlinkError::EntryNotFound` with the message "Entry #9999 not found", which the CLI prints as "Error: Entry #9999 not found".
+
+5. **Decision**: No veth pairs needed for `revert-noent` — just start the daemon with empty policy dir.
+   - **Alternatives considered**: Create a veth pair for consistency with other tests.
+   - **Rationale**: The test only verifies error handling for a missing seq number. No network state changes are needed. The daemon starts fine in a network namespace with only the loopback interface.
+
+6. **Decision**: Use `cleanup` in EXIT traps for consistency, even in scripts without dnsmasq.
+   - **Alternatives considered**: Only call `cleanup` in scripts that use dnsmasq.
+   - **Rationale**: Looking at existing scripts, tests without dnsmasq do NOT call `cleanup` (e.g., `600-e2e-static-apply.sh`). I'll follow this convention: only add `cleanup` to EXIT traps in scripts that call `start_dnsmasq`. None of the 10 new scripts use dnsmasq, so their traps follow the simpler pattern: `trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT`.
+
+7. **Decision**: For the `history-filter` test, use two separate `netfyr apply` calls with individual policy files (not a directory apply).
+   - **Alternatives considered**: Apply a directory containing both policies at once.
+   - **Rationale**: The filter test needs each apply to produce a distinct journal entry (one for veth-a0, one for veth-b0). A directory apply produces a single journal entry covering both interfaces, making filtering ambiguous. Two separate applies produce two entries, each referencing a single interface in its diff.
+
+8. **Decision**: For the `revert-dry-run` test, match output for "mtu" (flexible) rather than exact "mtu: 1300 -> 1400" format.
+   - **Alternatives considered**: Match the exact string "mtu: 1300 -> 1400".
+   - **Rationale**: The daemon-mode dry-run builds a VarlinkApplyReport with descriptions formatted as `"mtu: 1300 -> 1400"` (server.rs line 489). This could be matched exactly. However, the surrounding output includes ANSI color codes (from `colored` crate), which makes exact matching unreliable unless piped through `grep --color=never` or `sed` to strip them. Using `grep -q "mtu"` combined with `grep -q "1300"` and `grep -q "1400"` is robust and verifies the essential content.
+
+9. **Decision**: For the `journal-apply` test, verify JSON structure via `jq` queries on `current.ndjson` rather than through the `netfyr history -o json` CLI command.
+   - **Alternatives considered**: Use `netfyr history --show 1 -o json` and parse that output.
+   - **Rationale**: The spec explicitly says to verify `current.ndjson` directly. Reading the file also validates that the daemon actually wrote to the configured journal directory. Using the CLI would test a different code path (the Varlink API and CLI formatting) which has its own dedicated tests.
 
 ## File Changes
 
-### `tests/600-e2e-dhcp-and-static.sh`
-- **Action**: modify
-- **What**: On line 37, add `cleanup;` to the EXIT trap string. Change:
-  ```bash
-  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
-  ```
-  to:
-  ```bash
-  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
-  ```
-- **Why**: Without `cleanup`, dnsmasq processes started by `start_dnsmasq` on line 51 are never killed when the test exits. The `cleanup` function in `helpers.sh` iterates `_DNSMASQ_PIDS` and kills each PID. This prevents process leaks that cause the test runner to hang.
+### `tests/600-e2e-journal-apply.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR` to temp dir, starts daemon, applies static policy (mtu=1400 on `veth-e2e0`), then verifies `current.ndjson` via `jq`:
+  - File exists
+  - Last policy-apply entry (filtered by `.trigger.type == "policy_apply"`) has:
+    - `.trigger.type` == `"policy_apply"`
+    - `.diff.operations` contains an entry with `entity_name == "veth-e2e0"` and a field change for `mtu`
+    - `.state_after.entities` contains an entry with `entity_type == "ethernet"` and `selector_name == "veth-e2e0"` where `fields.mtu == 1400`
+    - `.outcome.kind` == `"applied"` with `.outcome.succeeded >= 1`
+  - Checks for `jq` at top of script.
+- **Why**: Validates that `netfyr apply` produces correct journal entries with proper metadata.
 
-### `tests/600-e2e-unmanaged.sh`
-- **Action**: modify
-- **What**: On line 37, add `cleanup;` to the EXIT trap string. Change:
-  ```bash
-  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
-  ```
-  to:
-  ```bash
-  trap 'kill "${DAEMON_PID:-}" 2>/dev/null || true; cleanup; rm -rf "$TMPDIR_TEST"' EXIT
-  ```
-- **Why**: Same dnsmasq leak issue as `600-e2e-dhcp-and-static.sh`. This script starts dnsmasq on line 56 via `start_dnsmasq`, and the EXIT trap must call `cleanup` to kill it.
+### `tests/600-e2e-journal-seq.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon, applies policy A (mtu=1400), then policy B (mtu=1300). Reads `current.ndjson`, filters to policy-apply entries with `jq`, and verifies:
+  - Exactly 2 policy-apply entries exist
+  - Their seq numbers are monotonically increasing (seq of second > seq of first)
+  - The timestamp of the first is earlier than or equal to the timestamp of the second
+  - Checks for `jq` at top.
+- **Why**: Validates monotonic sequence numbering across multiple applies.
+
+### `tests/600-e2e-history-list.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon, applies policy A (mtu=1400) then policy B (mtu=1300). Runs `NETFYR_SOCKET_PATH=... NETFYR_JOURNAL_DIR=... netfyr history -n 5` and captures output. Verifies:
+  - Output header contains "SEQ", "TIMESTAMP", "TRIGGER", "OUTCOME"
+  - At least 2 non-header lines mentioning "policy-apply" exist (daemon-startup entries may also appear)
+  - The first policy-apply entry has a higher seq than the second (reverse chronological order)
+  - Uses `grep` and `awk` for text parsing, no `jq` needed.
+- **Why**: Validates the `history` list view shows entries correctly.
+
+### `tests/600-e2e-history-show.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon, applies policy (mtu=1400 on `veth-e2e0`). Extracts the seq number of the policy-apply entry from `current.ndjson` using `jq`. Runs `netfyr history --show <seq>` and verifies:
+  - Output contains "Trigger:" and "policy-apply"
+  - Output contains "Diff:" and "mtu"
+  - Output contains "Outcome:" and "applied"
+  - Checks for `jq` at top (to extract the seq number).
+- **Why**: Validates the `history --show` detail view displays entry metadata.
+
+### `tests/600-e2e-history-json.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon, applies two policies sequentially. Runs `netfyr history -n 10 -o json --trigger apply` and pipes to `jq`. Verifies:
+  - Output is a valid JSON array (parseable by `jq`)
+  - Array has exactly 2 elements (2 policy-apply entries)
+  - Each element has `seq`, `timestamp`, `trigger`, `outcome` fields
+  - Checks for `jq` at top.
+- **Why**: Validates the JSON output format of the `history` command.
+
+### `tests/600-e2e-history-filter.sh`
+- **Action**: create
+- **What**: Shell test script. Creates two veth pairs (`veth-a0`/`veth-a1` and `veth-b0`/`veth-b1`), sets `NETFYR_JOURNAL_DIR`, starts daemon. Applies a policy for `veth-a0` (mtu=1400), then separately applies a policy for `veth-b0` (mtu=1300). Runs `netfyr history -s name=veth-a0` and verifies:
+  - Output contains "veth-a0"
+  - Output does NOT contain "veth-b0" (unless in a header or unrelated text)
+  - Verifies there's exactly 1 data line mentioning policy-apply
+  - Uses `grep` for text output verification.
+- **Why**: Validates the `-s name=` filter on the `history` command.
+
+### `tests/600-e2e-revert.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon. Applies policy A (mtu=1400), extracts its seq from `current.ndjson` (the policy-apply entry). Applies policy B (mtu=1300), verifies mtu=1300. Runs `netfyr revert <seq_of_A>`. Verifies:
+  - mtu is now 1400 (restored)
+  - `current.ndjson` has a new entry with `.trigger.type == "revert"`
+  - Checks for `jq` at top (to extract seq and verify revert entry).
+- **Why**: Validates that `revert` restores previous network state.
+
+### `tests/600-e2e-revert-dry-run.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon. Applies policy A (mtu=1400), extracts seq. Applies policy B (mtu=1300). Runs `netfyr revert <seq_of_A> --dry-run` and captures output. Verifies:
+  - Output mentions "mtu" (the field that would change)
+  - Output mentions "1300" and "1400" (the old and new values)
+  - `ip link show veth-e2e0` still shows mtu 1300 (no change applied)
+  - The count of policy-apply entries in `current.ndjson` is still 2 (no revert entry created)
+  - Checks for `jq` at top.
+- **Why**: Validates that `revert --dry-run` previews without modifying state.
+
+### `tests/600-e2e-revert-noent.sh`
+- **Action**: create
+- **What**: Shell test script. Sets `NETFYR_JOURNAL_DIR` to temp dir, starts daemon (no veth pairs needed). Waits for socket. Runs `netfyr revert 9999` and captures exit code and output (stderr). Verifies:
+  - Exit code is 1
+  - Output (stderr) contains "not found" (case-insensitive)
+  - No `jq` needed.
+- **Why**: Validates graceful error handling for reverting to a nonexistent entry.
+
+### `tests/600-e2e-revert-addr.sh`
+- **Action**: create
+- **What**: Shell test script. Creates veth pair, sets `NETFYR_JOURNAL_DIR`, starts daemon. Applies policy A with addresses `10.99.0.1/24` and `10.99.0.2/24`, extracts seq. Applies policy B with address `10.99.0.3/24`, verifies only `10.99.0.3/24` present. Runs `netfyr revert <seq_of_A>`. Verifies:
+  - `veth-e2e0` has addresses `10.99.0.1/24` and `10.99.0.2/24`
+  - `veth-e2e0` does NOT have address `10.99.0.3/24`
+  - Checks for `jq` at top (to extract seq).
+- **Why**: Validates that revert correctly restores address sets.
 
 ## Dependencies
 
-No new crate dependencies. No new system tool dependencies. No changes to `Cargo.toml` or `helpers.sh`.
+No new crate dependencies. No Rust code changes. No Makefile changes.
+
+**External tool dependency**: `jq` is required by 8 of the 10 new scripts (all except `revert-noent` and `history-list`). Each script that uses `jq` checks `command -v jq` at startup and exits with `FAIL` if absent, per the spec's "no skip" rule.
 
 ## Implementation Order
 
-1. **Modify `tests/600-e2e-dhcp-and-static.sh` line 37**: Add `cleanup;` to the EXIT trap.
-2. **Modify `tests/600-e2e-unmanaged.sh` line 37**: Add `cleanup;` to the EXIT trap.
+All 10 scripts are independent of each other — they can be created in any order. However, for logical coherence and easier debugging during development:
 
-Both edits are independent — neither depends on the other. They can be done in either order or in parallel. After both edits, the project is complete. Each edit is a single-line change that maintains a compilable (well, runnable) state.
+1. **`tests/600-e2e-journal-apply.sh`** — Foundation: validates journal entries exist after apply. All subsequent journal/history/revert tests depend on this behavior working.
+2. **`tests/600-e2e-journal-seq.sh`** — Validates seq numbering, which revert tests depend on.
+3. **`tests/600-e2e-history-list.sh`** — Simplest history test (text output, no jq for assertions).
+4. **`tests/600-e2e-history-show.sh`** — History detail view.
+5. **`tests/600-e2e-history-json.sh`** — History JSON output.
+6. **`tests/600-e2e-history-filter.sh`** — History filtering.
+7. **`tests/600-e2e-revert.sh`** — Core revert functionality.
+8. **`tests/600-e2e-revert-dry-run.sh`** — Revert preview.
+9. **`tests/600-e2e-revert-noent.sh`** — Simplest revert error case (no veth needed).
+10. **`tests/600-e2e-revert-addr.sh`** — Revert with address changes (most complex).
+
+Each step produces a runnable, self-contained test script. No step depends on a previous step being complete — the ordering is for logical grouping only.
 
 ## Risks and Mitigations
 
-1. **Risk**: `cleanup` might interfere with the daemon kill if called at the wrong point in the trap sequence.
-   - **Mitigation**: `cleanup` only kills PIDs in `_DNSMASQ_PIDS`. The daemon PID is in `DAEMON_PID` and is killed by the explicit `kill "${DAEMON_PID:-}"` that precedes the `cleanup` call. There is no overlap.
+1. **Risk**: Daemon startup entry contaminates seq number assertions.
+   - **Impact**: Tests that expect "2 entries" might see 3 (startup + 2 applies).
+   - **Mitigation**: All journal counting and seq extraction filters by `trigger.type == "policy_apply"` (or "revert") to exclude daemon-startup and external-change entries. The journal-seq test explicitly counts only policy-apply entries.
 
-2. **Risk**: The daemon restart test (`600-e2e-daemon-restart.sh`) may race if the daemon defers initial reconciliation after socket creation.
-   - **Mitigation**: Pre-existing condition, not introduced by this change. The test resets MTU to 1500 after killing the first daemon, then checks that the new daemon restores it to 1400. If the daemon performs reconciliation asynchronously after creating the socket, the assertion could fire before reconciliation completes. However, the daemon currently reconciles synchronously at startup before binding the socket. If this becomes flaky, adding a polling loop for the expected MTU (similar to `wait_for_address`) would fix it.
+2. **Risk**: `jq` not installed in the test environment.
+   - **Impact**: 8 of 10 scripts would fail with "command not found".
+   - **Mitigation**: Each script checks `command -v jq` at the top and exits with a clear FAIL message. CI environments typically have `jq` installed.
 
-3. **Risk**: The duplicate-address test (`600-e2e-addr-duplicate-reject.sh`) checks for any non-zero exit rather than exit code 2 specifically.
-   - **Mitigation**: Accepted as-is per Design Decision 3. The test correctly validates the failure case.
+3. **Risk**: Daemon creates journal directory structure (`current.ndjson`, `archive/`, `.seq`) — if the journal directory doesn't exist at daemon startup, `Journal::open` creates it.
+   - **Impact**: Tests that set `NETFYR_JOURNAL_DIR` must ensure the directory exists before daemon starts.
+   - **Mitigation**: `Journal::open` calls `std::fs::create_dir_all`, so it creates the directory if missing. Tests create the journal dir parent via `TMPDIR_TEST=$(mktemp -d)` and set `NETFYR_JOURNAL_DIR="$TMPDIR_TEST/journal"`. The daemon's `Journal::open_default()` will create the `journal/` subdirectory.
 
-4. **Risk**: Address ordering tests depend on the kernel returning addresses in insertion order and the entire pipeline preserving that order.
-   - **Mitigation**: Linux returns IPv4 addresses in insertion order by default. `Value::List` is a `Vec` (ordered). `IndexMap` preserves insertion order. The YAML parser builds lists in document order. This is a pre-existing assumption, validated by the existing tests passing.
+4. **Risk**: Race condition between `netfyr apply` completing and journal entry being flushed to disk.
+   - **Impact**: Tests that read `current.ndjson` immediately after apply might not see the latest entry.
+   - **Mitigation**: The `netfyr apply` CLI command returns only after the daemon's Varlink response is received, which happens after the journal entry is written and flushed (the journal append uses `fsync` semantics via write + flush). There should be no race.
 
-5. **Risk**: The `cleanup` function in `helpers.sh` uses `"${_DNSMASQ_PIDS[@]:-}"` expansion which could behave differently in strict `set -u` mode across bash versions.
-   - **Mitigation**: The existing code already uses `:-}` to provide an empty default when the array is empty, which is compatible with bash 4.x+ under `set -u`. This pattern is already used in every test via the default `netns_setup` trap — the fix simply ensures the DHCP tests also call it.
+5. **Risk**: The `history` CLI connects to the daemon and gets filtered results — the daemon's filter implementation may differ from direct journal reads.
+   - **Impact**: History filter test might pass with daemon but fail without, or vice versa.
+   - **Mitigation**: The filter test verifies behavior through the daemon (since daemon is running), which is the primary usage path. The daemon's `handle_get_history` in server.rs applies filters server-side using the same `matches_selector` and `matches_trigger` logic.
+
+6. **Risk**: ANSI color codes in `netfyr revert --dry-run` output interfere with `grep` matching.
+   - **Impact**: `grep -q "mtu"` might fail if "mtu" is split across ANSI escape sequences.
+   - **Mitigation**: ANSI codes are typically inserted around the whole string, not splitting individual words. The `colored` crate wraps entire `format!()` outputs. Testing confirms that `grep` matches through ANSI codes (since `grep` matches bytes, not rendered text). If this becomes flaky, the test can pipe through `sed 's/\x1b\[[0-9;]*m//g'` to strip codes.
+
+7. **Risk**: The `revert-addr` test depends on the revert mechanism correctly computing and applying address diffs.
+   - **Impact**: If the backend's address apply logic has bugs, this test exposes them but the fix would be in another story.
+   - **Mitigation**: This is an integration test — exposing bugs is the point. If the test fails, it provides a clear signal that the address revert path needs fixing.
+
+8. **Risk**: The history-filter test uses two separate applies, but the daemon-startup entry might also reference one of the veth interfaces (if the daemon queries existing interfaces during startup reconciliation).
+   - **Impact**: The filter for `name=veth-a0` might return 2 entries instead of 1 if the startup entry's diff lists veth-a0.
+   - **Mitigation**: The startup reconciliation with no policies produces an empty desired state. The diff between empty desired and current state may show veth-a0 as a "removal" candidate, but the daemon doesn't actually remove unmanaged interfaces — it writes a diff with empty operations (since no policies target anything). Verify by checking: if the startup entry has empty `diff.operations`, the selector filter won't match it (since `matches_selector` checks `diff.operations.iter().any(|op| op.entity_name == value)`). This should be safe.
 
 ## Test Strategy
 
-This story IS the test suite — the 16 scripts are the deliverable. Verification:
+This story produces only shell test scripts — no Rust code. The verification strategy is:
 
-1. **`make integration-test SPEC=600`**: Run all 16 end-to-end test scripts. All must print `PASS: 600-e2e-<name>` and exit 0.
+1. **Primary: `make integration-test`** — Run all shell integration tests including the 10 new 600-series scripts. All must print `PASS: 600-e2e-<name>` and exit 0.
 
-2. **Process leak verification**: After running the two DHCP tests (`600-e2e-dhcp-and-static.sh`, `600-e2e-unmanaged.sh`), verify no orphaned dnsmasq processes remain. Before the fix, `pgrep dnsmasq` after the test runner completes would find leaked processes; after the fix, it should find nothing.
+2. **Individual script testing** — Each script can be run independently: `bash tests/600-e2e-journal-apply.sh`. This is useful during development to iterate on a single test.
 
-3. **Hang verification**: Before the fix, running `make integration-test SPEC=600` would hang after the DHCP tests complete (waiting for dnsmasq I/O to close). After the fix, the runner should proceed cleanly to subsequent tests.
+3. **Regression: `cargo test`** — Run to verify no Rust regressions. This story adds no Rust code, so this is a sanity check.
 
-4. **`cargo test`**: Run to verify no Rust regressions. This story adds no Rust code, so this is a sanity check only.
+4. **Journal content inspection** — During development, manually inspect `current.ndjson` in the test temp directory to verify the actual JSON structure matches test assertions. This helps calibrate `jq` queries.
 
-5. **No new tests to write**: All 16 test scripts exist. The `helpers.sh` functions they depend on exist. The only change is the trap fix, which is verified by tests 2 (DHCP+static) and 16 (unmanaged) completing and cleaning up properly.
+### What to test (by script):
+- **journal-apply**: Journal entry exists, trigger type correct, diff references target entity/field, state_after has correct values, outcome indicates success.
+- **journal-seq**: Multiple entries have monotonically increasing seq numbers and non-decreasing timestamps.
+- **history-list**: Text output has header row with column names, data rows with correct info, reverse chronological order.
+- **history-show**: Detail output shows trigger, diff, and outcome sections.
+- **history-json**: Valid JSON array, correct element count, each element has required fields.
+- **history-filter**: Only matching entries shown, non-matching entries excluded.
+- **revert**: State restoration verified via `ip` commands, new journal entry with revert trigger.
+- **revert-dry-run**: Output mentions planned changes, state unchanged, no new journal entry.
+- **revert-noent**: Exit code 1, error output contains "not found".
+- **revert-addr**: Address set restored correctly, old addresses removed.
+
+### Common boilerplate to follow (from existing tests):
+- Header: `#!/bin/bash`, `set -euo pipefail`, source helpers, binary checks
+- `netns_setup "$@"`
+- `TMPDIR_TEST=$(mktemp -d)` with EXIT trap
+- Socket wait loop with daemon liveness check
+- Apply with exit code capture: `APPLY_EXIT=0; ... || APPLY_EXIT=$?`
+- Final `echo "PASS: 600-e2e-<name>"`
+
+### Seq extraction pattern (used by 6 scripts):
+```bash
+APPLY_SEQ=$(jq -r 'select(.trigger.type == "policy_apply") | .seq' "$JOURNAL_DIR/current.ndjson" | tail -n 1)
+```
+This extracts the seq of the most recent policy-apply entry, skipping daemon-startup and other entries.
