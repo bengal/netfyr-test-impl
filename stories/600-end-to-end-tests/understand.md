@@ -3,122 +3,106 @@
 ## Current State
 
 ### Test infrastructure
-- `tests/helpers.sh` (232 lines) — shared library providing: `netns_setup`, `create_veth`, `add_address`, `start_dnsmasq`, `cleanup` (kills all dnsmasq PIDs in `_DNSMASQ_PIDS[]`), `wait_for_address`, and assertion functions (`assert_eq`, `assert_match`, `assert_has_address`, `assert_not_has_address`, `assert_mtu`, `assert_link_up`, `assert_address_count`, `assert_json_address_order`).
-- `Makefile` — `integration-test` target discovers tests via `tests/[0-9]*.sh`. This glob matches 600-*.sh files (the leading `6` is a digit), so all 600 tests are in the default run.
+`tests/helpers.sh` (232 lines) — fully implemented shared library providing:
+- `netns_setup` — unprivileged user+network namespace re-exec guard
+- `create_veth`, `add_address`, `start_dnsmasq`, `cleanup` (kills all dnsmasq PIDs)
+- `wait_for_address` — polls until address appears on interface
+- Assertion functions: `assert_eq`, `assert_match`, `assert_has_address`, `assert_not_has_address`, `assert_mtu`, `assert_link_up`, `assert_address_count`, `assert_json_address_order`
 
-### Existing 600-series test scripts (16 of 26 required)
+Note: `helpers.sh` has no `kill_dnsmasq` function. The spec template refers to it, but the actual convention is `cleanup` (which kills all dnsmasq instances started via `start_dnsmasq`). Existing DHCP tests call `cleanup` in their EXIT traps.
+
+`Makefile` — `integration-test` target discovers tests via `tests/[0-9]*.sh` glob. No changes needed.
+
+### Existing 600-series test scripts (26 of 27 required)
+All 26 are fully implemented (82–167 lines each):
+
 | File | Status |
 |---|---|
-| `tests/600-e2e-static-apply.sh` | exists |
-| `tests/600-e2e-dhcp-and-static.sh` | exists |
-| `tests/600-e2e-replace-all.sh` | exists |
-| `tests/600-e2e-daemon-restart.sh` | exists |
-| `tests/600-e2e-conflict.sh` | exists |
-| `tests/600-e2e-dry-run.sh` | exists |
-| `tests/600-e2e-apply-directory.sh` | exists |
-| `tests/600-e2e-addr-single.sh` | exists |
-| `tests/600-e2e-addr-five.sh` | exists |
-| `tests/600-e2e-addr-twenty.sh` | exists |
-| `tests/600-e2e-addr-replace.sh` | exists |
-| `tests/600-e2e-addr-idempotent.sh` | exists |
-| `tests/600-e2e-addr-duplicate-reject.sh` | exists |
-| `tests/600-e2e-addr-overlapping-subnets.sh` | exists |
-| `tests/600-e2e-addr-removal.sh` | exists |
-| `tests/600-e2e-unmanaged.sh` | exists |
-| `tests/600-e2e-journal-apply.sh` | **missing** |
-| `tests/600-e2e-journal-seq.sh` | **missing** |
-| `tests/600-e2e-history-list.sh` | **missing** |
-| `tests/600-e2e-history-show.sh` | **missing** |
-| `tests/600-e2e-history-json.sh` | **missing** |
-| `tests/600-e2e-history-filter.sh` | **missing** |
-| `tests/600-e2e-revert.sh` | **missing** |
-| `tests/600-e2e-revert-dry-run.sh` | **missing** |
-| `tests/600-e2e-revert-noent.sh` | **missing** |
-| `tests/600-e2e-revert-addr.sh` | **missing** |
+| `tests/600-e2e-static-apply.sh` | ✓ exists |
+| `tests/600-e2e-dhcp-and-static.sh` | ✓ exists |
+| `tests/600-e2e-replace-all.sh` | ✓ exists |
+| `tests/600-e2e-daemon-restart.sh` | ✓ exists |
+| `tests/600-e2e-conflict.sh` | ✓ exists |
+| `tests/600-e2e-dry-run.sh` | ✓ exists |
+| `tests/600-e2e-apply-directory.sh` | ✓ exists |
+| `tests/600-e2e-addr-single.sh` | ✓ exists |
+| `tests/600-e2e-addr-five.sh` | ✓ exists |
+| `tests/600-e2e-addr-twenty.sh` | ✓ exists |
+| `tests/600-e2e-addr-replace.sh` | ✓ exists |
+| `tests/600-e2e-addr-idempotent.sh` | ✓ exists |
+| `tests/600-e2e-addr-duplicate-reject.sh` | ✓ exists |
+| `tests/600-e2e-addr-overlapping-subnets.sh` | ✓ exists |
+| `tests/600-e2e-addr-removal.sh` | ✓ exists |
+| `tests/600-e2e-journal-apply.sh` | ✓ exists |
+| `tests/600-e2e-journal-seq.sh` | ✓ exists |
+| `tests/600-e2e-history-list.sh` | ✓ exists |
+| `tests/600-e2e-history-show.sh` | ✓ exists |
+| `tests/600-e2e-history-json.sh` | ✓ exists |
+| `tests/600-e2e-history-filter.sh` | ✓ exists |
+| `tests/600-e2e-revert.sh` | ✓ exists |
+| `tests/600-e2e-revert-dry-run.sh` | ✓ exists |
+| `tests/600-e2e-revert-noent.sh` | ✓ exists |
+| `tests/600-e2e-revert-addr.sh` | ✓ exists |
+| `tests/600-e2e-unmanaged.sh` | ✓ exists |
+| **`tests/600-e2e-external-change.sh`** | **✗ MISSING** |
 
-### NETFYR_JOURNAL_DIR support
-`Journal::open_default()` (`crates/netfyr-journal/src/journal.rs:46`) reads `NETFYR_JOURNAL_DIR`, falling back to `/var/lib/netfyr/journal/`. The daemon's `reconciler.rs:67` and `server.rs:305,378,422` all call `Journal::open_default()`, so setting this env var on the daemon process redirects all journal writes. The `history` CLI (`crates/netfyr-cli/src/history.rs:583`) and `revert` CLI (`crates/netfyr-cli/src/revert.rs:98`) also read this env var through the same function.
-
-### Journal file layout
-`Journal::open` creates `current.ndjson` and an `archive/` subdirectory inside the configured journal directory. Each apply/revert/startup event appends one JSON line to `current.ndjson`.
-
-### helpers.sh naming vs spec template
-The spec template shows `kill_dnsmasq; cleanup` in EXIT traps. The actual `helpers.sh` merges both roles into a single `cleanup()` function. Existing 600 tests (e.g., `600-e2e-dhcp-and-static.sh`) call `cleanup` in their EXIT traps. There is no `kill_dnsmasq` function in `helpers.sh`.
+### Daemon env-var surface
+The daemon honors `NETFYR_SOCKET_PATH`, `NETFYR_POLICY_DIR`, and `NETFYR_JOURNAL_DIR` env vars. All tests that need journal isolation pass `NETFYR_JOURNAL_DIR` pointing to a temp directory. `Journal::open_default()` in `crates/netfyr-journal/src/journal.rs` reads this env var, falling back to `/var/lib/netfyr/journal/`.
 
 ---
 
 ## Requirements
 
-The 10 missing scripts cover three functional areas: journal recording, history CLI, and revert CLI.
+26 of 27 scenarios are already implemented. The single remaining requirement is:
 
-### Journal tests
-- **600-e2e-journal-apply.sh**: After `netfyr apply`, `current.ndjson` must exist; the relevant entry must have a trigger indicating policy apply, reference the target interface and mtu in the diff, include `state_after` with correct mtu, and have an outcome indicating success.
-- **600-e2e-journal-seq.sh**: Two sequential applies produce 2 entries in `current.ndjson`; the second entry has a higher seq number; the first entry's timestamp is earlier than the second.
+**Scenario 26 — External change detection** (`600-e2e-external-change.sh`):
 
-### History CLI tests
-- **600-e2e-history-list.sh**: `netfyr history -n 5` after two applies lists 2 entries in reverse chronological order showing SEQ, TIMESTAMP, TRIGGER, OUTCOME columns.
-- **600-e2e-history-show.sh**: `netfyr history --show 1` displays trigger, diff, and outcome detail for entry 1.
-- **600-e2e-history-json.sh**: `netfyr history -n 5 -o json` emits a valid JSON array with 2 elements each containing `seq`, `timestamp`, `trigger`, `outcome`; parseable by `jq`.
-- **600-e2e-history-filter.sh**: `netfyr history -s name=veth-a0` after applies on two different interfaces shows only the entry for `veth-a0`.
+The test exercises three external-change phases in sequence:
 
-### Revert CLI tests
-- **600-e2e-revert.sh**: After mtu=1400 (seq=1) then mtu=1300 (seq=2), `netfyr revert 1` restores mtu=1400 and creates a new journal entry with a revert trigger.
-- **600-e2e-revert-dry-run.sh**: `netfyr revert 1 --dry-run` outputs the planned mtu change but does not modify the interface or add a journal entry (entry count stays at 2).
-- **600-e2e-revert-noent.sh**: `netfyr revert 9999` exits with code 1 and output contains "not found".
-- **600-e2e-revert-addr.sh**: After addresses [10.99.0.1/24, 10.99.0.2/24] (seq=1) then [10.99.0.3/24] (seq=2), `netfyr revert 1` restores the two original addresses and removes 10.99.0.3/24.
+1. **MTU change**: Start daemon, apply policy setting `mtu=1400` on `veth-e2e0`. Externally run `ip link set veth-e2e0 mtu 1500`. Sleep 1 s (debounce window). Assert latest journal entry has `trigger.type == "external_change"` and diff shows `mtu 1400→1500`. Assert `ip link show` still reports `mtu=1500` (no re-reconcile).
+
+2. **Address additions**: Externally run `ip addr add 10.99.0.1/24 dev veth-e2e0` and `ip addr add 10.99.0.2/24 dev veth-e2e0`. Sleep 1 s. Assert new `external_change` journal entry with address-addition diff. Assert both addresses are present.
+
+3. **Address removal**: Externally run `ip addr del 10.99.0.1/24 dev veth-e2e0`. Sleep 1 s. Assert new `external_change` journal entry with address-removal diff. Assert only `10.99.0.2/24` remains.
+
+4. **No re-reconcile**: Throughout all phases, verify the daemon never re-applied `mtu=1400`.
+
+The script requires `jq` (same pattern as `600-e2e-revert.sh`). No DHCP needed. No `kill_dnsmasq`.
 
 ---
 
 ## Gap Analysis
 
-### Files to create (10 new shell scripts)
-| File | What to implement |
-|---|---|
-| `tests/600-e2e-journal-apply.sh` | Apply policy, parse `current.ndjson` with `jq`, assert trigger/diff/state_after/outcome fields |
-| `tests/600-e2e-journal-seq.sh` | Apply twice, count lines in `current.ndjson`, assert seq progression and timestamp ordering |
-| `tests/600-e2e-history-list.sh` | Apply twice, run `netfyr history -n 5`, assert 2 rows with required columns |
-| `tests/600-e2e-history-show.sh` | Apply once, run `netfyr history --show 1`, assert trigger/diff/outcome in output |
-| `tests/600-e2e-history-json.sh` | Apply twice, run `netfyr history -n 5 -o json`, pipe to `jq`, assert array length and fields |
-| `tests/600-e2e-history-filter.sh` | Apply to two interfaces, run `netfyr history -s name=veth-a0`, assert only veth-a0 entry shown |
-| `tests/600-e2e-revert.sh` | Apply A then B, run `netfyr revert 1`, assert mtu restored and new journal entry present |
-| `tests/600-e2e-revert-dry-run.sh` | Apply A then B, run `netfyr revert 1 --dry-run`, assert diff in output but mtu unchanged and no new entry |
-| `tests/600-e2e-revert-noent.sh` | Run `netfyr revert 9999` (no prior applies needed), assert exit=1 and "not found" in output |
-| `tests/600-e2e-revert-addr.sh` | Apply addr-set-A then addr-set-B, revert to 1, assert correct addresses present/absent |
+### Files to create
+- **`tests/600-e2e-external-change.sh`** — the only missing file. Approximately 160–200 lines following the established pattern: binary checks, `jq` check, `netns_setup`, temp dirs with `JOURNAL_DIR`, single veth pair, daemon start with socket poll and `NETFYR_JOURNAL_DIR` set, three sequential external-change phases each followed by a `sleep 1` and journal assertions, final no-re-apply check.
 
 ### Files to modify
-- **None** — no Rust code changes, no Makefile changes, no helpers.sh changes required.
+None. No Rust code, no helpers.sh changes, no Makefile changes are required.
 
 ---
 
 ## Integration Points
 
-| Component | How the new tests interact |
+| Component | How the new test interacts |
 |---|---|
-| `target/debug/netfyr-daemon` | Started with `NETFYR_SOCKET_PATH`, `NETFYR_POLICY_DIR`, and `NETFYR_JOURNAL_DIR` env vars; all 10 journal/history/revert tests need daemon writes to journal |
-| `target/debug/netfyr apply` | `crates/netfyr-cli/src/apply.rs::run_apply` — triggers journal write via daemon Varlink on each apply |
-| `target/debug/netfyr history` | `crates/netfyr-cli/src/history.rs::run_history` — reads `NETFYR_JOURNAL_DIR` directly from filesystem, no daemon needed for the read |
-| `target/debug/netfyr revert` | `crates/netfyr-cli/src/revert.rs::run_revert` — reads journal for `state_after`, applies diff via daemon Varlink; needs daemon running |
-| `Journal::open_default()` | `crates/netfyr-journal/src/journal.rs:46` — creates `current.ndjson` and `archive/` in `NETFYR_JOURNAL_DIR` |
-| `tests/helpers.sh` — `cleanup` | New DHCP tests (if any) must call `cleanup` in EXIT trap |
+| `target/debug/netfyr-daemon` | Started with `NETFYR_SOCKET_PATH`, `NETFYR_POLICY_DIR`, `NETFYR_JOURNAL_DIR`; must implement `NetlinkMonitor`-based external-change detection (SPEC-353) writing `trigger.type = "external_change"` journal entries |
+| `target/debug/netfyr apply` | Used to establish initial managed state (mtu=1400) before external changes |
+| `tests/helpers.sh` — `create_veth`, `cleanup` | Used for veth pair setup and EXIT trap |
+| `Journal::open_default()` | Creates `current.ndjson` in `NETFYR_JOURNAL_DIR`; assertions parse this file with `jq` |
+| `tests/[0-9]*.sh` glob | New script auto-discovered by `make integration-test`; no Makefile changes needed |
 
 ---
 
 ## Risks
 
-### Daemon startup journal entry
-`reconciler.rs:67` calls `Journal::open_default()` on `Trigger::DaemonStartup`. This means `current.ndjson` may already contain seq=1 as a startup entry before the first `netfyr apply`. The journal-seq test and revert tests that reference specific seq numbers (e.g., "seq=1 is the first apply") must account for the startup entry being seq=1, pushing the first apply to seq=2. This needs verification against actual daemon behavior before writing the assertions.
+1. **Debounce timing**: The spec uses `sleep 1` between external changes and journal assertions. If the daemon's netlink debounce window is longer than 1 second, assertions will fail because the journal entry has not yet been written. The sleep duration must match or exceed the actual debounce interval.
 
-### jq availability
-The history-json and journal-apply tests require `jq` to parse JSON. If `jq` is not installed, scripts fail with a cryptic "command not found" error. Each script that uses `jq` must check `command -v jq` at startup and `exit 1` with a clear FAIL message if absent.
+2. **Address vs. link events**: The `NetlinkMonitor` must watch both link-level events (MTU) and address-level events (add/del). If it only monitors link events, phases 2 and 3 will not produce journal entries and the test will fail. This is a dependency on SPEC-353's implementation scope.
 
-### Journal archive subdirectory
-`Journal::open` creates `archive/` inside the journal directory. If the journal directory does not exist, the open fails. Tests must create `TMPDIR_TEST/journal` (or similar) before starting the daemon. The revert-noent test uses no daemon, so it must either pre-create `archive/` itself or use the CLI's own handling of a missing journal (exit code 1 with "not found" or similar).
+3. **Batched journal entries**: Multiple external changes in rapid succession (e.g., two `ip addr add` commands) may be coalesced into a single journal entry by the debounce logic. The test should count cumulative journal entries across phases (not require exactly one new entry per individual `ip` command) or insert a deliberate pause between each command.
 
-### Trigger field name in serialized JSON
-The spec references `trigger.type` in `current.ndjson`. The actual serialized field names depend on the serde configuration of `Trigger` in `crates/netfyr-journal/src/entry.rs`. Tests must use the actual emitted field names, verified empirically. Using `jq` with flexible queries (e.g., `jq '.trigger | has("type")'`) is safer than hardcoding the exact field path.
+4. **No-re-apply assertion is a negative**: Verifying "daemon did not re-apply mtu=1400" is expressed as a positive check that `ip link show veth-e2e0` still reports `mtu=1500` after each phase. This is correct behavior to assert but does not catch cases where re-application happened and then the daemon reverted itself.
 
-### revert-dry-run output format
-The spec expects the dry-run output to contain "mtu: 1300 -> 1400". The exact format comes from `DryRunReport::summary()` in `crates/netfyr-backend/src/report.rs`. Tests should match with a flexible pattern (e.g., `assert_match "$OUTPUT" "mtu"`) rather than requiring exact formatting.
+5. **jq availability**: The script must check `command -v jq` at startup and `exit 1` with a clear FAIL message, consistent with `600-e2e-revert.sh` line 26–29.
 
-### helpers.sh `kill_dnsmasq` naming
-The spec template uses `kill_dnsmasq` in EXIT traps. The actual helpers.sh uses `cleanup`. New scripts must use `cleanup`, not `kill_dnsmasq`, to match the existing convention and avoid `command not found` errors.
+6. **`kill_dnsmasq` spec artifact**: The spec template mentions `kill_dnsmasq` in EXIT traps. The new script does not involve DHCP, so this is irrelevant. The EXIT trap should follow the non-DHCP pattern: `kill "${DAEMON_PID:-}" 2>/dev/null || true; rm -rf "$TMPDIR_TEST"` (no `cleanup` needed since no dnsmasq is started).

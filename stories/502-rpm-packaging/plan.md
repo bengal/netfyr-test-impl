@@ -2,204 +2,115 @@
 
 ## Approach
 
-This story creates the RPM packaging infrastructure for netfyr: a spec file, a build helper script, and supporting files (LICENSE, example policies, .gitignore update). No Rust code is modified — this is purely a packaging task producing four new files and two small edits.
+The RPM packaging infrastructure is already implemented. Four files exist: `netfyr.spec`, `scripts/build-rpm.sh`, `dist/systemd/netfyr.service`, and `dist/systemd/netfyr.socket`. All supporting artifacts (man pages in `man/`, example policy in `examples/policies/`, `LICENSE` file, `.gitignore` with `/vendor`) are in place.
 
-The spec file produces two binary RPMs (`netfyr` and `netfyr-daemon`) from a single source RPM, following Fedora's `rust-packaging` conventions. The build uses vendored dependencies (offline mode via `%cargo_prep -v vendor`) so it works in isolated build environments like Koji/mock. The daemon subpackage depends on the CLI package and includes systemd integration via standard RPM macros.
+The only required change is a **bug fix in `netfyr.spec`**: lines 47 and 77 reference `target/release/netfyr-cli`, but the correct CLI binary is `target/release/netfyr`. The `netfyr-cli` crate declares two `[[bin]]` targets in its `Cargo.toml`: `name = "netfyr"` (from `src/main.rs`, the primary CLI) and `name = "netfyr-cli"` (from `src/netfyr_cli_main.rs`, a secondary entry point). Cargo outputs both as separate binaries. The spec needs to reference the primary one — `target/release/netfyr` — which is the binary that should be installed as `/usr/bin/netfyr`.
 
-The alternative approach — a single monolithic RPM containing both binaries — was rejected because the daemon is optional (only needed for DHCP/dynamic factories) and pulls in a systemd dependency that pure-CLI users don't need. Splitting into two packages follows the established pattern for daemon+CLI tools in Fedora (e.g., `podman` / `podman-remote`).
+No new files need to be created. No dependencies change. No Rust code is modified. The fix is two path corrections and cleanup of two misleading comments.
+
+The alternative of renaming the Cargo `[[bin]]` entry was rejected because it would be a cross-cutting change affecting other stories, test infrastructure, and the crate's public build artifacts. Fixing the spec to reference the correct existing binary name is the minimal, correct solution.
 
 ## Design Decisions
 
-1. **Decision**: Reference the actual systemd unit paths (`dist/systemd/netfyr.service` and `dist/systemd/netfyr.socket`) in the spec file, rather than moving the files to `dist/`.
-   - **Alternatives considered**: Moving the files to `dist/` flat to match the spec template exactly.
-   - **Rationale**: The files already exist at `dist/systemd/`. Moving them would break any other references and is unnecessary churn — adjusting two paths in the spec is simpler and preserves the existing directory organization.
+1. **Decision**: Change `target/release/netfyr-cli` to `target/release/netfyr` in the spec's `%install` and `%check` sections.
+   - **Alternatives considered**: (a) Renaming the `[[bin]]` in `crates/netfyr-cli/Cargo.toml` to only produce `netfyr-cli` and keeping the spec's rename approach. (b) Keeping the spec as-is (which would fail at build time).
+   - **Rationale**: The Cargo workspace already produces `target/release/netfyr` as the primary CLI binary. The spec should reference this directly. The current spec references the secondary binary (`netfyr-cli`) which is not intended for installation. Installing `target/release/netfyr` to `%{_bindir}/netfyr` is a no-rename copy — simple and correct.
 
-2. **Decision**: Install `target/release/netfyr-cli` as `/usr/bin/netfyr` (renaming during install).
-   - **Alternatives considered**: Renaming the `[[bin]]` in `crates/netfyr-cli/Cargo.toml` from `netfyr-cli` to `netfyr`.
-   - **Rationale**: The binary is defined as `netfyr-cli` in `Cargo.toml` (`[[bin]] name = "netfyr-cli"`). Changing the Cargo binary name would affect the entire build system and is outside the scope of this packaging story. The `install` command trivially renames during installation, which is standard RPM practice. The `%check` section must also reference `target/release/netfyr-cli`.
+2. **Decision**: Remove the misleading comment on line 46 that says "the Cargo binary is named netfyr-cli; rename on install".
+   - **Alternatives considered**: Updating the comment to say "the Cargo binary is named netfyr".
+   - **Rationale**: The install command `install -Dpm 0755 target/release/netfyr %{buildroot}%{_bindir}/netfyr` is self-explanatory. A simpler comment ("Install CLI binary") matches the style used for the daemon binary on line 49.
 
-3. **Decision**: Add a `%changelog` section to the spec file.
-   - **Alternatives considered**: Omitting it (as the spec template does).
-   - **Rationale**: `rpmlint` reports an error for missing `%changelog`, and Fedora packaging guidelines require it. Adding a single initial entry satisfies both requirements.
-
-4. **Decision**: Use MIT license text for the `LICENSE` file.
-   - **Alternatives considered**: None — the spec declares `License: MIT`.
-   - **Rationale**: The `%license LICENSE` directive in both `%files` sections requires this file to exist. The spec explicitly declares `License: MIT`.
-
-5. **Decision**: Create a minimal but realistic `examples/policies/bare-ethernet.yaml` example file.
-   - **Alternatives considered**: Creating multiple example files, or a trivial placeholder.
-   - **Rationale**: The spec's `%install` section globs `examples/policies/*.yaml`. At least one file must exist or the shell glob fails. A realistic example serves double duty: it prevents the build failure and provides actual user value. The spec's `rpm -ql` output shows `bare-ethernet.yaml` specifically, so that's the filename to use.
-
-6. **Decision**: Escape macro names in spec comments using `%%` (double-percent).
-   - **Alternatives considered**: Avoiding comments that mention macros.
-   - **Rationale**: RPM expands macros even inside comments. The spec template's note about `%cargo_install` in a comment would cause a parse error. All macro references in comments must be doubled.
-
-7. **Decision**: The vendor tarball is created on-the-fly by the build script and never committed.
-   - **Alternatives considered**: Checking in a pre-built vendor tarball.
-   - **Rationale**: The vendored dependencies are hundreds of megabytes. The build script runs `cargo vendor` to create the tarball fresh each time. Adding `/vendor` to `.gitignore` prevents accidental commits.
+3. **Decision**: Remove the misleading comment on line 76 that says "the CLI binary is named netfyr-cli in the build output".
+   - **Alternatives considered**: Keeping a corrected comment.
+   - **Rationale**: The smoke-test command `target/release/netfyr --help > /dev/null` is self-evident. The existing comment above it on line 75 ("Smoke-test: verify the built binaries are functional.") provides sufficient context.
 
 ## File Changes
 
-### 1. `netfyr.spec` (create)
+### 1. `netfyr.spec` — modify
 
-RPM spec file at the workspace root. Contains:
+Four changes, all in the same file:
 
-- **Preamble**: `Name: netfyr`, `Version: 0.1.0`, `Release: 1%{?dist}`, `Summary`, `License: MIT`, `URL`, `Source0` (source tarball), `Source1` (vendor tarball), `ExclusiveArch: %{rust_arches}`, `BuildRequires` for `cargo >= 1.86`, `rust >= 1.86`, `rust-packaging >= 25`, `systemd-rpm-macros`.
-- **`%description`**: Multi-line description of netfyr.
-- **`%package daemon`**: Subpackage with `Summary`, `Requires: %{name} = %{version}-%{release}`, `Requires: systemd`.
-- **`%description daemon`**: Description of the daemon subpackage.
-- **`%prep`**: `%autosetup -n %{name}-%{version}`, extract `%{SOURCE1}` (vendor tarball), call `%cargo_prep -v vendor`.
-- **`%build`**: `%cargo_build`, then `cargo run -p xtask -- man` (NOT `cargo xtask man` — the `.cargo/config.toml` alias may not exist after `%cargo_prep`).
-- **`%install`**:
-  - Install `target/release/netfyr-cli` as `%{buildroot}%{_bindir}/netfyr` (mode 0755). Note the rename from `netfyr-cli` to `netfyr`.
-  - Install `target/release/netfyr-daemon` as `%{buildroot}%{_bindir}/netfyr-daemon` (mode 0755).
-  - Install man pages from `man/` into appropriate `%{_mandir}` subdirectories (man1, man5, man7).
-  - Install systemd units from `dist/systemd/netfyr.service` and `dist/systemd/netfyr.socket` to `%{_unitdir}`.
-  - Create `%{buildroot}%{_sysconfdir}/netfyr/policies` directory.
-  - Install example policy files from `examples/policies/*.yaml` to `%{_docdir}/%{name}/examples/policies/`.
-  - Do NOT manually install LICENSE (handled by `%license`).
-- **`%check`**: Smoke-test both binaries: `target/release/netfyr-cli --help > /dev/null` and `target/release/netfyr-daemon --help > /dev/null`. Note: must use `netfyr-cli` (the actual binary name), not `netfyr`.
-- **`%post daemon`** / **`%preun daemon`** / **`%postun daemon`**: systemd scriptlets using `%systemd_post`, `%systemd_preun`, `%systemd_postun_with_restart` for `netfyr.service netfyr.socket`.
-- **`%files`**: `%license LICENSE`, `%{_bindir}/netfyr`, man pages (with glob `*` suffix for compression), `%dir %{_sysconfdir}/netfyr`, `%dir %{_sysconfdir}/netfyr/policies`, `%{_docdir}/%{name}/examples/policies/`.
-- **`%files daemon`**: `%license LICENSE`, `%{_bindir}/netfyr-daemon`, both systemd unit files.
-- **`%changelog`**: One initial entry dated today (Wed Apr 15 2026 or the appropriate day-of-week for the release), with a brief "Initial package" message. Use a placeholder maintainer name/email.
+**Change A — Line 46 (comment fix):**
+- **Current**: `# Install CLI binary (the Cargo binary is named netfyr-cli; rename on install)`
+- **New**: `# Install CLI binary`
+- **Why**: The comment is factually wrong — the binary is named `netfyr`, not `netfyr-cli`.
 
-**Why**: This is the core deliverable — the spec file that drives `rpmbuild` to produce installable RPMs.
+**Change B — Line 47 (binary path fix in `%install`):**
+- **Current**: `install -Dpm 0755 target/release/netfyr-cli %{buildroot}%{_bindir}/netfyr`
+- **New**: `install -Dpm 0755 target/release/netfyr %{buildroot}%{_bindir}/netfyr`
+- **Why**: The primary CLI binary produced by Cargo is `target/release/netfyr`. The current path `target/release/netfyr-cli` references the secondary entry point, causing `%install` to fail with "No such file or directory" (or worse, install the wrong binary if both exist).
 
-### 2. `scripts/build-rpm.sh` (create)
+**Change C — Line 76 (comment removal in `%check`):**
+- **Current**: `# Note: the CLI binary is named netfyr-cli in the build output.`
+- **Remove this line entirely.**
+- **Why**: Factually wrong and misleading. The preceding comment on line 75 is sufficient.
 
-Shell script (mode 0755) that automates the RPM build. Contains:
+**Change D — Line 77 (binary path fix in `%check`):**
+- **Current**: `target/release/netfyr-cli --help > /dev/null`
+- **New**: `target/release/netfyr --help > /dev/null`
+- **Why**: Must smoke-test the same binary that gets installed. The current line tests the wrong binary.
 
-- Shebang `#!/bin/bash` and `set -euo pipefail`.
-- Derive `SCRIPT_DIR` and `REPO_ROOT` from `$0`.
-- Extract `NAME` and `VERSION` from `netfyr.spec` using `grep` + `awk`.
-- Create `~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}` directory tree.
-- Create source tarball via `git archive --format=tar.gz --prefix=${NAME}-${VERSION}/ -o ~/rpmbuild/SOURCES/${NAME}-${VERSION}.tar.gz HEAD`.
-- Create vendor tarball: run `cargo vendor vendor`, then `tar czf ~/rpmbuild/SOURCES/${NAME}-${VERSION}-vendor.tar.gz vendor/`, then `rm -rf vendor/` (clean up after ourselves).
-- Copy `netfyr.spec` to `~/rpmbuild/SPECS/`.
-- Run `rpmbuild -ba ~/rpmbuild/SPECS/netfyr.spec`.
-- Print paths of resulting RPMs using `find`.
+### No other files need changes
 
-**Why**: Provides a one-command workflow for developers to build RPMs locally. Extracts metadata from the spec to keep version numbers in sync.
+All other files are already correct and require no modifications:
 
-### 3. `LICENSE` (create)
-
-Standard MIT license text file at the workspace root. Use the year 2024 (or current year) and "The netfyr authors" as the copyright holder. The full MIT license body follows the SPDX-standard template.
-
-**Why**: Required by the `%license LICENSE` directive in both `%files` sections. Without this file, `rpmbuild` fails during the `%install` phase.
-
-### 4. `examples/policies/bare-ethernet.yaml` (create)
-
-A minimal but realistic YAML policy file demonstrating basic Ethernet configuration. Should define a single policy with a static factory that configures an Ethernet interface. The content should match the netfyr policy format as used by `netfyr-policy`'s YAML parser — specifically, a document with `name`, `factory` (type: `static`), and `states` fields containing an `ethernet` entity type with a selector and fields like `mtu`.
-
-Example structure (the implementer should use the actual policy format as parsed by `parse_policy_yaml`):
-```yaml
-name: bare-ethernet
-factory:
-  type: static
-states:
-  - type: ethernet
-    selector:
-      name: eth0
-    fields:
-      mtu: 1500
-```
-
-The implementer should verify the exact field names by reading `crates/netfyr-policy/src/lib.rs` to ensure the example parses correctly.
-
-**Why**: The spec's `%install` section runs `install -pm 0644 examples/policies/*.yaml` which will fail if no YAML files exist in that directory.
-
-### 5. `.gitignore` (modify)
-
-Append `/vendor` on a new line to the existing `.gitignore` (which currently only contains `/target`).
-
-**Why**: Prevents accidental commits of the vendored dependency directory (hundreds of megabytes, thousands of files) that `cargo vendor` creates during the build script.
-
-### 6. `examples/policies/` directory (create)
-
-Create the `examples/policies/` directory (implied by creating the YAML file above, but noting it explicitly since the directory doesn't exist).
-
-**Why**: Required for the `%install` glob and the `%files` doc directive.
+- **`scripts/build-rpm.sh`**: Executable (mode 755 confirmed), reads Name/Version from spec, creates source and vendor tarballs, cleans up vendor/ after tarball creation, copies spec to `~/rpmbuild/SPECS/`, runs `rpmbuild -ba`. Matches spec requirements exactly.
+- **`dist/systemd/netfyr.service`**: `Type=notify`, `ExecStart=/usr/bin/netfyr-daemon`, `RuntimeDirectory=netfyr`, `StateDirectory=netfyr`, correct ordering targets (`After=network-pre.target`, `Before=network.target`). Matches spec.
+- **`dist/systemd/netfyr.socket`**: `ListenStream=/run/netfyr/netfyr.sock`, `SocketMode=0666`. Matches spec.
+- **`.gitignore`**: Already contains `/vendor` (along with `/target` and `/.factory/`).
+- **`man/`**: All seven man pages exist: `netfyr.1`, `netfyr-apply.1`, `netfyr-query.1`, `netfyr-history.1`, `netfyr-revert.1`, `netfyr.yaml.5`, `netfyr-examples.7`.
+- **`examples/policies/bare-ethernet.yaml`**: Exists for the `%install` glob.
+- **`LICENSE`**: Exists at workspace root for `%license` directive.
 
 ## Dependencies
 
-No new crate dependencies. This story only creates packaging artifacts (spec file, shell script, license, example files). All existing Cargo.toml files remain unchanged.
+No new crate dependencies. This is a packaging-only change — no `Cargo.toml` files are modified.
 
 ## Implementation Order
 
-1. **Create `LICENSE`** — No dependencies. Required before the spec file can be tested. Create the MIT license file at the workspace root.
+1. **Fix `netfyr.spec`** — Apply all four changes (A through D) described above. This is a single atomic edit to one file. The spec parses correctly before and after — there is no intermediate broken state.
 
-2. **Create `examples/policies/bare-ethernet.yaml`** — No dependencies on other steps. Create the directory and example file. The implementer should briefly read `crates/netfyr-policy/src/lib.rs` to verify the policy YAML format.
-
-3. **Update `.gitignore`** — No dependencies. Append `/vendor` line.
-
-4. **Create `netfyr.spec`** — Depends on steps 1-3 (the files referenced in the spec must exist). This is the main deliverable. The implementer must account for:
-   - Binary name `netfyr-cli` (not `netfyr`) in install and check sections.
-   - Systemd unit path `dist/systemd/` (not `dist/`).
-   - Escaped macro names in comments (`%%cargo_prep`, etc.).
-   - `%changelog` section at the end.
-
-5. **Create `scripts/build-rpm.sh`** — Depends on step 4 (reads the spec file). Create the script and ensure it has the executable bit set (`chmod +x`).
-
-Each step produces a valid, committable state. Steps 1-3 are independent and can be done in any order or in parallel. Step 4 depends on 1-3 existing. Step 5 depends on 4.
+That is the entire implementation. One step, one file, four edits.
 
 ## Risks and Mitigations
 
-1. **CLI binary name mismatch** (`netfyr-cli` vs `netfyr`)
-   - **Risk**: The spec template in the story says `target/release/netfyr`, but the actual Cargo binary is `netfyr-cli` (per `crates/netfyr-cli/Cargo.toml` `[[bin]] name = "netfyr-cli"`). Using the wrong name causes `%install` to fail with "No such file or directory".
-   - **Mitigation**: The spec must reference `target/release/netfyr-cli` in the `install` command and `%check` section, while still installing it as `netfyr` at `/usr/bin/netfyr`. The `install -Dpm 0755 target/release/netfyr-cli %{buildroot}%{_bindir}/netfyr` command handles the rename.
+1. **Risk**: The secondary binary `target/release/netfyr-cli` (from `src/netfyr_cli_main.rs`) is also built by `%cargo_build` but is not installed. If it serves a purpose that requires packaging, it would be missing.
+   - **Mitigation**: The spec explicitly requires only `/usr/bin/netfyr` and `/usr/bin/netfyr-daemon`. The `netfyr-cli` binary is a secondary entry point not called for in the packaging requirements. If it needs packaging in the future, a third `install` line can be added.
 
-2. **Systemd unit path mismatch** (`dist/` vs `dist/systemd/`)
-   - **Risk**: The spec template references `dist/netfyr.service` and `dist/netfyr.socket`, but the actual files are at `dist/systemd/netfyr.service` and `dist/systemd/netfyr.socket`.
-   - **Mitigation**: Use the actual paths (`dist/systemd/`) in the spec's `%install` section.
+2. **Risk**: `rpmlint` may flag warnings unrelated to this change (e.g., `non-standard-group`, socket permission warnings for `SocketMode=0666`, or informational notes).
+   - **Mitigation**: The acceptance criteria says "no errors" from rpmlint. Informational warnings and notes are acceptable. The `%changelog` is already present (lines 109-111), which prevents the most common rpmlint error.
 
-3. **Missing prerequisite man pages**
-   - **Risk**: This story depends on SPEC-501 and SPEC-503 which produce the hand-maintained man pages (`man/netfyr.yaml.5` and `man/netfyr-examples.7`). The xtask generates the section-1 pages during `%build`, but the section-5 and section-7 pages must already exist in the source tarball. If the prerequisite stories have not been implemented, `%install` will fail when trying to install these files.
-   - **Mitigation**: The plan assumes prerequisites are met. If the man pages don't exist at build time, the `install` commands for those specific files will fail clearly, pointing to the missing dependency. The implementer should verify these files exist before testing the RPM build.
+3. **Risk**: The `%build` step runs `cargo run -p xtask -- man` to regenerate man pages. If the xtask binary has changed since the committed man pages were generated, the output could differ.
+   - **Mitigation**: The man pages are committed to the repo and regeneration is a consistency check. If xtask output diverges, the build still succeeds (the `install` commands use the generated output). The regeneration ensures the installed pages match the current code.
 
-4. **`%cargo_prep` overwrites `.cargo/config.toml`**
-   - **Risk**: The `%cargo_prep` macro may overwrite or remove `.cargo/config.toml`, which contains the `cargo xtask` alias.
-   - **Mitigation**: The spec uses `cargo run -p xtask -- man` (direct invocation) instead of `cargo xtask man` (alias-based). This is explicitly called out in the spec story.
+4. **Risk**: `%cargo_build` might not build all workspace members, leaving `target/release/netfyr` or `target/release/netfyr-daemon` missing.
+   - **Mitigation**: The Cargo workspace has no `default-members` restriction, so `%cargo_build` (which wraps `cargo build --release`) builds all members. Both binaries will be produced.
 
-5. **`rpmlint` failures**
-   - **Risk**: Missing `%changelog` will cause rpmlint errors. Macro expansion in comments will cause parse failures.
-   - **Mitigation**: Include a `%changelog` section. Double all `%` signs in comments that reference macro names (e.g., `%%cargo_install`).
-
-6. **Vendor directory accidentally committed**
-   - **Risk**: Running the build script creates a `vendor/` directory before creating the tarball. If the developer interrupts the script or it fails after `cargo vendor` but before cleanup, `vendor/` will remain on disk. Without `.gitignore` protection, it could be committed.
-   - **Mitigation**: Add `/vendor` to `.gitignore` (step 3). The build script should also clean up `vendor/` after creating the tarball (add `rm -rf vendor/` after `tar czf`).
-
-7. **Example policy file format**
-   - **Risk**: If the example YAML doesn't match the actual policy parser format, it won't be usable as documentation and could mislead users.
-   - **Mitigation**: The implementer should read `crates/netfyr-policy/src/lib.rs` (specifically `parse_policy_from_value` and the `Policy` struct) to verify the correct YAML structure before writing the example.
-
-8. **`%cargo_build` macro behavior**
-   - **Risk**: The `%cargo_build` macro from `rust-packaging` may pass different flags than a plain `cargo build --release`. It may not build all workspace members by default, or may build only the default members.
-   - **Mitigation**: Verify that `%cargo_build` builds the full workspace. If it only builds the default package, the spec may need to pass `--workspace` or explicitly name the packages. The Cargo workspace has no `default-members`, so `%cargo_build` should build all members.
+5. **Risk**: Version drift between `Version: 0.1.0` in the spec and `version = "0.1.0"` in individual `Cargo.toml` files.
+   - **Mitigation**: Out of scope for this story. The version is 0.1.0 in both places currently. An automated version-sync check could be added later.
 
 ## Test Strategy
 
-This story is primarily packaging infrastructure, so testing focuses on build validation rather than unit tests. No Rust test code is needed.
+Since this is a packaging fix (not Rust code), traditional unit/integration tests don't apply. Validation focuses on:
 
-**Build validation tests** (manual or CI):
-- Run `rpmlint netfyr.spec` — should report no errors (warnings about missing source tarballs are acceptable for a standalone lint check).
-- Run `./scripts/build-rpm.sh` on a Fedora system with `rust-packaging` installed — should exit 0 and produce RPMs.
-- Install both RPMs and verify `rpm -ql netfyr` and `rpm -ql netfyr-daemon` match the expected file lists.
-- Verify `netfyr --help` and `netfyr-daemon --help` work after installation.
-- Verify `man netfyr` displays the man page.
-- Verify `systemctl cat netfyr.service` and `systemctl cat netfyr.socket` display correct unit files.
-- Verify `rpm -qR netfyr-daemon` lists `netfyr` and `systemd` as dependencies.
+1. **Spec correctness**: Verify that `netfyr.spec` lines 47 and 77 now reference `target/release/netfyr` (not `netfyr-cli`). This can be checked with a simple grep.
 
-**File existence tests** (can be checked statically):
-- `netfyr.spec` exists at workspace root.
-- `scripts/build-rpm.sh` exists and is executable.
-- `LICENSE` exists at workspace root.
-- `examples/policies/bare-ethernet.yaml` exists and is valid YAML.
-- `.gitignore` contains `/vendor`.
+2. **Binary name verification**: Run `cargo build --release -p netfyr-cli` and confirm `target/release/netfyr` exists. This validates that the spec references a binary that actually gets built.
 
-**Spec file content tests** (can be checked with grep/assertions):
-- Spec references `netfyr-cli` (not `netfyr`) for the CLI binary path in `%install` and `%check`.
-- Spec references `dist/systemd/` (not `dist/`) for systemd unit paths.
-- Spec contains `%changelog` section.
-- Spec contains `%license LICENSE` in both `%files` and `%files daemon`.
-- No unescaped macro names in comments.
+3. **Spec parse check**: If `rpmspec` is available, run `rpmspec -P netfyr.spec` to verify macro expansion produces the correct `install` commands.
+
+4. **rpmlint**: Run `rpmlint netfyr.spec` to verify no errors.
+
+5. **Full RPM build** (if rpmbuild is available in the environment): Run `./scripts/build-rpm.sh` end-to-end. Verify:
+   - Build exits 0
+   - `netfyr-0.1.0-1.*.rpm` and `netfyr-daemon-0.1.0-1.*.rpm` are produced
+   - `rpm -qlp` on both RPMs shows expected file lists
+
+6. **Post-install smoke tests** (if in a Fedora environment with dnf):
+   - `netfyr --help` exits 0
+   - `netfyr-daemon --help` exits 0
+   - `man netfyr` renders
+   - `systemctl cat netfyr.service` shows correct content
+   - `rpm -qR netfyr-daemon` lists `netfyr` and `systemd`
+
+No Rust test code needs to be written. The acceptance criteria scenarios from the spec serve as the complete test plan — they are validated through the RPM build system, not through Rust test harnesses.

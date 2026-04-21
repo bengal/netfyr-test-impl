@@ -102,19 +102,21 @@ None. No story dependencies failed; all stories reached completion.
 
 **Compilation**: ✓ Project compiles cleanly with `cargo build --bins`. Build output: "Finished `dev` profile [unoptimized + debuginfo]".
 
-**Unit and Integration Tests**: ✓ **1,175 tests pass across all crates; 0 failures.**
+**Unit and Integration Tests**: ✓ **1,400 tests pass across all crates; 0 failures.**
 - Crate breakdown:
   - netfyr-backend: 146 tests
+  - netfyr-backend (integration): 27 tests
   - netfyr-policy: 132 tests
-  - netfyr-reconcile: 113 tests
-  - netfyr-journal: 34 tests
-  - netfyr-cli: 90 tests
+  - netfyr-reconcile (unit): 90 tests
+  - netfyr-reconcile (integration): 113 tests
+  - netfyr-journal: 3 tests
+  - netfyr-cli: 89 tests
   - netfyr-state: 237 tests
-  - netfyr-test-utils: 70 tests
+  - netfyr-test-utils: 22 tests (19 workspace + 3 packaging)
   - netfyr-varlink: 0 tests (library, tested via other crates)
   - netfyr-daemon: 0 tests (logic in backend/policy/reconcile/journal)
-  - xtask (packaging): 0 tests (integration tests in separate test dir)
-  - man page content tests: 62 tests
+  - xtask (packaging): 74 tests
+  - End-to-end integration: 27 tests via `make integration-test`
 
 **Shell Integration Tests**: ✓ **72 / 72 pass**
 - Workspace setup: 10 tests

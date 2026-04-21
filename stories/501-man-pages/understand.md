@@ -1,161 +1,112 @@
-# SPEC-501: Man Pages — Gap Analysis
-
 ## Current State
 
-The project has no `xtask` crate, no `man/` directory, and no `.cargo/config.toml` alias. None of these files or directories exist at all.
+The `xtask` crate, `man/` directory, and hand-written files are all substantially complete. The story is largely implemented.
+
+### `xtask/` crate
+
+- **`xtask/Cargo.toml`** — exists; declares `clap_mangen = "0.2"`, `clap` with `derive`+`string` features, and `netfyr-cli = { path = "../crates/netfyr-cli" }`. Matches the spec.
+- **`xtask/src/main.rs`** — exists and implements the `man` subcommand with `generate_man_pages()`. Iterates `Cli::command().get_subcommands()` to produce one page per subcommand. Four helper functions append manual troff sections: `append_exit_status`, `append_files`, `append_examples`, `append_see_also`. Includes ~50 unit tests covering EXIT STATUS, FILES, EXAMPLES, and SEE ALSO content for the `apply` and `query` subcommands and the top-level page.
 
 ### `netfyr-cli` crate
 
-- `crates/netfyr-cli/src/main.rs` defines `struct Cli` and `enum Commands` — both **private** (no `pub`).
-- The crate has a `[[bin]]` target only; there is **no `[lib]` section**. The `Cli` type cannot be imported by any other crate.
-- `struct ApplyArgs` (in `apply.rs`) is `pub` and derives `clap::Args`. It has `paths: Vec<PathBuf>` (positional, `required = true`) and `dry_run: bool` (`--dry-run` long flag).
-- `struct QueryArgs` (in `query.rs`) is `pub` and derives `clap::Args`.
-- The clap `#[command(name = "netfyr", about = "Declarative Linux network configuration")]` annotation is on `Cli`. Subcommands are annotated with doc-comment strings (`/// Apply network policies…`, `/// Query current system network state`).
+- **`crates/netfyr-cli/src/lib.rs`** — exists and exports `Cli`, `Commands`, `run_apply`, `run_history`, `run_query`, `run_revert`. `Cli` is `pub` and derives `Parser` (making `CommandFactory` available). All four subcommands — `apply`, `query`, `history`, `revert` — are defined.
+- `crates/netfyr-cli/Cargo.toml` has a `[lib]` section (implied by the lib.rs existing and being importable from xtask).
 
-### Workspace
+### `man/` directory
 
-- `Cargo.toml` lists 8 member crates; `xtask` is not among them.
-- No `.cargo/config.toml` exists.
+All seven files already exist at the workspace root:
 
-### man/
+| File | Type | Lines |
+|---|---|---|
+| `netfyr.1` | auto-generated | 79 |
+| `netfyr-apply.1` | auto-generated | 63 |
+| `netfyr-query.1` | auto-generated | 71 |
+| `netfyr-history.1` | auto-generated | 72 |
+| `netfyr-revert.1` | auto-generated | 52 |
+| `netfyr-examples.7` | hand-written | 163 |
+| `netfyr.yaml.5` | hand-written | 357 |
 
-- No `man/` directory exists at the workspace root. Neither the auto-generated pages nor the hand-written `netfyr-examples.7` exist.
+`netfyr-examples.7` is complete: it has the hand-maintenance comment, all seven required scenarios (static IP, multiple interfaces, DHCP, mixed static+DHCP, priority override, selecting by driver, dry-run workflow), each with a copy-pasteable YAML example, and a SEE ALSO section referencing all sibling pages.
+
+### `.cargo/config.toml`
+
+Does **not** exist. No files were found under `.cargo/`.
 
 ---
 
 ## Requirements
 
-### R1 — New `xtask` crate
+From the acceptance criteria, the following must hold:
 
-- `xtask/Cargo.toml`: package `xtask`, `publish = false`, dependencies on `clap_mangen = "0.2"`, `clap = { version = "4", features = ["derive"] }`, and `netfyr-cli = { path = "../crates/netfyr-cli" }`.
-- `xtask/src/main.rs`: entry point with a `man` subcommand that calls the generation logic.
-- Workspace `Cargo.toml` must add `"xtask"` to `members`.
-
-### R2 — `.cargo/config.toml` alias
-
-- File `.cargo/config.toml` at the workspace root with:
-  ```toml
-  [alias]
-  xtask = "run --package xtask --"
-  ```
-
-### R3 — `netfyr-cli` must expose `Cli` as a library
-
-- Add a `[lib]` section to `crates/netfyr-cli/Cargo.toml` (e.g., `name = "netfyr_cli"`, `path = "src/lib.rs"`), or restructure `main.rs` so that `Cli` and `Commands` are defined in a lib module re-exported from `main.rs`.
-- `Cli` must be `pub` and `Commands` must be `pub` so the xtask can call `netfyr_cli::Cli::command()` (the `CommandFactory` trait impl is auto-derived by `clap::Parser`).
-
-### R4 — Man page generation logic
-
-The `xtask man` command must:
-
-1. Create `man/` at the workspace root if it does not exist.
-2. Generate `man/netfyr.1` from the top-level `Cli` command.
-3. For each subcommand in `Cli` (apply, query), generate `man/netfyr-{name}.1`.
-4. For each generated page, append the following sections that `clap_mangen` does not produce automatically:
-   - **EXIT STATUS**: codes 0, 1, 2 with descriptions from SPEC-301/302.
-   - **FILES**: `/etc/netfyr/policies/` and `/var/lib/netfyr/`.
-   - **EXAMPLES**: at least two real-world usage examples per subcommand.
-   - **SEE ALSO**: cross-references to all sibling man pages and `netfyr.yaml(5)`.
-5. Must **not** create or overwrite `man/netfyr-examples.7` — guard with an existence check.
-6. Must be idempotent: running twice produces byte-identical output files.
-
-### R5 — Hand-written `man/netfyr-examples.7`
-
-- A troff-formatted man page file at `man/netfyr-examples.7`.
-- Section 7 (miscellaneous).
-- Must include a comment at the top of the file marking it as hand-maintained.
-- Must include all seven scenarios listed in the acceptance criteria:
-  - Static IP on a single interface
-  - Multiple interfaces in one file
-  - DHCP on an interface
-  - Mixed static and DHCP
-  - Priority override
-  - Selecting by driver
-  - Dry-run workflow
-- Each scenario must contain a copy-pasteable YAML example.
-- SEE ALSO section references `netfyr(1)`, `netfyr-apply(1)`, `netfyr-query(1)`, `netfyr.yaml(5)`.
-
-### R6 — Man pages render without troff errors
-
-- All generated `.1` files and the hand-written `.7` file must render cleanly with `man ./man/netfyr.1` etc. (no troff warnings).
+1. `cargo xtask man` runs and creates/updates the `man/` directory.
+2. Produced files: `netfyr.1`, `netfyr-apply.1`, `netfyr-query.1`, `netfyr-history.1`, `netfyr-revert.1`.
+3. `netfyr-examples.7` is not overwritten.
+4. Each generated page includes EXIT STATUS (codes 0/1/2), FILES (`/etc/netfyr/policies/`), EXAMPLES (≥2 per subcommand), and SEE ALSO.
+5. `netfyr-apply.1` OPTIONS documents `--dry-run` and `<path>`.
+6. SEE ALSO for `apply` references `netfyr(1)`, `netfyr-query(1)`, `netfyr.yaml(5)`.
+7. `netfyr-examples.7` covers all 7 annotated scenarios.
+8. `cargo xtask` alias works.
+9. Generation is idempotent.
 
 ---
 
 ## Gap Analysis
 
-| Item | Status | Action Required |
-|---|---|---|
-| `xtask/` crate | Missing | Create `xtask/Cargo.toml` and `xtask/src/main.rs` |
-| Workspace `members` includes `xtask` | Missing | Add `"xtask"` to `[workspace] members` in `Cargo.toml` |
-| `.cargo/config.toml` with alias | Missing | Create file with `[alias] xtask = "run --package xtask --"` |
-| `netfyr-cli` lib target | Missing | Add `[lib]` section to `crates/netfyr-cli/Cargo.toml`; create `src/lib.rs` or re-export from `main.rs` |
-| `Cli` struct is `pub` | Missing | Change `struct Cli` → `pub struct Cli` |
-| `Commands` enum is `pub` | Missing | Change `enum Commands` → `pub enum Commands` |
-| `man/` directory | Missing | Created at runtime by xtask; also needs `man/netfyr-examples.7` committed |
-| `man/netfyr.1` | Missing | Auto-generated by xtask |
-| `man/netfyr-apply.1` | Missing | Auto-generated by xtask |
-| `man/netfyr-query.1` | Missing | Auto-generated by xtask |
-| `man/netfyr-examples.7` | Missing | Hand-written troff file to be committed |
-| EXIT STATUS section in generated pages | Missing | Appended by xtask after `clap_mangen` renders base content |
-| FILES section in generated pages | Missing | Appended by xtask after `clap_mangen` renders base content |
-| EXAMPLES section in generated pages | Missing | Appended by xtask after `clap_mangen` renders base content |
-| SEE ALSO section in generated pages | Missing | Appended by xtask after `clap_mangen` renders base content |
-| Guard against overwriting `netfyr-examples.7` | Missing | Existence check in xtask before writing |
+### Gap 1 — `.cargo/config.toml` is missing (BLOCKING)
+
+**File to create:** `/workspace/.cargo/config.toml`
+
+Without this file `cargo xtask man` fails with "no such subcommand: xtask". The required content is:
+
+```toml
+[alias]
+xtask = "run --package xtask --"
+```
+
+This is the only entirely absent file mandated by the spec.
+
+### Gap 2 — `append_examples` has no arms for `history` and `revert` (FUNCTIONAL)
+
+**File to modify:** `xtask/src/main.rs`, function `append_examples`
+
+The match covers `None`, `Some("apply")`, `Some("query")`, and a catch-all `Some(other)`. The catch-all emits only:
+
+```
+See netfyr-<other>(1) for usage details.
+```
+
+This produces **zero** `.nf` blocks. The spec requires at least two real-world usage examples per subcommand. `netfyr-history.1` and `netfyr-revert.1` currently fail this requirement.
+
+Required additions:
+- `Some("history")` arm — two examples using real `HistoryArgs` flags (e.g., bare `netfyr history`, and a filtered invocation with `--since` or `--limit`).
+- `Some("revert")` arm — two examples using real `RevertArgs` fields (e.g., `netfyr revert <seq>` and `netfyr revert --dry-run <seq>`).
+
+### Gap 3 — No unit tests for `history` and `revert` EXAMPLES (TEST COVERAGE)
+
+**File to modify:** `xtask/src/main.rs`, `#[cfg(test)]` block
+
+No tests assert that `history` or `revert` EXAMPLES sections contain at least two `.nf` blocks or include subcommand-specific content. These should be added once Gap 2 is resolved, following the pattern of `test_apply_examples_has_at_least_two_nf_blocks`.
 
 ---
 
 ## Integration Points
 
-### `netfyr-cli` → `xtask`
-
-The xtask depends on `netfyr-cli` as a library to call `Cli::command()`. This is the `CommandFactory` trait method auto-implemented by `#[derive(Parser)]`. The xtask uses the resulting `clap::Command` tree to drive `clap_mangen::Man`.
-
-**Breaking change in `netfyr-cli`**: Adding a `[lib]` section changes how the crate is compiled. The existing `[[bin]]` target (`src/main.rs`) must continue to work. Two common patterns:
-- Move `Cli` and `Commands` into `src/lib.rs`, have `main.rs` import them via `use netfyr_cli::...`.
-- Or declare `lib.path = "src/main.rs"` with `[[bin]] path = "src/main.rs"` — risky as the `main` function would be part of the lib.
-
-The cleaner pattern is a new `src/lib.rs` that defines/exports `Cli` and `Commands`, with `main.rs` importing from it.
-
-### clap annotation completeness
-
-`clap_mangen` derives DESCRIPTION from `#[command(about = ...)]` and `#[command(long_about = ...)]`. The current `about` on `Cli` is a short string. The generated DESCRIPTION for `netfyr(1)` will be minimal unless `long_about` is added. The spec's example output shows a paragraph-length DESCRIPTION for `netfyr-apply`. This may require adding `long_about` annotations to `Cli`, `ApplyArgs` impl, and `QueryArgs` impl before generation produces useful content.
-
-### Workspace root vs. project root
-
-The spec says `man/` is at "the workspace root." The workspace root is `/workspace/project/`. The xtask will be run via `cargo xtask man` from inside the workspace. The xtask must locate the workspace root reliably — typically via the `CARGO_MANIFEST_DIR` environment variable (set to `xtask/`) and navigating one level up, or by reading `CARGO_WORKSPACE_DIR` if available, or by walking parent directories for `Cargo.toml`.
-
-### Idempotency
-
-`clap_mangen` output is deterministic given the same clap `Command` tree. The manually appended sections (EXIT STATUS, FILES, EXAMPLES, SEE ALSO) are static strings. Idempotency is guaranteed if the xtask always overwrites the output files completely, which is the default `fs::write` behavior.
+- **`netfyr-cli::Cli`** (`crates/netfyr-cli/src/lib.rs:50`) — xtask calls `Cli::command()`. `Cli` must remain `pub` with `#[derive(Parser)]`. No changes needed.
+- **`ApplyArgs`** (`crates/netfyr-cli/src/apply.rs`) — `--dry-run` and `<path>` are already defined; they flow into OPTIONS automatically via `clap_mangen`. No changes needed.
+- **`HistoryArgs`** (`crates/netfyr-cli/src/history.rs`) — flags like `--since`, `--limit`, `--trigger`, `--selector`, `--output` must be reflected accurately in the new EXAMPLES arm. The `parse_since` function accepts duration strings (e.g. `"1h"`, `"24h"`) as well as RFC3339 timestamps.
+- **`RevertArgs`** (`crates/netfyr-cli/src/revert.rs`) — accepts a sequence ID positional argument and `--dry-run`. The EXAMPLES arm must match these actual flags.
+- **`man/netfyr-examples.7`** — hand-written; the xtask does not generate it (it is not a CLI subcommand and the loop only processes `get_subcommands()`). The `println!` note at the end of `generate_man_pages()` confirms the intent. No code change needed to protect it.
 
 ---
 
 ## Risks
 
-### R1 — `netfyr-cli` lib refactor touches the binary entry point
+1. **`HistoryArgs`/`RevertArgs` flag names** — the EXAMPLES text for Gap 2 must use actual flag names. Consulting `history.rs` and `revert.rs` before writing is necessary to avoid documenting flags that don't exist or with wrong syntax.
 
-Introducing a `[lib]` target requires restructuring `main.rs`. This is a mechanical change but could introduce compilation errors if internal modules (`mod apply`, `mod query`) reference private items that need to become `pub(crate)` or `pub`. The `apply.rs` and `query.rs` modules use many internal imports; they will need to remain accessible from the lib.
+2. **Idempotency with `clap_mangen` dates** — `clap_mangen 0.2` may embed the current date in the `.TH` macro of the generated troff. If so, running `cargo xtask man` on different days produces different files, violating the idempotency acceptance criterion. This should be verified; the `Man` builder may accept a date override via `Man::date()`.
 
-### R2 — Sections not generated by `clap_mangen`
+3. **`netfyr.yaml.5` forward reference** — SEE ALSO sections reference `netfyr.yaml(5)` (SPEC-503). The file already exists in `man/` (357 lines), so this is not a risk — the cross-reference is already satisfied.
 
-`clap_mangen 0.2` does not have a built-in API for EXIT STATUS, FILES, or EXAMPLES sections. The xtask must append raw troff markup after calling `man.render(&mut buf)`. The troff syntax must be correct or `man` will emit warnings (violating the acceptance criterion). The correct troff macros for these sections are `.SH EXIT STATUS`, `.SH FILES`, `.SH EXAMPLES`, `.SH "SEE ALSO"` followed by appropriate `.TP`, `.PP`, `.RS`/`.RE` macros. Incorrectly formatted troff produces rendering artifacts.
+4. **`groff`/`man` availability in CI** — the acceptance criterion "man pages render without troff warnings" requires `groff` or `man`. No automated test infrastructure for this exists in the codebase. This criterion can only be validated manually or in a CI job that installs `groff`.
 
-### R3 — `clap_mangen` subcommand name override
-
-The spec calls for generating `netfyr-apply.1` (with a hyphen in the command name). `clap_mangen` uses the command's `name` field for the page header. The xtask must call `subcmd.clone().name("netfyr-apply")` before passing to `Man::new()` so the header says `NETFYR-APPLY(1)` rather than `APPLY(1)`. This is shown in the spec's pseudocode and is straightforward but must be done correctly.
-
-### R4 — `netfyr-examples.7` existence guard
-
-The acceptance criterion is explicit: `cargo xtask man` must not overwrite `man/netfyr-examples.7` if it already exists. The xtask must check `Path::exists()` before writing. If the file is absent on a fresh checkout (e.g., it was not committed), the xtask should skip creating it (it is hand-written) or document that it must be committed separately. The hand-written file should be committed to the repository as a source artifact.
-
-### R5 — `netfyr.yaml(5)` referenced but not generated
-
-The SEE ALSO sections reference `netfyr.yaml(5)` (from SPEC-503, which is not yet implemented). This is a forward reference. The man pages can include it in SEE ALSO without the file existing, but the acceptance criterion for rendering without warnings must still pass — `man` does not validate cross-references in SEE ALSO at render time, so this is safe.
-
-### R6 — Long description quality
-
-The acceptance criterion "DESCRIPTION section mentions apply and query subcommands" for `netfyr.1` depends on what `clap_mangen` generates from the existing `about` annotation. The current `about` string on `Cli` is `"Declarative Linux network configuration"`. This is too brief to satisfy the criterion. Either `long_about` must be added to `Cli`, or the xtask must inject a DESCRIPTION section with the subcommand listing manually via raw troff after the auto-generated content.
-
-### R7 — `clap_mangen` version availability
-
-The spec specifies `clap_mangen = "0.2"`. This version is compatible with `clap 4` (which the project already uses). No known conflict, but the `Cargo.lock` does not yet include it — first compilation of xtask will resolve and fetch it.
+5. **Workspace membership** — the context snapshot shows `xtask/` as a workspace member (it is listed in the module structure and its `Cargo.toml` references the workspace), but the root `Cargo.toml` was not directly verified. If `xtask` is not in `[workspace] members`, `cargo run --package xtask` will fail even with the alias in place.
