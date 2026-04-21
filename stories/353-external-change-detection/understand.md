@@ -2,124 +2,97 @@
 
 ## Current State
 
-### Journal infrastructure (complete)
-`netfyr-journal/src/entry.rs` already contains:
-- `Trigger::ExternalChange { changed_entities: Vec<String> }` — serializes as `"type": "external_change"`
-- `ApplyOutcome::Observed` — serializes as `"kind": "observed"`
-- Both variants have full unit-test coverage (serialization round-trips, discriminator values)
+The implementation of SPEC-353 is **substantially complete**. All primary components described in the spec exist and are wired together.
 
-`netfyr-journal/src/journal.rs` already contains:
-- `Journal::latest_state_for(entity_name: &str) -> Result<Option<SerializableState>>` — scans `current.ndjson` newest-first for the most recent state snapshot of the named entity
+### `crates/netfyr-daemon/src/netlink_monitor.rs` (complete)
+- `enum ChangeKind { LinkChanged, AddressAdded, AddressRemoved }` — all three variants present
+- `struct NetlinkChange { ifindex, ifname, kind }` — matches spec
+- `struct NetlinkMonitor { change_rx, task }` — matches spec
+- `NetlinkMonitor::start()` — subscribes to `RTNLGRP_LINK` (group 1) and `RTNLGRP_IPV4_IFADDR` (group 5) via `netlink-sys::Socket` wrapped in `tokio::io::unix::AsyncFd`
+- `NetlinkMonitor::next_change()` / `stop()` — present
+- 500 ms sliding-window debounce with per-ifindex coalescing; duplicate `ChangeKind` per window deduplicated
+- Raw netlink message parsing for RTM_NEWLINK, RTM_DELLINK, RTM_NEWADDR, RTM_DELADDR using fixed-size struct offsets
+- ifindex→ifname name cache so address messages resolve interface names from prior link messages
+- Full unit test suite: ChangeKind variants, `kind_eq`, `process_buffer` edge cases, RTM_* parsing, name cache propagation, coalescing, and debounce deadline reset
 
-### CLI display (complete)
-`netfyr-cli/src/history.rs` already handles `ExternalChange` in:
-- `trigger_display_name()` → returns `"external"`
-- `matches_trigger()` → matches filter string `"external"`
-- `format_text_detail()` → shows `changed_entities` list and diff
+### `crates/netfyr-daemon/src/reconciler.rs` (complete)
+- `Reconciler.is_applying: Arc<AtomicBool>` — thread-safe self-change flag
+- `set_applying(bool)` / `is_applying()` — both present, use `SeqCst` ordering
+- `managed_entity_names(policy_store, factory_manager) -> HashSet<String>` — returns interface names covered by active policies
+- `record_external_change(changed_entity_names, policy_store)` — queries backend for current state of each named entity (`"ethernet"` entity type hardcoded), compares to `journal.latest_state_for()`, produces `SerializableFieldChange` entries, appends `JournalEntry { trigger: ExternalChange, outcome: Observed }`
+- `compute_external_field_changes(last, current)` — private helper, diffs journal snapshot fields against live state; handles new, changed, and removed fields
+- Unit tests: `is_applying` flag lifecycle (defaults false, set/clear, toggle), `managed_entity_names` with zero/one/many policies, `record_external_change` with empty and nonexistent entity lists
 
-### Daemon server (partial)
-`netfyr-daemon/src/server.rs`:
-- `server_trigger_type_str()` already has an arm for `Trigger::ExternalChange { .. }` → `"external_change"`
-- `serve_varlink()` has a 4-branch `tokio::select!` loop (connection accept, factory events, SIGTERM, SIGINT)
-- **No netlink monitor branch exists**
+### `crates/netfyr-daemon/src/server.rs` (complete)
+- `NetlinkMonitor::start()` called in `serve_varlink`; failure is non-fatal (daemon continues without external change detection)
+- `managed_entities: HashSet<String>` maintained in the event loop, refreshed after every Varlink connection (in case `SubmitPolicies` was called) and after every DHCP event
+- Branch 5 `tokio::select!` arm: guards on `reconciler.is_applying()`, deduplicates changed names (via `HashSet`), filters to `managed_entities`, calls `reconciler.record_external_change()`
+- `handle_submit_policies` sets `set_applying(true)` before apply and `set_applying(false)` after — self-change suppression wired
+- DHCP event branches (LeaseAcquired, LeaseRenewed, LeaseExpired) also bracket `reconcile_and_apply()` with `set_applying(true/false)`
+- `server_trigger_type_str()` returns `"external_change"` for `Trigger::ExternalChange`
 
-### Reconciler (missing applying flag)
-`netfyr-daemon/src/reconciler.rs`:
-- `Reconciler` holds `BackendRegistry`, `SchemaRegistry`, and `Mutex<Option<Journal>>`
-- Has `reconcile_and_apply()`, `dry_run()`, `query()`, and a private `append_journal_entry()`
-- **No `is_applying` / `set_applying` flag exists**
-- The journal is private to `Reconciler`; external change entries cannot be written from outside without a new method
+### `crates/netfyr-journal/src/entry.rs` (complete)
+- `Trigger::ExternalChange { changed_entities: Vec<String> }` — present with `serde(tag = "type", rename_all = "snake_case")` yielding `"type": "external_change"`
+- `ApplyOutcome::Observed` — present with `"kind": "observed"` serialization
+- Both have full unit tests including serialization round-trips
 
-### Dependencies
-- `netlink-sys` v0.8.8 is in `Cargo.lock` as a transitive dependency via `rtnetlink` (used in `netfyr-backend`)
-- `netfyr-daemon/Cargo.toml` does **not** list `netlink-sys` as a direct dependency; it would need to be added for `netlink_sys::Socket`
-- `rtnetlink` and `netlink-packet-route` appear only in `[dev-dependencies]` of `netfyr-daemon`
+### `crates/netfyr-journal/src/journal.rs`
+- `Journal::latest_state_for(entity_name: &str) -> Result<Option<SerializableState>>` — present, used by `record_external_change`
 
----
+### `crates/netfyr-cli/src/history.rs` (complete)
+- `trigger_display_name(Trigger::ExternalChange { .. })` returns `"external_change"`
+- `matches_trigger` handles "external" as a substring match
+- Text/JSON formatters handle all trigger variants
+
+### `tests/600-e2e-external-change.sh` (exists)
+- Tests MTU change detection (RTM_NEWLINK path)
+- Tests address addition detection (two addresses in quick succession — exercises coalescing)
+- Tests address removal detection (RTM_DELADDR path)
+- Verifies daemon does not re-reconcile (interface retains externally-set values)
+- Verifies no new `policy_apply` entries are written during external-change phases
 
 ## Requirements
 
-1. **`NetlinkMonitor` struct** — opens a raw netlink socket subscribed to `RTNLGRP_LINK` (group 1) and `RTNLGRP_IPV4_IFADDR` (group 5); runs a background tokio task; debounces notifications into 500ms windows; emits `Vec<NetlinkChange>` per window.
+All spec acceptance criteria map to implemented code:
 
-2. **`NetlinkChange` / `ChangeKind`** — typed structs representing a single netlink notification: interface index, optional name, and kind (`LinkChanged`, `AddressAdded`, `AddressRemoved`).
-
-3. **Self-change exclusion flag** — `AtomicBool` on `Reconciler` exposing `set_applying(bool)` and `is_applying() -> bool`; the event loop sets it around `reconcile_and_apply()` calls; the monitor branch discards notifications while it is set.
-
-4. **External change journal write** — a new `Reconciler` method (or the event loop itself, if the journal is made accessible) that:
-   - Queries the current state of the changed interface via the backend registry
-   - Looks up the last known state via `journal.latest_state_for()`
-   - Computes a field-level diff between the two
-   - Writes a `JournalEntry` with `Trigger::ExternalChange`, `ApplyOutcome::Observed`, and the computed diff
-
-5. **Managed-entity filter** — only write a journal entry if the changed interface is covered by an active policy (i.e., present in the effective desired state), to satisfy the "monitor ignores unmanaged interfaces" acceptance criterion.
-
-6. **New `tokio::select!` branch** in `serve_varlink()` for `netlink_monitor.next_change()`.
-
-7. **`netlink-sys` direct dependency** — added to `netfyr-daemon/Cargo.toml`.
-
-8. **End-to-end tests** — new scenarios in `crates/netfyr-daemon/tests/` covering: MTU change detection, address addition/removal detection, self-change exclusion, burst coalescing, no re-reconciliation, and unmanaged interface filtering.
-
----
+| Criterion | Status |
+|---|---|
+| Monitor detects MTU change → `external_change` journal entry | Implemented |
+| Diff shows mtu: old → new | Implemented via `compute_external_field_changes` |
+| Outcome is `observed` | Implemented |
+| `changed_entities` includes the interface name | Implemented |
+| Monitor detects address addition | Implemented (RTM_NEWADDR → AddressAdded → backend re-query) |
+| Monitor detects address removal | Implemented (RTM_DELADDR → AddressRemoved → backend re-query) |
+| Self-changes excluded | Implemented via `set_applying` flag on `Reconciler` |
+| Burst changes coalesced into one entry | Implemented via 500ms sliding debounce |
+| External changes do not trigger re-reconciliation | Implemented (only `record_external_change`, not `reconcile_and_apply`) |
+| Unmanaged interfaces ignored | Implemented via `managed_entities.contains(name)` filter in `server.rs` |
 
 ## Gap Analysis
 
-### New file: `crates/netfyr-daemon/src/netlink_monitor.rs`
-Does not exist. Must be created from scratch.
+**No code creation or modification is required** to satisfy the spec's acceptance criteria. The implementation is complete.
 
-Contents:
-- `pub struct NetlinkMonitor` with `change_rx: mpsc::Receiver<Vec<NetlinkChange>>` and `task: JoinHandle<()>`
-- `pub struct NetlinkChange { ifindex: u32, ifname: Option<String>, kind: ChangeKind }`
-- `pub enum ChangeKind { LinkChanged, AddressAdded, AddressRemoved }`
-- `impl NetlinkMonitor { pub async fn start() -> Result<Self>; pub async fn next_change(&mut self) -> Option<Vec<NetlinkChange>>; pub async fn stop(self); }`
-- Background task: reads raw `NETLINK_ROUTE` socket messages, classifies them as `RTM_NEWLINK`/`RTM_DELLINK`/`RTM_NEWADDR`/`RTM_DELADDR`, accumulates by ifindex, fires the 500ms debounce timer
-
-### Modify: `crates/netfyr-daemon/src/reconciler.rs`
-- Add `is_applying: Arc<AtomicBool>` field to `Reconciler`
-- Add `pub fn set_applying(&self, v: bool)` and `pub fn is_applying(&self) -> bool`
-- Add a new public method (e.g., `pub fn record_external_change(...)`) that writes a journal entry with `Trigger::ExternalChange` and `ApplyOutcome::Observed`, so the journal's private `Mutex` is accessed from within the reconciler rather than from `serve_varlink`
-
-### Modify: `crates/netfyr-daemon/src/server.rs`
-- Add a 5th `tokio::select!` branch: `Some(changes) = netlink_monitor.next_change() => { ... }`
-- Branch logic:
-  1. Skip if `reconciler.is_applying()`
-  2. For each `NetlinkChange` with a known `ifname`, check if the interface is managed (present in policy-derived state)
-  3. Query current state via `reconciler.query(Some("ethernet"), Some(&selector))`
-  4. Call `reconciler.record_external_change(...)` for any managed interface whose state differs from the last journal snapshot
-- Wrap `reconcile_and_apply()` calls with `set_applying(true)` / `set_applying(false)` in all three existing factory-event arms (`LeaseAcquired`, `LeaseRenewed`, `LeaseExpired`) and in `handle_submit_policies()`
-- Instantiate `NetlinkMonitor::start().await` before the loop and pass it into the loop (or construct it inside `serve_varlink`)
-- `serve_varlink`'s signature may need to accept or internally construct `NetlinkMonitor`
-
-### Modify: `crates/netfyr-daemon/src/main.rs`
-- Add `mod netlink_monitor;` declaration
-
-### Modify: `crates/netfyr-daemon/Cargo.toml`
-- Add `netlink-sys = "0.8"` to `[dependencies]` for direct use of `Socket`, `SocketAddr`, `protocols::NETLINK_ROUTE`
-
----
+**One coverage gap** remains: the spec's acceptance criterion "Monitor ignores unmanaged interfaces" has no e2e test. The underlying logic is tested at the unit level (via `managed_entity_names` and `record_external_change` tests in `reconciler.rs`) but the full end-to-end path — where a netlink event for an unmanaged interface arrives and produces no journal entry — is not covered by `tests/600-e2e-external-change.sh`. Adding this phase to the e2e test is the only item not yet implemented.
 
 ## Integration Points
 
-- **`BackendRegistry::query(entity_type, selector)`** — used to fetch current state of a changed interface. Already accessible via `Reconciler::query()`. The selector must be constructed as `Selector::with_name(ifname)`.
-- **`Journal::latest_state_for(entity_name)`** — used to find the last known state. Already implemented. Only searches `current.ndjson`; archives are not scanned.
-- **`Journal::append(entry)`** — used to write the `Observed` entry. Already implemented. Access must go through `Reconciler`'s mutex.
-- **`JournalEntry`/`SerializableDiff`/`SerializableStateSet`** — already fully defined. The external change diff must be built from `SerializableState` fields by comparing `current` (journal snapshot) to `desired` (actual live state), with `change_kind: "set"`.
-- **`summarize_policies(policy_store.policies())`** — already used in `append_journal_entry`; the same call will populate `active_policies` in the external change entry.
-- **`FactoryManager::next_event()`** — the existing Branch 2 in `tokio::select!`; the new Branch 5 for netlink events must not interfere with this.
+All integration points are already active in the current implementation:
 
----
+- `Journal::latest_state_for(&str)` — called in `record_external_change` to get the previous snapshot per entity; used to detect actual field-level drift
+- `BackendRegistry::query(&EntityType, Option<&Selector>)` — called in `record_external_change` with `entity_type = "ethernet"` and `Selector::with_name(entity_name)` to get current live state
+- `Journal::append(JournalEntry)` — called inside `record_external_change` through the `Mutex<Option<Journal>>` lock; seq is assigned by `append`
+- `SerializableDiff`, `SerializableDiffOp`, `SerializableFieldChange`, `SerializableStateSet`, `SerializableState` — all constructed in `record_external_change`
+- `summarize_policies(policy_store.policies())` — used in the external change entry's `active_policies` field
+- `NetlinkMonitor` is created once in `serve_varlink` and its `next_change()` is polled in Branch 5 of the `tokio::select!` loop alongside the existing branches for Varlink connections, factory events, and signals
 
 ## Risks
 
-1. **Blocking socket in async runtime**: `netlink_sys::Socket` is a synchronous, blocking file descriptor. Reading it in the monitor task requires either `tokio::task::spawn_blocking` or wrapping it in `tokio::io::unix::AsyncFd`. The spec does not specify which; the wrong choice can block the tokio thread pool.
+**Race condition in self-change suppression**: `set_applying(false)` is called synchronously after `backend_registry.apply()` returns, but netlink notifications arrive asynchronously from the kernel. If the OS delivers notifications more than 500 ms after `set_applying(false)` (i.e., after the debounce window fires), those notifications will appear as external changes even though they were caused by netfyr. This is inherent to a flag-based approach and acknowledged in the spec.
 
-2. **Journal access from `serve_varlink`**: The `Journal` is behind a private `Mutex` inside `Reconciler`. The external change write path must go through a new `Reconciler` method, not directly from `serve_varlink`. This requires adding API surface to `Reconciler` that was not present before.
+**Entity type hardcoded to `"ethernet"`**: `record_external_change` issues backend queries only for `entity_type = "ethernet"`. Changes to future entity types (bonds, bridges, VLANs) would not be detected without modifying this function.
 
-3. **Self-change exclusion timing**: The `AtomicBool` flag is set synchronously around `reconcile_and_apply()`, but the 500ms debounce means notifications generated during a slow apply could arrive after the flag is cleared. Specifically, if `reconcile_and_apply` takes <500ms but the OS delivers netlink messages after it returns, those messages will still be debounced into a window that fires after `is_applying` is `false`. This is inherent to a flag-based approach.
+**`latest_state_for` skips entities with no prior journal entry**: On a freshly-started daemon, or immediately after journal rotation, the function returns `None` for entities not yet in `current.ndjson`. The first external change on such an entity goes undetected. This is intentional per the spec ("entities in the current state but not in the journal are ignored") but creates a blind spot in the startup window.
 
-4. **`latest_state_for` only searches `current.ndjson`**: On a freshly-started daemon (or immediately after journal rotation), the method returns `None` for interfaces not yet in the current journal file. These interfaces will not produce external-change entries until a reconcile-and-apply writes them. The spec says "entities in the current state but not in the journal are ignored" — this is intentional but means the first external change after a rotation goes undetected.
+**Address field representation**: Address addition/removal detection depends on the ethernet backend representing IP addresses as a serialized field in `StateSet`. If the address list is not captured as a distinct field in the snapshot, `compute_external_field_changes` would produce an empty list and no journal entry would be written even after an address change.
 
-5. **Managed-entity check requires effective state computation**: To determine whether a changed interface is "managed", the event loop must know which entities are covered by active policies. This requires either calling `merge(inputs)` (expensive, runs the full policy merge) or maintaining a cached set of managed entity names. The spec does not prescribe how to compute this; naive re-running `build_policy_inputs` + `merge` on every netlink event is functionally correct but inefficient.
-
-6. **`rtnetlink` version compatibility with `netlink-sys`**: `netfyr-backend` uses `rtnetlink = "0.20"` which depends on `netlink-sys 0.8.8`. Adding `netlink-sys = "0.8"` directly must resolve to the same version; a mismatch would cause duplicate crate instances.
-
-7. **Interface name availability in netlink messages**: `RTM_NEWLINK` messages include the interface name as `IFLA_IFNAME`. `RTM_NEWADDR` messages include the interface index but not always the name. The monitor must handle the case where `ifname` is absent (the spec says skip such changes), meaning address-only changes on interfaces not also generating link changes may be silently dropped.
+**Missing e2e coverage for unmanaged interface scenario**: The `"Monitor ignores unmanaged interfaces"` acceptance criterion is not validated end-to-end, only at unit-test level.

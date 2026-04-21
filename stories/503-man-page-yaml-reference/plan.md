@@ -1,8 +1,8 @@
 # Plan: SPEC-503 — YAML Reference Man Page
 
-## Status: Already Implemented
+## Status: Nearly Complete — One Minor Fix
 
-The understanding analysis and direct verification confirm that all acceptance criteria for this story are already met. No code changes are required.
+The man page, tests, xtask exclusion, and RPM integration are all in place. One cosmetic fix is needed: the SEE ALSO section is missing `netfyr-daemon(8)`, which the spec explicitly includes and which exists at `man/netfyr-daemon.8`.
 
 ## Approach
 
@@ -10,7 +10,9 @@ This story calls for a hand-written `man/netfyr.yaml.5` troff man page documenti
 
 The chosen design is a single standalone troff file committed to `man/netfyr.yaml.5`, with no code generation or build-time templating. This is the standard Unix approach for section-5 format documentation. The alternative — generating the man page from Rust code or from the JSON schema — was rejected because the content requires hand-written prose, examples, and editorial judgment about what details matter to users. Auto-generation would produce either too little (missing examples and caveats) or too much (schema dump) information.
 
-**Current state**: `man/netfyr.yaml.5` exists as a 358-line troff file containing all required sections with correct content. The xtask infrastructure correctly excludes it from generation and documents this in both the `Man` variant doc comment (line 28) and the post-generation println (line 89). All 42+ related tests in the xtask test suite pass.
+**Current state**: `man/netfyr.yaml.5` exists as a 358-line troff file containing all required sections with correct content. The xtask infrastructure correctly excludes it from generation and documents this in both the `Man` variant doc comment (line 28) and the post-generation println (line 90). The integration test suite (`xtask/tests/man_page_yaml_reference.rs`) has 39 tests and the xtask unit tests (`xtask/src/main.rs` lines 520-1021) add further coverage. All tests pass.
+
+The only gap: The spec's SEE ALSO section lists `netfyr-daemon(8)` but the current man page omits it. The file `man/netfyr-daemon.8` exists, so this reference should be added. No acceptance-criteria test currently enforces this, but it's a clear spec requirement.
 
 ## Design Decisions
 
@@ -26,9 +28,9 @@ The chosen design is a single standalone troff file committed to `man/netfyr.yam
    - **Alternatives considered**: No comment; relying on xtask output alone.
    - **Rationale**: Developers editing the file directly need to see the warning. The xtask output is only visible when running `cargo xtask man`.
 
-4. **Decision**: The xtask `Man` subcommand's doc comment and post-generation println both mention `netfyr.yaml.5` alongside `netfyr-examples.7`.
-   - **Alternatives considered**: Only mentioning the file in one location.
-   - **Rationale**: Both the developer-facing doc comment and the runtime output should be complete so no one wonders why the section-5 page wasn't regenerated.
+4. **Decision**: Add `netfyr-daemon(8)` to SEE ALSO.
+   - **Alternatives considered**: Leaving it out since no test enforces it.
+   - **Rationale**: The spec explicitly lists it, and `man/netfyr-daemon.8` exists. Cross-references between man pages are a standard Unix convention and help users discover related documentation.
 
 5. **Decision**: Document the `state` field (administrative state: "up"/"down") in the FIELDS section despite it not appearing in the ethernet JSON schema.
    - **Alternatives considered**: Omitting it because the schema has `operstate` (read-only) but no writable `state`.
@@ -37,49 +39,44 @@ The chosen design is a single standalone troff file committed to `man/netfyr.yam
 ## File Changes
 
 ### 1. `man/netfyr.yaml.5`
-- **Action**: no change needed (already complete)
-- **What**: 358-line troff man page with all required sections: NAME, DESCRIPTION, BARE STATE FORMAT (with example), POLICY FORMAT (kind/name/factory/priority/selector/state/states; 3 examples covering static-single, static-multi, dhcpv4), MULTI-DOCUMENT FILES (with example), SELECTORS (name/driver/pci_path/mac with dhcpv4 note), FIELDS (mtu/addresses/routes/state for ethernet), VALUE TYPES (full mapping table with IPv4-only language and IPv6 rejection note), FILES (/etc/netfyr/policies/ and /var/lib/netfyr/policies/), SEE ALSO.
-- **Why**: Satisfies all acceptance criteria from the spec.
+- **Action**: modify (one line change)
+- **What**: Add `.BR netfyr\-daemon (8),` to the SEE ALSO section, between the `.BR netfyr\-revert (1),` line and the `.BR netfyr\-examples (7)` line. This matches the ordering in the spec: `netfyr(1), netfyr-apply(1), netfyr-query(1), netfyr-history(1), netfyr-revert(1), netfyr-daemon(8), netfyr-examples(7)`.
+- **Why**: The spec's SEE ALSO section explicitly includes `netfyr-daemon(8)`, and the file exists at `man/netfyr-daemon.8`. All other SEE ALSO entries are already present.
 
-### 2. `xtask/src/main.rs`
-- **Action**: no change needed (already updated)
-- **What**: Line 28 doc comment and line 89 println both mention `netfyr.yaml.5` and `netfyr-examples.7` as hand-maintained files. Test suite (lines 516-1016) includes comprehensive content tests for the man page.
-- **Why**: Ensures developers know both files are outside the generation pipeline.
+### 2. All other files
+- **Action**: no change needed
+- The following are already correctly implemented:
+  - `xtask/src/main.rs`: Line 28-29 doc comment and line 90 println both mention `netfyr.yaml.5` as a hand-maintained file. Unit tests at lines 520-1021 verify man page content.
+  - `xtask/tests/man_page_yaml_reference.rs`: 39 integration tests covering all acceptance criteria.
+  - `netfyr.spec`: `%install` section has `install -pm 0644 man/netfyr.yaml.5 %{buildroot}%{_mandir}/man5/` and `%files` section has `%{_mandir}/man5/netfyr.yaml.5*`.
 
 ## Dependencies
 
-No new crate dependencies. This story involves only a troff file and minor Rust string changes, all already in place.
+No new crate dependencies. This story involves only a troff file.
 
 ## Implementation Order
 
-No implementation steps are needed — the story is complete. For reference, the implementation that was done:
+1. **Edit `man/netfyr.yaml.5`**: Add the `netfyr-daemon(8)` cross-reference to the SEE ALSO section (lines 351-357). Insert `.BR netfyr\-daemon (8),` as a new line between the `netfyr\-revert (1),` and `netfyr\-examples (7)` lines. This is the only change needed. The file compiles (renders) independently — there is no Rust compilation dependency.
 
-1. `man/netfyr.yaml.5` was created with all required sections and examples.
-2. `xtask/src/main.rs` was updated with the hand-maintained file note and comprehensive tests.
-3. All tests pass: `cargo test -p xtask -- yaml` runs 42+ tests successfully.
+2. **Verify**: Run `cargo test -p xtask` to confirm all existing tests still pass. The existing tests do not check for `netfyr-daemon(8)` specifically, so no test updates are needed for this change to pass.
 
 ## Risks and Mitigations
 
-1. **Risk: `state` field not in ethernet JSON schema.** The man page documents `state` ("up"/"down") but the JSON schema has `operstate` (read-only) and no writable `state`.
-   - **Mitigation**: The spec requires documenting this field. Any schema update is out of scope.
+1. **Risk: No automated troff rendering CI.** Man page rendering correctness is verified only when `groff` is available on the test host.
+   - **Mitigation**: The file uses simple, well-established troff macros (`.TH`, `.SH`, `.SS`, `.TP`, `.PP`, `.RS`, `.RE`, `.nf`, `.fi`, `.B`, `.BR`, `.I`) that are unlikely to break. The integration test at `test_man_page_renders_without_fatal_troff_errors` will catch any syntax issues when groff is available.
 
-2. **Risk: No automated troff rendering CI.** Man page rendering correctness is verified manually.
-   - **Mitigation**: The file uses simple, well-established troff macros (`.TH`, `.SH`, `.SS`, `.TP`, `.PP`, `.RS`, `.RE`, `.nf`, `.fi`, `.B`, `.BR`, `.I`) that are unlikely to break. The xtask test suite verifies content strings are present.
-
-3. **Risk: Man page drift if new entity types or fields are added.**
+2. **Risk: Man page drift if new entity types or fields are added.**
    - **Mitigation**: The line-1 comment warns maintainers. Future feature stories that add entity types or fields must update this file manually.
+
+3. **Risk: The `state` field (up/down) is documented but not present in the JSON schema.**
+   - **Mitigation**: The spec requires documenting this field. If the implementation changes, the man page must be updated. This is inherent to hand-maintained documentation.
 
 ## Test Strategy
 
-No new tests are needed. The existing xtask test suite (`xtask/src/main.rs` lines 516-1016 and `xtask/tests/man_page_yaml_reference.rs`) provides comprehensive coverage:
+No new tests are required. The existing test coverage is comprehensive:
 
-- Content presence tests for all sections (NAME, BARE STATE FORMAT, POLICY FORMAT, MULTI-DOCUMENT FILES, SELECTORS, FIELDS, VALUE TYPES, FILES, SEE ALSO)
-- Field documentation tests (kind, name, factory, priority, selector, state, states, mtu, addresses, routes)
-- Factory type tests (static, dhcpv4)
-- Value type mapping tests (Bool, U64, I64, IpAddr, IpNetwork, String, List, Map)
-- IPv4-only language verification
-- Selector field tests (name, driver, pci_path, mac)
-- Cross-reference tests (SEE ALSO entries)
-- Hand-maintained comment verification
+- **`xtask/tests/man_page_yaml_reference.rs`** (39 integration tests): Covers file existence, section-5 declaration, hand-maintained comment, NAME section, BARE STATE FORMAT (section existence, type field, selector properties, example), POLICY FORMAT (section existence, all 7 fields, both factory types, examples for static and dhcpv4), MULTI-DOCUMENT FILES (section, separator documentation, example), SELECTORS (section, all 4 fields), FIELDS (section, mtu, addresses, routes, state), VALUE TYPES (section, all 8 type mappings), FILES (section, both directories), RPM path verification, groff rendering.
 
-All 42+ tests pass as of the current state.
+- **`xtask/src/main.rs`** unit tests (lines 520-1021): Additional content verification tests with similar coverage.
+
+The SEE ALSO change does not require a new test — no acceptance criterion mandates testing for specific SEE ALSO entries. If desired, a test asserting `netfyr-daemon` appears in the SEE ALSO section could be added to `man_page_yaml_reference.rs`, but this is optional.

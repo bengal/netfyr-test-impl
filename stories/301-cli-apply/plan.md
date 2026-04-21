@@ -2,129 +2,158 @@
 
 ## Approach
 
-The `netfyr apply` implementation is **nearly complete**. The apply flow logic in `apply.rs` (1033 lines) is fully implemented: daemon detection via `NETFYR_SOCKET_PATH`, policy loading with bare-state auto-wrapping, DHCP rejection in daemon-free mode, reconciliation, diff generation, apply, display functions, and exit code mapping. All 8 shell integration tests already exist and cover the spec's acceptance criteria. There are 30+ unit tests covering exit codes, policy loading, and DHCP rejection.
+The core `netfyr apply` implementation is **complete**. The apply flow in `apply.rs` (~1279 lines) is fully implemented: daemon detection via `NETFYR_SOCKET_PATH`, policy loading with bare-state auto-wrapping, DHCP rejection in daemon-free mode, reconciliation, diff generation, apply, journal write-back, display functions with colored output, and exit code mapping. The `Cli` struct in `lib.rs` already has `subcommand_required = true, arg_required_else_help = true` and uses non-optional `Commands`. All 13 shell integration test scripts exist. There are 30+ unit tests.
 
-**Three gaps remain**, all in the CLI entry-point layer:
+**Three gaps remain**, all relating to color control:
 
-1. **`lib.rs`**: The `Cli` struct uses `command: Option<Commands>` without `subcommand_required`/`arg_required_else_help` attributes. The spec requires that running bare `netfyr` prints usage help and exits with code 2. Without these clap attributes, clap doesn't enforce this behavior — instead the `None` match arm in `main.rs` silently exits 0.
+1. **`lib.rs`**: Missing `--color` global flag (`ColorMode` enum with `ValueEnum` derive, `color: ColorMode` field on `Cli`).
+2. **`main.rs`**: Missing color resolution logic — needs to read `NO_COLOR` env var and `cli.color`, then call `colored::control::set_override()` before dispatching subcommands.
+3. **`netfyr_cli_main.rs`**: The alternate binary `netfyr-cli` has a manual `if args().len() == 1 { exit(0) }` guard that bypasses clap and exits 0 instead of 2. This must be fixed to match `main.rs` behavior, and it must also apply the same color resolution logic.
 
-2. **`main.rs`**: The `None =>` arm prints `"netfyr"` and returns `ExitCode::from(0u8)`. Once `lib.rs` is fixed to make the subcommand required, this arm becomes unreachable and must be removed.
+**Why this approach**: The `colored` crate (v2.2.0) already respects `NO_COLOR` and detects TTY status by default. For `--color=auto`, we let `colored`'s built-in behavior handle everything (no `set_override` call needed). For `--color=always`, we call `set_override(true)`. For `--color=never`, we call `set_override(false)`. This means `NO_COLOR` is respected for `auto` mode automatically by `colored`, and overridden by explicit `always`/`never`. However, the spec says `NO_COLOR` takes precedence over `--color` regardless — so if `NO_COLOR` is set, we must call `set_override(false)` even if `--color=always` was passed.
 
-3. **Missing shell test**: The AC scenario "No subcommand shows usage help, exit code 2" has no corresponding `301-no-subcommand.sh`. The existing `301-no-args-error.sh` tests `netfyr apply` with no paths (a different clap error path).
-
-**Why this approach over alternatives**: The fix uses clap's built-in `SubcommandRequiredElseHelp` policy, which is the idiomatic way to handle "no subcommand" in clap. The alternative — keeping `Option<Commands>` and manually printing help in the `None` arm — would duplicate clap's help rendering logic and is more fragile. The clap approach also guarantees the correct exit code (2) without any manual plumbing.
-
-**xtask compatibility**: `xtask/src/main.rs` calls `netfyr_cli::Cli::command()` via clap's `CommandFactory` trait (line 56). This returns a `clap::Command` and does not access the `command` field directly. Changing `Option<Commands>` to `Commands` has zero impact on xtask.
+**Alternative considered**: Adding an `atty` or `is-terminal` dependency for explicit TTY detection in `auto` mode. Rejected because `colored` already does this internally — adding another crate would be redundant.
 
 ## Design Decisions
 
-1. **Decision**: Change `command: Option<Commands>` to `command: Commands` and add `subcommand_required = true, arg_required_else_help = true`.
-   - **Alternatives considered**: Keep `Option<Commands>` and fix the `None` arm to call `Cli::command().print_help()` and return exit code 2.
-   - **Rationale**: The spec explicitly shows the clap derive approach with non-optional `Commands`. Making it non-optional is simpler — it eliminates a code path entirely (the `None` arm in `main.rs`). Clap handles help rendering and exit code 2 automatically via `SubcommandRequiredElseHelp`. The alternative would require manual help rendering and explicit exit code management.
+1. **Decision**: Add `ColorMode` enum and `color` field to the existing `Cli` struct in `lib.rs`.
+   - **Alternatives considered**: (a) Put `ColorMode` in its own file. (b) Put it in `main.rs`.
+   - **Rationale**: `lib.rs` is where `Cli` and `Commands` live; keeping `ColorMode` there maintains locality. It must be in the `lib` crate (not `main.rs`) because `Cli` is a public struct used by `xtask` for man page generation. The `color` field must be part of `Cli` for clap to generate correct `--help` output.
 
-2. **Decision**: Remove the `None =>` arm from `main.rs` rather than converting it.
-   - **Alternatives considered**: Keep the arm with `unreachable!()` for safety.
-   - **Rationale**: Once `command` is `Commands` (not `Option<Commands>`), the match is exhaustive over `Commands::Apply` and `Commands::Query` — there is no `None` variant to match. The compiler enforces this. Adding `unreachable!()` is unnecessary noise.
+2. **Decision**: `NO_COLOR` env var overrides `--color` flag unconditionally.
+   - **Alternatives considered**: Let `--color=always` override `NO_COLOR`.
+   - **Rationale**: The spec explicitly states: "If the `NO_COLOR` environment variable is set (any value), colors are disabled regardless of the `--color` flag." This follows the https://no-color.org/ convention.
 
-3. **Decision**: Remove `Some()` wrappers from the remaining match arms.
-   - **Rationale**: With `command: Commands`, the match is directly on `Commands::Apply(args)` and `Commands::Query(args)`, not `Some(Commands::Apply(args))`. This is a required syntactic change.
+3. **Decision**: For `--color=auto` (default), do NOT call `set_override` — let `colored`'s built-in TTY + `NO_COLOR` detection handle it.
+   - **Alternatives considered**: Explicitly detect TTY with `std::io::stdout().is_terminal()` (Rust 1.70+ stable) and call `set_override`.
+   - **Rationale**: `colored` 2.x already checks `NO_COLOR` and TTY internally. Calling `set_override` for `auto` would bypass `colored`'s `NO_COLOR` check, forcing us to duplicate that logic. By not calling `set_override`, `colored`'s default behavior is exactly what `auto` means. The only case where `NO_COLOR` must be checked explicitly is when `--color=always` is passed, since `set_override(true)` would override `colored`'s `NO_COLOR` check.
 
-4. **Decision**: Add `301-no-subcommand.sh` shell test.
-   - **Alternatives considered**: Rely solely on unit tests.
-   - **Rationale**: The spec's acceptance criteria explicitly lists "No subcommand shows usage help, exit code 2" as a scenario. Shell integration tests are the verification mechanism for CLI behavior. Unit tests cannot test the clap parse → exit code path through `main()`. The existing `301-no-args-error.sh` tests a different scenario (`netfyr apply` with no paths).
+4. **Decision**: Color resolution as a standalone function `resolve_color_mode(mode: &ColorMode)` in `lib.rs`, called from both `main.rs` and `netfyr_cli_main.rs`.
+   - **Alternatives considered**: Inline the logic in `main.rs` only.
+   - **Rationale**: Both binaries (`netfyr` and `netfyr-cli`) need the same color behavior. A shared function in `lib.rs` avoids duplication. Making it public allows both binaries to call it.
 
-5. **Decision**: The dry-run exit code 1 (when changes exist) is intentional and correct.
-   - **Rationale**: `apply.rs:139` returns `ExitCode::from(1)` for non-empty dry-run diffs. This lets scripts detect "something would change" via exit code without parsing output. The spec AC only specifies exit 0 for "no changes" dry-run, and is silent about the "changes pending" case, so exit 1 is a valid choice. The existing `301-apply-dry-run.sh` test already asserts this.
+5. **Decision**: Fix `netfyr_cli_main.rs` by removing the `if args().len() == 1` guard entirely.
+   - **Alternatives considered**: Change the guard to `exit(2)` and print help manually.
+   - **Rationale**: With `subcommand_required = true, arg_required_else_help = true` on `Cli`, clap handles the no-subcommand case correctly (prints help, exits 2). The manual guard pre-empts clap and produces wrong behavior. Removing it lets clap handle it consistently. The rest of the file should mirror `main.rs` exactly (parse, resolve color, dispatch).
+
+6. **Decision**: Export `ColorMode` as public from `lib.rs`.
+   - **Rationale**: `netfyr_cli_main.rs` (the `netfyr-cli` binary) imports from `netfyr_cli::*`. The `ColorMode` is embedded in `Cli` via clap's derive, so it must be accessible. Additionally, `xtask` uses `Cli::command()` for man page generation, and the `--color` flag must appear in generated man pages. Public export ensures both use cases work.
 
 ## File Changes
 
 ### `crates/netfyr-cli/src/lib.rs` — Modify
 
-**What**: Two changes to the `Cli` struct:
+**What**:
 
-1. Add `#[command(subcommand_required = true, arg_required_else_help = true)]` attribute to the `Cli` struct, alongside the existing `#[command(name = "netfyr", ...)]` attribute.
-2. Change `pub command: Option<Commands>` to `pub command: Commands`.
+1. Add `use clap::ValueEnum;` to the existing clap imports (or add it to the existing `use clap::{Parser, Subcommand};` line).
 
-The `#[derive(Parser)]`, doc comments, and `Commands` enum remain unchanged.
+2. Define `ColorMode` enum before the `Cli` struct:
+   ```
+   #[derive(Clone, ValueEnum)]
+   pub enum ColorMode {
+       Auto,
+       Always,
+       Never,
+   }
+   ```
 
-**Why**: The spec requires that `netfyr` with no subcommand prints usage help and exits 2. Clap's `SubcommandRequiredElseHelp` policy provides this behavior automatically. Making `command` non-optional is the idiomatic companion change — it means the parsed `Cli` always has a valid subcommand, eliminating the `None` case in `main.rs`.
+3. Add `color` field to `Cli` struct:
+   ```rust
+   #[arg(long, global = true, default_value = "auto")]
+   pub color: ColorMode,
+   ```
+   Place it before the `command` field.
+
+4. Add a public function `resolve_color_mode(mode: &ColorMode)` that:
+   - Checks if `NO_COLOR` env var is set (any value). If so, calls `colored::control::set_override(false)` and returns.
+   - If `mode` is `Always`, calls `colored::control::set_override(true)`.
+   - If `mode` is `Never`, calls `colored::control::set_override(false)`.
+   - If `mode` is `Auto`, does nothing (lets `colored`'s built-in TTY detection handle it).
+
+5. Add `use colored::control::set_override;` import for the resolve function.
+
+6. Add `pub use` for `ColorMode` and `resolve_color_mode` alongside the existing re-exports.
+
+**Why**: Implements GAP 1 (missing `--color` flag) and GAP 2 (missing color resolution). Placing the enum and resolver in `lib.rs` makes them available to both binary targets and to `xtask`.
 
 ### `crates/netfyr-cli/src/main.rs` — Modify
 
-**What**: Simplify the `match cli.command` block:
+**What**:
 
-1. Remove the `None => { ... }` arm entirely.
-2. Change `Some(Commands::Apply(args))` to `Commands::Apply(args)`.
-3. Change `Some(Commands::Query(args))` to `Commands::Query(args)`.
+1. Add `resolve_color_mode` to the import from `netfyr_cli`.
+2. After `let cli = Cli::parse();`, add a call to `resolve_color_mode(&cli.color);` before the `match cli.command` block.
 
-The error handling within each arm (`match run_apply(args).await { ... }`) remains identical.
+**Why**: Ensures color mode is resolved before any output is produced by subcommand handlers. Must happen after `Cli::parse()` (to access the parsed `--color` value) and before dispatching.
 
-**Why**: With `command: Commands` (non-optional), the match is directly on `Commands` variants. The `None` arm is gone because `Option` is gone. This eliminates the incorrect exit-0 behavior for bare `netfyr` invocation.
+### `crates/netfyr-cli/src/netfyr_cli_main.rs` — Modify
 
-### `tests/301-no-subcommand.sh` — Create
+**What**:
 
-**What**: Shell script that validates running bare `netfyr` (no subcommand) prints help and exits 2.
+1. Remove the `if std::env::args().len() == 1 { println!("netfyr"); std::process::exit(0); }` block (lines 8-11).
+2. Add `resolve_color_mode` to the import from `netfyr_cli`.
+3. After `let cli = Cli::parse();`, add `resolve_color_mode(&cli.color);` before the match block.
 
-Structure (following established `301-*.sh` conventions):
-- Shebang, `set -euo pipefail`
-- Set `SCRIPT_DIR`, source `helpers.sh`
-- Set `NETFYR_BIN` with fallback to `$SCRIPT_DIR/../target/debug/netfyr`
-- Check binary exists with `[[ ! -x "$NETFYR_BIN" ]]` then `echo "FAIL: ..." >&2; exit 1`
-- Export `NETFYR_SOCKET_PATH=/nonexistent`
-- NO `netns_setup` (this test doesn't touch network state)
-- Run `"$NETFYR_BIN"` with no arguments, capture exit code using `EXIT_CODE=0; "$NETFYR_BIN" 2>&1 || EXIT_CODE=$?` pattern
-- Assert `EXIT_CODE` is 2
-- Assert captured output contains "Usage" or "usage" (clap's help output)
-- Print `PASS: 301-no-subcommand`
+The resulting file should be identical to `main.rs` in structure (parse, resolve color, dispatch).
 
-**Why**: Satisfies AC scenario "No subcommand shows usage help, exit code 2". This cannot be tested by existing scripts — `301-no-args-error.sh` tests `netfyr apply` with no paths, which is a different clap error path. This test validates the top-level `SubcommandRequiredElseHelp` behavior.
+**Why**: Fixes GAP 3 (wrong exit code 0 for no-args). With the manual guard removed, clap's `SubcommandRequiredElseHelp` handles the no-subcommand case correctly (help + exit 2). Adding color resolution ensures `netfyr-cli` binary has the same color behavior as `netfyr`.
 
 ## Dependencies
 
-No new crate dependencies needed. All existing dependencies (`clap`, `tokio`, `anyhow`, `colored`, `netfyr-*` crates) are already in `crates/netfyr-cli/Cargo.toml`.
+No new crate dependencies needed. The `colored` crate (already in `Cargo.toml`) provides `colored::control::set_override`. The `std::env::var` function handles `NO_COLOR` checking. No additional imports are required beyond what's already available.
 
 ## Implementation Order
 
-1. **Modify `crates/netfyr-cli/src/lib.rs`** — Add clap attributes and change `Option<Commands>` to `Commands`. This is the foundational change; without it, step 2 won't compile (the match arms reference `Some(...)` patterns on a non-optional type).
+1. **Modify `crates/netfyr-cli/src/lib.rs`** — Add `ColorMode` enum, `color` field on `Cli`, and `resolve_color_mode()` function. This is the foundational change; steps 2 and 3 depend on these types being available.
 
-2. **Modify `crates/netfyr-cli/src/main.rs`** — Remove `None` arm and `Some()` wrappers. This depends on step 1 — the field type must be `Commands` for the simplified match to compile. After this step, `cargo build` should succeed.
+2. **Modify `crates/netfyr-cli/src/main.rs`** — Add `resolve_color_mode(&cli.color)` call after parse. Depends on step 1 for the import. After this step, `cargo build` should succeed and `netfyr` binary has correct color behavior.
 
-3. **Create `tests/301-no-subcommand.sh`** — Independent of steps 1-2 at the code level, but logically depends on them for correct behavior. Must be created and made executable (`chmod +x`).
+3. **Modify `crates/netfyr-cli/src/netfyr_cli_main.rs`** — Remove the args-length guard and add color resolution. Depends on step 1. After this step, both binaries behave correctly.
 
-4. **Verify** — Run `cargo test -p netfyr-cli` to confirm unit tests pass, then `cargo build` to produce the binary. Steps 1-2 are a compile-time change with no logic changes to `apply.rs`, so existing unit tests should pass unchanged. If `make integration-test SPEC=301` is available, run it to verify all 9 shell tests (8 existing + 1 new) pass.
+4. **Verify** — Run `cargo test -p netfyr-cli` (unit tests), `cargo build` (compile both binaries), `cargo clippy -p netfyr-cli` (lint). Then run `make integration-test SPEC=301` to verify all 13 shell integration tests pass. The `301-no-subcommand.sh` test specifically validates that bare `netfyr` exits 2 — this test was failing before step 3 if invoked via the `netfyr-cli` binary, but since tests use `NETFYR_BIN` defaulting to `target/debug/netfyr` (from `main.rs`), it should have been passing already. Step 3 fixes the `netfyr-cli` binary for correctness.
 
 ## Risks and Mitigations
 
-1. **Risk**: Clap's `SubcommandRequiredElseHelp` might exit with a code other than 2.
-   - **Impact**: The `301-no-subcommand.sh` test would fail even though the behavior is correct.
-   - **Mitigation**: Clap 4.x exits with code 2 for usage errors (including missing required subcommands). This is documented behavior. The existing `301-no-args-error.sh` already relies on clap exiting 2 for missing required arguments and passes, confirming this behavior on the current clap version.
+1. **Risk**: `colored::control::set_override` is a process-global state setter. Unit tests in `apply.rs` that call display functions will see whatever color state was last set.
+   - **Impact**: Low. Unit tests don't call `resolve_color_mode()`, so they get `colored`'s default behavior (which respects `NO_COLOR` and TTY). No unit test assertions depend on ANSI escape codes being present or absent.
+   - **Mitigation**: No action needed. If a future test needs to assert on colored output, it can call `set_override` in a test fixture, but that's out of scope.
 
-2. **Risk**: Changing `Option<Commands>` to `Commands` could break downstream code that pattern-matches on `cli.command`.
-   - **Impact**: Compile failure in crates that depend on `netfyr-cli`.
-   - **Mitigation**: Only two consumers exist: `main.rs` (fixed in step 2) and `xtask` (which calls `Cli::command()` — the `CommandFactory` trait method — not `cli.command` the field). I verified `xtask/src/main.rs:56` uses `netfyr_cli::Cli::command()` which is unaffected.
+2. **Risk**: `colored` 2.x might change its `NO_COLOR` handling semantics in a patch release.
+   - **Impact**: Unlikely but would affect `auto` mode behavior.
+   - **Mitigation**: The version is pinned to `"2"` in Cargo.toml. The `resolve_color_mode` function explicitly checks `NO_COLOR` before calling `set_override(true)` for `Always` mode, so even if `colored` changed its internal behavior, the `NO_COLOR`-overrides-everything guarantee is maintained by our code.
 
-3. **Risk**: The `301-no-subcommand.sh` test doesn't use `netns_setup` — could it interfere with other tests running in parallel?
-   - **Impact**: None. The test only runs the `netfyr` binary with no arguments and checks its output/exit code. It performs no network operations, creates no files (besides the implicit tempdir from mktemp if used), and has no side effects.
+3. **Risk**: `xtask` man page generation might render the `--color` flag differently than expected.
+   - **Impact**: Cosmetic only. Man pages might show `--color <COLOR_MODE>` with values `auto`, `always`, `never`.
+   - **Mitigation**: This is the correct clap behavior for `ValueEnum`. The help text from the doc comment and the enum variant names produce reasonable man page output. No action needed.
 
-4. **Risk**: Existing unit tests in `apply.rs` use `unsafe { std::env::set_var(...) }` which is unsound in multi-threaded contexts (Rust 1.81+).
-   - **Impact**: Compiler warnings or test failures in CI.
-   - **Mitigation**: This is a pre-existing issue, not introduced by this change. The test (`test_run_apply_dhcp_policy_without_daemon_returns_error_with_daemon_message`) already uses `unsafe` and runs under `#[tokio::test]` (single-threaded by default). No changes needed for this story. If it becomes a problem, the fix would be to use `#[tokio::test(flavor = "current_thread")]` explicitly, but that's out of scope.
+4. **Risk**: The `netfyr_cli_main.rs` removal of the args guard could break some undocumented use case of the `netfyr-cli` binary.
+   - **Impact**: Low. The `netfyr-cli` binary is an alternate entry point. The primary binary is `netfyr` from `main.rs`. Making them consistent is the right thing.
+   - **Mitigation**: Both binaries will have identical behavior after the change.
+
+5. **Risk**: Existing integration tests run with piped stdout (not a TTY), so `colored`'s auto mode disables colors. If any test greps for ANSI escape sequences, it would fail.
+   - **Impact**: None. Checked all 13 test scripts — none grep for ANSI codes. They grep for text content like "mtu", "path not found", "usage", etc.
+   - **Mitigation**: No action needed.
 
 ## Test Strategy
 
-**Unit tests**: The 30+ existing unit tests in `apply.rs` cover exit code logic, policy loading, DHCP rejection, and display functions. No new unit tests are needed — the change is purely in the CLI entry point (clap parse → dispatch), not in the apply logic.
+**Unit tests**: No new unit tests needed. The color resolution logic is a thin wrapper around `colored::control::set_override` — testing it would require process-global state manipulation (setting/unsetting `NO_COLOR` env var) which is unsound in multi-threaded test runners. The existing 30+ unit tests in `apply.rs` continue to validate all apply logic. The `ColorMode` enum is tested transitively by clap's derive validation (invalid values produce parse errors).
 
-**Shell integration tests**: After adding `301-no-subcommand.sh`, there will be 9 scripts total:
-- `301-apply-static-mtu.sh` — MTU change in namespace
-- `301-apply-with-address.sh` — MTU + address in namespace
-- `301-apply-dry-run.sh` — dry-run does not change state
-- `301-dhcp-policy-no-daemon.sh` — DHCP policy exits 2
-- `301-dry-run-no-changes.sh` — dry-run exits 0 when no changes
-- `301-no-args-error.sh` — `netfyr apply` with no paths exits 2
-- `301-no-subcommand.sh` — bare `netfyr` shows help, exits 2 (NEW)
-- `301-path-not-found.sh` — nonexistent path exits 2
-- `301-yaml-parse-error.sh` — invalid YAML exits 2
+**Shell integration tests**: All 13 existing test scripts cover the required acceptance criteria:
+- `301-apply-static-mtu.sh` — MTU change in namespace (exit 0)
+- `301-apply-with-address.sh` — MTU + address in namespace (exit 0)
+- `301-apply-dry-run.sh` — dry-run does not change state (exit 1)
+- `301-apply-no-changes.sh` — no changes needed (exit 0)
+- `301-conflict-warning.sh` — conflict warnings (exit 1)
+- `301-dhcp-policy-no-daemon.sh` — DHCP policy without daemon (exit 2)
+- `301-dry-run-no-changes.sh` — dry-run with no changes (exit 0)
+- `301-no-args-error.sh` — `netfyr apply` with no paths (exit 2)
+- `301-no-subcommand.sh` — bare `netfyr` shows help (exit 2)
+- `301-partial-failure.sh` — partial failure (exit 1)
+- `301-path-not-found.sh` — nonexistent path (exit 2)
+- `301-total-failure.sh` — total failure (exit 2)
+- `301-yaml-parse-error.sh` — invalid YAML (exit 2)
+
+No new test scripts are needed. The color flag behavior is best verified manually (since it depends on TTY state which is hard to simulate in shell scripts) or by inspecting the code.
+
+**Behaviors to test in existing tests** (already covered): all exit codes, output messages, kernel state changes, dry-run non-mutation, DHCP rejection, conflict reporting, error messages with file paths.
 
 **Verification command**: `make integration-test SPEC=301` runs all `tests/301-*.sh` scripts.
-
-**What to watch for**: After the `lib.rs`/`main.rs` changes, run `cargo test --workspace` to ensure no regressions in any crate, especially xtask (which compiles against `netfyr-cli`'s `Cli` type).

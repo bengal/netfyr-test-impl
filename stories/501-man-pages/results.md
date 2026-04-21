@@ -2,25 +2,25 @@
 PASS
 
 ## Test Results
-1372 tests passed, 0 failed across all workspace crates. No tests required fixes.
+All 1,514 tests passed across all crates. No failures.
 
-Notable test suites related to this story:
-- `test_man_page_renders_without_fatal_troff_errors` — PASS
-- `test_examples_7_renders_without_troff_errors` — PASS
-- `test_netfyr_1_renders_without_troff_errors` — PASS
-- `test_netfyr_apply_1_renders_without_troff_errors` — PASS
-- `test_netfyr_query_1_renders_without_troff_errors` — PASS
+Notable test suites for this story:
+- `xtask` unit tests (9 tests): `test_xtask_man_creates_netfyr_1`, `test_xtask_man_creates_netfyr_apply_1`, `test_xtask_man_creates_netfyr_history_1`, `test_xtask_man_creates_netfyr_query_1`, `test_xtask_man_creates_netfyr_revert_1`, `test_xtask_man_does_not_overwrite_hand_written_daemon_page`, `test_xtask_man_does_not_overwrite_hand_written_examples_page`, `test_xtask_man_exits_successfully`, `test_spec_uses_cargo_run_p_xtask_not_alias` — all pass.
+- `xtask/tests/man_pages.rs` integration test: `test_spec_files_includes_section_1_man_pages` — passes.
+
+No tests required fixes.
 
 ## Changes Made
-None. Tests passed from the start and `cargo clippy` reported no warnings.
+None. All tests passed on the first run. `cargo clippy` produced no warnings in the project code (only an unrelated `unused manifest key: workspace.features` warning from `Cargo.toml`).
 
-Additional verification performed:
-- `cargo xtask man` ran successfully, generating all five man pages (`netfyr.1`, `netfyr-apply.1`, `netfyr-query.1`, `netfyr-history.1`, `netfyr-revert.1`) without overwriting the hand-written `netfyr-examples.7`.
-- All generated man pages contain required sections: EXIT STATUS, EXAMPLES, FILES, SEE ALSO (verified via `groff -mandoc -Tascii`).
-- `man/netfyr-examples.7` exists with correct NAME section and hand-written content marker.
-- `cargo xtask man` is idempotent (second run produces same output).
-
-Note: The `man` command is not installed in this environment, so rendering was verified using `groff` directly, which produced correct output with no troff errors.
+Verification command `cargo xtask man` ran successfully and produced:
+- `man/netfyr.1` (generated)
+- `man/netfyr-apply.1` (generated)
+- `man/netfyr-query.1` (generated)
+- `man/netfyr-history.1` (generated)
+- `man/netfyr-revert.1` (generated)
+- `man/netfyr-daemon.8` (hand-written, not overwritten)
+- `man/netfyr-examples.7` (hand-written, not overwritten)
 
 ## Remaining Issues
 None.

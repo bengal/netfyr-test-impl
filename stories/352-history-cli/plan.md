@@ -1,356 +1,305 @@
-# Plan: SPEC-352 — History CLI and Varlink API
+# Plan: SPEC-352 — History CLI and Varlink API (Gap Closure)
 
 ## Approach
 
-The `netfyr history` command is a read-only view over the journal infrastructure from SPEC-351. The design follows the established CLI pattern (`apply` and `query`): a clap `Args` struct, a `run_history` async entry point, daemon-detection via Varlink with local fallback, and format-aware output.
+The core implementation of `netfyr history` is already in place: CLI args, dual-mode operation, filtering, text/JSON formatting, Varlink client methods, and daemon server handlers all exist and work. This plan closes the remaining gaps between the current implementation and the spec.
 
-The core module is `crates/netfyr-cli/src/history.rs` (new file). It owns all history-specific logic: argument parsing, duration parsing, entry filtering, and text/JSON formatting. The Varlink layer adds two methods (`get_history`, `get_journal_entry`) to the client and two handlers to the daemon server. Since `JournalEntry` already derives `Serialize`/`Deserialize` with a well-defined JSON shape, the Varlink wire format reuses that serialization directly — the daemon serializes `JournalEntry` to `serde_json::Value` and the client deserializes it back. This avoids introducing redundant DTO types while keeping the existing Varlink pattern (JSON values flowing through `call()`).
+There are seven gaps, falling into three categories: (1) text output correctness — column order, terminal-width truncation, list-field notation, and color (GAPs 1-4), (2) Varlink IDL completeness (GAP-7), and (3) test coverage for the Varlink client and daemon server (GAPs 5-6).
 
-The alternative of creating separate `VarlinkJournalEntry` / `VarlinkTrigger` / etc. types was considered but rejected: `JournalEntry`'s serde format is already the stable on-disk format (NDJSON files), so coupling the wire format to it is acceptable and significantly reduces code. If the journal format ever changes, a versioning strategy would be needed regardless. The filtering is done client-side in daemon-free mode and server-side in daemon mode (so the daemon doesn't stream unnecessary data over the socket). In both cases, the `Journal` API is read-first-then-filter since `read_recent()` is the only bulk-read method.
+The text output gaps (1-4) are all localized to `crates/netfyr-cli/src/history.rs`, specifically `format_text_list`, `changes_summary`, and `format_text_detail`. The approach is to fix these functions in-place rather than restructure, since the existing code is well-organized. For terminal width detection (GAP-2), we add the `terminal_size` crate — the alternative of raw ioctl via `libc` works but `terminal_size` is 50 lines of safe code with zero transitive dependencies, already battle-tested across platforms, and saves us from writing unsafe ioctl calls. For color (GAP-4), we use the `colored` crate already in `Cargo.toml`, applying color via `Colorize` trait methods. The color must be applied carefully: ANSI escape sequences have nonzero byte length but zero display width, so column-width calculations in `format_text_list` must measure display width (without escapes) but emit the colored string. The simplest approach is to compute and truncate the CHANGES string *before* colorizing it, then apply color as a final pass. This avoids the complexity of stripping escapes for width measurement.
 
-For the daemon server, the journal is opened read-only per request rather than sharing the `Reconciler`'s `Mutex<Option<Journal>>`. The reconciler's journal is write-oriented and holds a write lock during append. Opening a fresh read-only `Journal` for history queries avoids contention and is safe because `read_current_entries()` just reads `current.ndjson` — no locking needed for reads. However, `Journal::open()` calls `create_dir_all`, which is fine for the daemon (it has write access to `/var/lib/netfyr/journal`).
+The Varlink IDL gap (GAP-7) is documentation-only — the wire protocol is hand-rolled JSON, not generated from the IDL file. We add the missing method declarations and error type to make the `.varlink` file accurately describe the implemented API.
 
 ## Design Decisions
 
-### 1. Reuse JournalEntry JSON format as Varlink wire format
+### 1. Terminal width: add `terminal_size` crate
 
-- **Decision**: Serialize `JournalEntry` directly to `serde_json::Value` for the Varlink response, and deserialize `serde_json::Value` back to `JournalEntry` in the client.
-- **Alternatives considered**: Creating dedicated `VarlinkJournalEntry`, `VarlinkTrigger`, `VarlinkPolicySummary`, etc. types with `From` impls.
-- **Rationale**: `JournalEntry` already has a stable, well-tested serde representation (the NDJSON format). Creating parallel types would be ~150 lines of boilerplate with no practical benefit. The spec's Varlink type definitions describe the same shape as the existing `JournalEntry` serialization. If the internal format ever changes, migration would be needed at the journal level regardless.
+- **Decision**: Add `terminal_size = "0.4"` to `netfyr-cli/Cargo.toml`.
+- **Alternatives considered**: (a) Raw `libc::ioctl` with `TIOCGWINSZ` — requires `unsafe`, more code, Linux-only without abstraction. (b) `std::io::IsTerminal` for TTY detection + hardcoded 120 — misses the "use actual terminal width" requirement. (c) Reading `$COLUMNS` env var — unreliable, not always set.
+- **Rationale**: `terminal_size` is minimal (no transitive deps beyond `libc` which is already in the dep tree), safe, cross-platform, and handles the exact case we need: "terminal width or 120 if not a TTY." One function call replaces ~15 lines of unsafe ioctl code.
 
-### 2. Separate OutputFormat enum for history
+### 2. Color application order: colorize after truncation
 
-- **Decision**: Define `HistoryOutputFormat` in `history.rs` with variants `Text` (default) and `Json`.
-- **Alternatives considered**: Reusing `query::OutputFormat` (has `Yaml` and `Json`, defaults to `Yaml`) or making a shared enum in `lib.rs`.
-- **Rationale**: History's default is `Text` (tabular), not `Yaml`. History has no YAML output mode. A shared enum would force both commands to support all variants or require dead-code suppression. Two small enums are cleaner than one leaky abstraction.
+- **Decision**: In `format_text_list`, compute the CHANGES string as plain text, measure its display width, truncate if needed, then apply color as a post-processing step.
+- **Alternatives considered**: Colorizing inline during `changes_summary` construction, then stripping ANSI codes for width measurement.
+- **Rationale**: Colorizing-then-stripping is error-prone (must correctly handle all escape sequences) and wasteful (build colored string, strip it, rebuild if truncated). Computing plain text first is simpler and guarantees width accuracy. The color pass is a simple regex-free replacement of `+`, `~`, `-` prefixes.
 
-### 3. Extract daemon_socket_path() to lib.rs
+### 3. List field detection: check JSON value type
 
-- **Decision**: Move the `daemon_socket_path()` function from `query.rs` to `lib.rs` as a `pub(crate)` function. Update `query.rs` to import it.
-- **Alternatives considered**: Duplicating the function in `history.rs`.
-- **Rationale**: Both `query` and `history` (and potentially future commands) need this. Duplication is a maintenance risk for a 3-line function. Moving it is a trivial refactor.
+- **Decision**: In `changes_summary`, detect list fields by checking if `current` or `desired` in `SerializableFieldChange` is a `serde_json::Value::Array`. When detected, count additions and removals and render as `field(+N)`, `field(-N)`, or `field(+N,-M)`.
+- **Alternatives considered**: Hard-coding known list field names (`addresses`, `routes`).
+- **Rationale**: Checking `is_array()` on the JSON value is robust and automatically handles any future list-typed fields without code changes. The spec says list fields use count notation — the only reliable signal for "is this a list field" is whether the serialized value is an array. Hard-coding field names would require maintenance when new entity types are added.
 
-### 4. History selector only accepts name=value
+### 4. Color in format_text_detail: colorize diff prefixes
 
-- **Decision**: Define a separate `parse_history_selector` function in `history.rs` that only accepts `name=<value>` (not `type`, `driver`, `mac`, `pci_path`).
-- **Alternatives considered**: Reusing `query::parse_selector` (private, accepts 5 keys).
-- **Rationale**: The spec explicitly defines `--selector` as filtering by entity name in the diff operations. Supporting `type`, `driver`, etc. would require querying the backend for metadata, which is outside the journal's scope. A simpler parser with a clear error message is better UX.
+- **Decision**: Apply color to the `+`, `~`, `-` prefixes in the diff section of `format_text_detail`, and to the `+`/`~`/`-` field-level prefixes. Use `colored::Colorize` methods: `.green()`, `.red()`, `.yellow()`.
+- **Alternatives considered**: Not colorizing detail view (spec explicitly says "Diff output in `--show` also uses colors when enabled").
+- **Rationale**: The spec explicitly requires color in both list and detail views. The `colored` crate respects `colored::control::set_override` which is already configured by `resolve_color_mode()` in `main.rs`, so colors are automatically disabled when `--color=never` or `NO_COLOR` is set.
 
-### 5. Duration parsing in the history module
+### 5. Changes column width calculation
 
-- **Decision**: Implement `parse_since(s: &str) -> Result<DateTime<Utc>>` that handles both relative durations (`30s`, `5m`, `1h`, `7d`) and ISO 8601 timestamps. Return the absolute cutoff time.
-- **Alternatives considered**: Using the `humantime` crate, or `chrono`'s parsing.
-- **Rationale**: The format is simple (4 suffixes + ISO 8601). `chrono` is already a dependency and handles ISO 8601 via `DateTime::parse_from_rfc3339`. A 20-line function avoids a new dependency. The function parses the numeric prefix and multiplies by the unit's seconds.
+- **Decision**: In `format_text_list`, compute the total width of all fixed columns (SEQ=5, TIMESTAMP=21, TRIGGER=15, ENTITIES=14, OUTCOME=16, plus 5 inter-column spaces = 76 chars), subtract from the terminal width (or 120), and use the remainder as the max width for CHANGES. If the CHANGES string exceeds this, truncate and append `...`.
+- **Alternatives considered**: Using a fixed width for CHANGES (the current approach with count-based truncation).
+- **Rationale**: The spec says "CHANGES is placed last so it can use all remaining terminal width." The current implementation uses CHANGES as a middle column with a fixed 16-char width, which both violates the column order spec and wastes space. Placing CHANGES last and computing available width dynamically matches the spec exactly.
 
-### 6. Server-side journal access: open per request
+### 6. Varlink IDL: use `object` for journal types
 
-- **Decision**: In the daemon's `handle_get_history` and `handle_get_journal_entry`, open a `Journal` instance per request using `Journal::open_default()`.
-- **Alternatives considered**: (a) Sharing the `Reconciler`'s `Mutex<Option<Journal>>` — requires exposing read methods through `Reconciler`, couples reconciliation with querying. (b) Adding a second `Arc<Mutex<Journal>>` to `serve_varlink` — adds lifetime complexity. (c) Opening read-only per request.
-- **Rationale**: Journal reads are cheap (read a single file, parse NDJSON). `Journal::open_default()` is safe to call multiple times — it reads `.seq` and counts lines, but doesn't interfere with the writer. The daemon processes requests sequentially (one connection at a time), so there's no concurrency concern. This keeps the server code simple with no new shared state.
-
-### 7. Server-side filtering for daemon mode
-
-- **Decision**: Apply `--since`, `--trigger`, and `--selector` filters on the server side in `handle_get_history`, not on the client side.
-- **Alternatives considered**: Always returning all entries and filtering on the client.
-- **Rationale**: The Varlink protocol sends the full JSON of each entry. Filtering server-side reduces data transfer and is consistent with the `GetHistory` API accepting filter parameters. The filter logic is simple and shared (extracted to a helper function used by both local and daemon code paths). Actually — since the filter logic lives in the CLI crate and the daemon crate is separate, we'll apply filters in each location independently. The daemon applies filters in `handle_get_history` using inline logic, and the CLI applies them in local mode using the same logic in `history.rs`. The filter parameters are passed through Varlink as strings.
-
-### 8. Missing journal directory check
-
-- **Decision**: Before calling `Journal::open_default()` in daemon-free mode, check if the journal directory exists using `Path::exists()`. If not, print the error message and exit with code 1.
-- **Alternatives considered**: Relying on `Journal::open()` errors — but it calls `create_dir_all`, so it creates the directory rather than failing.
-- **Rationale**: The acceptance criteria require: "No journal found at /var/lib/netfyr/journal/" with exit code 1. Since `Journal::open()` auto-creates the directory, we must check before opening. Read the `NETFYR_JOURNAL_DIR` env var (default `/var/lib/netfyr/journal`) and check existence.
-
-### 9. Text formatting: fixed-width columns
-
-- **Decision**: Use `format!` with fixed-width specifiers for the table header and rows. Column widths: SEQ (5), TIMESTAMP (21), TRIGGER (15), ENTITIES (14), CHANGES (16), OUTCOME (20).
-- **Alternatives considered**: Using the `prettytable` or `comfy-table` crate.
-- **Rationale**: The table is simple (6 columns, predictable content). A dependency for tabular output is unnecessary. `format!("{:<5} {:<21} {:<15} {:<14} {:<16} {}", ...)` is sufficient.
-
-### 10. Filter ordering: since → trigger → selector → count
-
-- **Decision**: Apply filters in this order: (1) `--since` timestamp comparison, (2) `--trigger` substring match, (3) `--selector` entity name match, (4) `--count` as `.take(n)`.
-- **Alternatives considered**: Applying count before filters (spec says count is "number of entries to show", applied last).
-- **Rationale**: The spec says to read entries, filter, then limit. Applying `--count` last means `read_recent` must return enough raw entries to survive filtering. We'll call `read_recent` with a large count (e.g., 10,000 — the max before rotation) when filters are active, then filter, then take `count`. When no filters are active, `read_recent(count)` is sufficient.
+- **Decision**: Declare `GetHistory` and `GetJournalEntry` methods in the `.varlink` file using `object` for the entry type rather than defining the full JournalEntry type hierarchy.
+- **Alternatives considered**: Defining `JournalEntry`, `Trigger`, `PolicySummary`, `DiffSummary`, etc. types in the IDL.
+- **Rationale**: The wire format serializes `JournalEntry` directly via serde. The IDL is documentation-only (not parsed at runtime). Defining parallel types in the IDL would be verbose and could drift from the serde representation. Using `object` is honest about what the wire format actually is: opaque JSON objects whose schema is defined by the Rust `JournalEntry` struct.
 
 ## File Changes
 
-### 1. `crates/netfyr-cli/src/history.rs` — CREATE
+### 1. `crates/netfyr-cli/Cargo.toml` — modify
 
-New file implementing the history subcommand. Contains:
+- **What**: Add `terminal_size = "0.4"` to `[dependencies]`.
+- **Why**: GAP-2 requires querying terminal width. This crate provides a safe, minimal API for that.
 
-- **`HistoryOutputFormat`** enum: `Text` (default), `Json`. Derives `Clone, ValueEnum`.
-- **`HistoryArgs`** struct (clap `Args`):
-  - `count: usize` — `#[arg(long, short = 'n', default_value = "20")]`
-  - `since: Option<String>` — `#[arg(long)]`
-  - `trigger: Option<String>` — `#[arg(long)]`
-  - `selector: Vec<(String, String)>` — `#[arg(long, short = 's', value_parser = parse_history_selector)]`
-  - `show: Option<u64>` — `#[arg(long)]`
-  - `output: HistoryOutputFormat` — `#[arg(long, short = 'o', default_value = "text")]`
-- **`run_history(args: HistoryArgs) -> Result<ExitCode>`**: Main entry point. Detects daemon vs local mode using `daemon_socket_path()`. Dispatches to `run_history_daemon` or `run_history_local`.
-- **`run_history_local(args: &HistoryArgs) -> Result<ExitCode>`**: Checks journal directory existence. Opens `Journal::open_default()`. If `--show` is set, calls `journal.read_entry(seq)` and formats/prints. Otherwise calls `journal.read_recent(...)` with appropriate count, filters entries, formats/prints.
-- **`run_history_daemon(client: &mut VarlinkClient, args: &HistoryArgs) -> Result<ExitCode>`**: If `--show` is set, calls `client.get_journal_entry(seq)`. Otherwise calls `client.get_history(...)`. Formats/prints results.
-- **`parse_since(s: &str) -> Result<DateTime<Utc>>`**: Parses `30s`, `5m`, `1h`, `7d` relative durations (compute `Utc::now() - duration`) or ISO 8601 timestamps via `DateTime::parse_from_rfc3339`. Returns the cutoff time.
-- **`parse_history_selector(s: &str) -> Result<(String, String), String>`**: Accepts only `name=<value>`. Returns error for any other key.
-- **`filter_entries(entries: Vec<JournalEntry>, args: &HistoryArgs) -> Result<Vec<JournalEntry>>`**: Applies `--since`, `--trigger`, `--selector` filters in order, then `.take(count)`. Uses `has_filters()` helper to decide whether to read more entries.
-- **`matches_trigger(entry: &JournalEntry, trigger_filter: &str) -> bool`**: Serializes the entry's trigger to JSON, extracts the `"type"` field, performs case-insensitive substring match. E.g., "apply" matches "policy_apply", "external" matches "external_change".
-- **`matches_selector(entry: &JournalEntry, selectors: &[(String, String)]) -> bool`**: Checks if any `diff.operations[].entity_name` matches the selector name. Since the spec only supports `name=X`, this is a simple string comparison.
-- **`format_text_list(entries: &[JournalEntry]) -> String`**: Renders the fixed-width column table. Header: `SEQ  TIMESTAMP             TRIGGER         ENTITIES       CHANGES          OUTCOME`. Each row extracts entity names from `diff.operations`, builds a compact change summary (`+field`, `~field`, `-field`), and formats the outcome.
-- **`format_text_detail(entry: &JournalEntry) -> String`**: Renders the full detail view for `--show`. Includes: "Entry #{seq} at {timestamp} UTC", "Trigger: {type} (source: {source})", "Active policies:" list, "Diff:" section with per-field changes, "Outcome:" line, "State after:" section.
-- **`format_json_list(entries: &[JournalEntry]) -> Result<String>`**: Serializes entries to a JSON array via `serde_json::to_string_pretty`.
-- **`format_json_detail(entry: &JournalEntry) -> Result<String>`**: Serializes single entry to a JSON object via `serde_json::to_string_pretty`.
-- **`trigger_display_name(trigger: &Trigger) -> &str`**: Returns human-readable trigger type: "policy-apply", "dhcp-lease", "external", "daemon-startup", "revert".
-- **`outcome_summary(outcome: &ApplyOutcome) -> String`**: Returns "applied (N ok, M failed, K skipped)" or "observed".
-- **`entities_summary(ops: &[SerializableDiffOp]) -> String`**: Returns comma-separated entity names, with "+N more" truncation if > 3.
-- **`changes_summary(ops: &[SerializableDiffOp]) -> String`**: Returns compact change notation: `+field` for "add"/"set" with no current, `~field` for "set" with current, `-field` for "unset". Truncated with `+N more` if too many.
-- **`journal_dir_path() -> String`**: Returns `NETFYR_JOURNAL_DIR` env var or default `/var/lib/netfyr/journal`.
+### 2. `crates/netfyr-cli/src/history.rs` — modify
 
-### 2. `crates/netfyr-cli/src/lib.rs` — MODIFY
+#### GAP-1: Fix column order in `format_text_list`
 
-- Add `pub mod history;`
-- Add `pub use history::run_history;`
-- Extract `daemon_socket_path()` from `query.rs` into this file as `pub(crate) fn daemon_socket_path() -> String`.
-- Add `History(history::HistoryArgs)` variant to the `Commands` enum with a doc comment matching the style of `Apply` and `Query`:
+- **What**: Swap OUTCOME and CHANGES in the header format string and in the per-row format string. The header should be `SEQ  TIMESTAMP  TRIGGER  ENTITIES  OUTCOME  CHANGES` with CHANGES as the last, variable-width column. Change from using a fixed-width specifier for CHANGES to a dynamic-width approach: render fixed columns first with fixed widths, then append CHANGES at the end with no width specifier.
+- **Why**: Spec requires `SEQ, TIMESTAMP, TRIGGER, ENTITIES, OUTCOME, CHANGES` order. CHANGES must be last so it can use remaining terminal width.
+
+#### GAP-2: Terminal width truncation of CHANGES
+
+- **What**: Modify `format_text_list` to:
+  1. Import `terminal_size::terminal_size` and `terminal_size::Width`.
+  2. At the start of the function, determine the available width: call `terminal_size()`, use the width if available, otherwise default to 120.
+  3. Compute the fixed-column overhead: SEQ(5) + space + TIMESTAMP(21) + space + TRIGGER(15) + space + ENTITIES(14) + space + OUTCOME(16) + space = 76 chars.
+  4. Compute `max_changes_width = terminal_width - 76`. Clamp to a minimum of 10 (so there's always some space for CHANGES).
+  5. After computing the `changes` string for each row, check its `len()`. If it exceeds `max_changes_width`, truncate to `max_changes_width - 3` chars and append `...`.
+  6. The header's CHANGES column does not need a width specifier since it's the last column.
+- **Why**: Spec requires truncation with `...` when CHANGES would exceed terminal width.
+
+#### GAP-3: List field notation in `changes_summary`
+
+- **What**: Modify the field-change loop inside `changes_summary` (the `"modify"` / `_` match arm, around current line 543-550). For each `SerializableFieldChange`:
+  1. Check if `fc.current` or `fc.desired` is a `serde_json::Value::Array`.
+  2. If yes, this is a list field. Count additions and removals:
+     - If `current` is `None` (or not an array) and `desired` is an array: all elements are additions. Render as `field(+N)`.
+     - If `current` is an array and `desired` is `None` (or not an array, i.e. `unset`): all elements are removals. Render as `field(-N)`.
+     - If both are arrays: additions = `desired.len() - overlap`, removals = `current.len() - overlap`, where overlap is the count of elements present in both (using simple equality). Render as `field(+A,-R)`, omitting zero counts. If both are zero, skip (no visible change).
+  3. If no, keep the existing scalar notation: `+field`, `~field`, `-field`.
+- **Why**: Spec defines separate notation for list fields: `addr(+2)`, `addr(-1)`, `addr(+1,-1)`. The current code treats all fields as scalar.
+
+**Note on list overlap computation**: Since `serde_json::Value` implements `PartialEq`, we can count overlap by iterating `current` elements and checking if each appears in `desired`. This is O(n*m) but list fields are small (typically 1-5 elements), so this is fine.
+
+#### GAP-4: Color support
+
+- **What**: Add `use colored::Colorize;` import. Modify two functions:
+
+  **In `changes_summary`**: After building each change notation string, apply color to the prefix:
+  - Strings starting with `+` (additions): apply `.green()` to the `+` character (or the full `+field` token).
+  - Strings starting with `~` (modifications): apply `.yellow()`.
+  - Strings starting with `-` (removals): apply `.red()`.
+  - For list notation like `field(+N,-M)`: colorize the `+N` part green and `-M` part red.
+
+  However, per Design Decision #2, color is applied *after* width measurement for the CHANGES column in `format_text_list`. So `changes_summary` should return **plain text**, and a new helper function `colorize_changes(plain: &str) -> String` applies color. `format_text_list` calls `changes_summary` to get plain text, measures/truncates, then calls `colorize_changes` on the (possibly truncated) result before appending to the output line.
+
+  **In `format_text_detail`**: Apply color to the diff section prefix characters:
+  - Line `"  + ethernet eth0\n"` -> colorize `+` green.
+  - Line `"  ~ ethernet eth0\n"` -> colorize `~` yellow.
+  - Line `"  - ethernet eth0\n"` -> colorize `-` red.
+  - Field lines `"      +mtu: 9000"` -> colorize `+` green.
+  - Field lines `"      ~mtu: 1500 -> 9000"` -> colorize `~` yellow.
+  - Field lines `"      -mtu: 1500"` -> colorize `-` red.
+
+- **Why**: Spec requires `+` green, `-` red, `~` yellow in CHANGES column and diff output. The `colored` crate is already a dependency and respects the global override set by `resolve_color_mode()`.
+
+**Implementation detail for `colorize_changes`**: This function takes a plain-text changes string (e.g., `"~mtu, +addr, -carrier"`) and returns a colorized version. It splits on `, `, applies color to each token based on its first character, and rejoins. For list notation tokens like `addr(+2,-1)`, it colorizes the `+2` portion green and `-1` portion red. The function should handle the `...` truncation suffix (leave it uncolored) and the `+N more` suffix (leave uncolored). Edge cases: `+entity`, `-entity`, `+N entities` should be colorized green/red respectively.
+
+### 3. `crates/netfyr-varlink/src/io.netfyr.varlink` — modify
+
+- **What**: Add the following declarations after the existing `method GetStatus`:
+
   ```
-  /// Show journal history of state changes
-  ///
-  /// Display a log of reconciliation events recorded by the journal.
-  /// Shows what changed, when, and why. Supports filtering by time,
-  /// trigger type, and entity name.
-  ///
-  /// If the netfyr daemon is running, history is retrieved via Varlink.
-  /// Otherwise, journal files are read directly.
-  ```
-- Update the top-level `Cli` doc comment to include `history` in the subcommand list.
+  method GetHistory(count: ?int, since: ?string, trigger: ?string, selector_name: ?string) -> (entries: []object)
 
-### 3. `crates/netfyr-cli/src/query.rs` — MODIFY
+  method GetJournalEntry(seq: int) -> (entry: ?object)
 
-- Remove the private `daemon_socket_path()` function.
-- Import it from `crate::daemon_socket_path` instead.
-- No other changes.
-
-### 4. `crates/netfyr-cli/src/main.rs` — MODIFY
-
-- Add `run_history` to the import from `netfyr_cli`.
-- Add dispatch arm:
-  ```
-  Commands::History(args) => match run_history(args).await {
-      Ok(code) => code,
-      Err(e) => {
-          eprintln!("Error: {:#}", e);
-          ExitCode::from(2u8)
-      }
-  },
+  method Revert(target_seq: int, dry_run: bool) -> (report: ApplyReport, entry_timestamp: string)
   ```
 
-### 5. `crates/netfyr-cli/src/netfyr_cli_main.rs` — MODIFY
+  And add a new error type after the existing `error InternalError`:
 
-- Same changes as `main.rs`: add `run_history` import and `Commands::History` dispatch arm.
+  ```
+  error EntryNotFound (reason: string)
+  ```
 
-### 6. `crates/netfyr-varlink/src/client.rs` — MODIFY
+- **Why**: GAP-7. The IDL file documents the Varlink API contract. These methods and the error type are already implemented in the client and server but missing from the IDL.
 
-Add two new public async methods to `VarlinkClient`:
+### 4. `crates/netfyr-varlink/src/client.rs` — modify (tests only)
 
-- **`get_history(&mut self, count: Option<usize>, since: Option<String>, trigger: Option<String>, selector_name: Option<String>) -> Result<Vec<serde_json::Value>, VarlinkError>`**:
-  Sends `io.netfyr.GetHistory` with parameters `{count, since, trigger, selector_name}` (omitting `None` values). Extracts `response["entries"]` as a `Vec<serde_json::Value>`. Returns the raw JSON values so the CLI can deserialize them as `JournalEntry` — this avoids adding `netfyr-journal` as a dependency of `netfyr-varlink`.
+- **What**: Add unit tests to the `#[cfg(test)] mod tests` block using the existing `spawn_mock_server` pattern:
 
-- **`get_journal_entry(&mut self, seq: u64) -> Result<Option<serde_json::Value>, VarlinkError>`**:
-  Sends `io.netfyr.GetJournalEntry` with parameters `{seq}`. Extracts `response["entry"]`. Returns `None` if the value is `null`, otherwise returns `Some(value)`.
+  - **`test_get_history_sends_correct_method_and_parameters`**: Spawn mock server with `{"entries": [...]}` response. Call `client.get_history(Some(10), Some("1h".into()), Some("apply".into()), Some("eth0".into()))`. Verify the request has `method: "io.netfyr.GetHistory"` and `parameters` contains `count: 10`, `since: "1h"`, `trigger: "apply"`, `selector_name: "eth0"`.
 
-Note: The return type is `serde_json::Value` rather than `JournalEntry` to avoid adding `netfyr-journal` as a dependency of `netfyr-varlink`. The CLI deserializes the JSON into `JournalEntry` on its end.
+  - **`test_get_history_returns_entries_array`**: Spawn mock server with `{"entries": [{"seq": 1}, {"seq": 2}]}`. Call `client.get_history(None, None, None, None)`. Verify result is `Ok` and contains 2 elements.
 
-### 7. `crates/netfyr-varlink/src/lib.rs` — MODIFY
+  - **`test_get_history_omits_none_parameters`**: Spawn mock server. Call `client.get_history(None, None, None, None)`. Verify the request parameters object does not contain `count`, `since`, `trigger`, or `selector_name` keys.
 
-No changes needed — the new methods are on `VarlinkClient` which is already re-exported.
+  - **`test_get_journal_entry_returns_some_when_entry_present`**: Spawn mock server with `{"entry": {"seq": 42, "timestamp": "..."}}`. Call `client.get_journal_entry(42)`. Verify result is `Ok(Some(value))` and `value["seq"] == 42`.
 
-### 8. `crates/netfyr-daemon/src/server.rs` — MODIFY
+  - **`test_get_journal_entry_returns_none_when_entry_is_null`**: Spawn mock server with `{"entry": null}`. Call `client.get_journal_entry(9999)`. Verify result is `Ok(None)`.
 
-Add two new handler functions and wire them into the dispatch:
+  - **`test_get_journal_entry_sends_correct_method_and_seq`**: Spawn mock server. Call `client.get_journal_entry(42)`. Verify request has `method: "io.netfyr.GetJournalEntry"` and `parameters.seq == 42`.
 
-- **`handle_get_history(stream, params) -> Result<()>`**:
-  1. Parse optional parameters: `count` (default 20), `since` (Option<String>), `trigger` (Option<String>), `selector_name` (Option<String>).
-  2. Open `Journal::open_default()`. On error, return `InternalError`.
-  3. Determine read count: if any filter is present, read up to 10,000 entries; otherwise read `count`.
-  4. Call `journal.read_recent(read_count)`.
-  5. Apply filters in order: since (parse with same logic as CLI), trigger (case-insensitive substring on serialized type field), selector_name (match against `diff.operations[].entity_name`).
-  6. Take first `count` entries.
-  7. Serialize each `JournalEntry` to `serde_json::Value`.
-  8. Write success response: `{"entries": [...]}`.
+- **Why**: GAP-5. These methods have no test coverage. The tests follow the same `spawn_mock_server` / `spawn_error_server` pattern used by the existing tests.
 
-- **`handle_get_journal_entry(stream, params) -> Result<()>`**:
-  1. Parse required `seq` parameter (u64). If missing, return `InternalError`.
-  2. Open `Journal::open_default()`. On error, return `InternalError`.
-  3. Call `journal.read_entry(seq)`.
-  4. If `Some(entry)`, serialize to `serde_json::Value` and write `{"entry": value}`.
-  5. If `None`, write `{"entry": null}`.
+### 5. `crates/netfyr-daemon/src/server.rs` — modify (tests only)
 
-- **Dispatch**: Add two arms to the `match method.as_str()` block in `handle_connection`:
-  - `"io.netfyr.GetHistory" => handle_get_history(stream, &params).await`
-  - `"io.netfyr.GetJournalEntry" => handle_get_journal_entry(stream, &params).await`
+- **What**: Add unit tests to the `#[cfg(test)] mod tests` block. These tests use the `make_stream_pair()` helper already present. Note: `handle_get_history` and `handle_get_journal_entry` call `Journal::open_default()`, which reads from `/var/lib/netfyr/journal` (or `NETFYR_JOURNAL_DIR`). For unit tests, we can set `NETFYR_JOURNAL_DIR` to a temp directory.
 
-Note: These handlers do NOT need `policy_store`, `factory_manager`, or `reconciler` — they only read the journal. This keeps the `handle_connection` signature unchanged.
+  - **`test_handle_get_journal_entry_missing_seq_returns_error`**: Call `handle_get_journal_entry` with `params = {}` (no `seq`). Read response and verify it's an error with `"missing or invalid 'seq' parameter"`.
+
+  - **`test_handle_get_journal_entry_with_valid_seq_returns_entry_or_null`**: Set `NETFYR_JOURNAL_DIR` to a temp dir, create a `Journal` and append one entry. Call `handle_get_journal_entry` with `params = {"seq": 1}`. Verify response has `entry` field that is not null. Then call with `params = {"seq": 9999}` and verify `entry` is null.
+
+  - **`test_handle_get_history_returns_entries_array`**: Set `NETFYR_JOURNAL_DIR` to a temp dir, create a `Journal` and append 3 entries. Call `handle_get_history` with `params = {"count": 10}`. Verify response has `entries` as an array with 3 elements.
+
+  - **`test_handle_get_history_with_count_limits_results`**: Set `NETFYR_JOURNAL_DIR` to a temp dir with 5 entries. Call with `params = {"count": 2}`. Verify `entries` array has exactly 2 elements.
+
+- **Why**: GAP-6. The two new handlers have zero test coverage. The existing test suite covers all other handlers.
 
 ## Dependencies
 
-No new crate dependencies are needed.
+| Crate | Version | Justification |
+|-------|---------|---------------|
+| `terminal_size` | `0.4` | Query terminal width for CHANGES column truncation (GAP-2). No std equivalent. Only transitive dep is `libc` which is already in the dep tree. |
 
-- `chrono` — already in `netfyr-cli/Cargo.toml`, used for `DateTime<Utc>` in duration parsing and timestamp display.
-- `serde_json` — already in `netfyr-cli/Cargo.toml`, used for JSON output formatting.
-- `netfyr-journal` — already in `netfyr-cli/Cargo.toml`, provides `Journal`, `JournalEntry`, `Trigger`, etc.
-- `netfyr-varlink` — already in `netfyr-cli/Cargo.toml`, provides `VarlinkClient`.
-- `colored` — already in `netfyr-cli/Cargo.toml`, may optionally be used for the text table header (but not required).
+No other new dependencies needed. All other crates (`colored`, `chrono`, `serde_json`, `netfyr-journal`, `netfyr-varlink`) are already in `Cargo.toml`.
 
 ## Implementation Order
 
-### Step 1: Extract daemon_socket_path to lib.rs
+### Step 1: Fix column order in `format_text_list` (GAP-1)
 
-Move `daemon_socket_path()` from `query.rs` to `lib.rs`. Update `query.rs` to import it. Both `main.rs` and `netfyr_cli_main.rs` remain unchanged. Verify compilation.
+Swap OUTCOME and CHANGES in the header and row format strings in `format_text_list`. CHANGES becomes the last column with no fixed-width specifier.
 
-**Produces**: Compilable state. No behavior change.
+**Produces**: Compilable state. Column order matches spec. Existing tests may need minor updates if they assert on column position.
 
-### Step 2: Create history.rs with CLI args and local mode
+### Step 2: Add `terminal_size` dependency and implement CHANGES truncation (GAP-2)
 
-Create `crates/netfyr-cli/src/history.rs` with:
-- `HistoryOutputFormat` enum
-- `HistoryArgs` struct
-- `parse_history_selector` function
-- `parse_since` function
-- `run_history` entry point (local mode only, daemon mode can return a stub/fallback for now)
-- `filter_entries` function
-- All text and JSON formatting functions
-- Empty journal / missing directory handling
+Add `terminal_size = "0.4"` to `Cargo.toml`. Modify `format_text_list` to query terminal width, compute available CHANGES width, and truncate with `...`.
 
-Register the module in `lib.rs` and add dispatch in `main.rs` / `netfyr_cli_main.rs`.
+**Produces**: Compilable state. CHANGES column respects terminal width.
 
-**Produces**: Compilable state. `netfyr history` works in daemon-free mode.
+**Depends on**: Step 1 (CHANGES must already be the last column).
 
-**Depends on**: Step 1 (for `daemon_socket_path`).
+### Step 3: Implement list field notation in `changes_summary` (GAP-3)
 
-### Step 3: Add Varlink client methods
+Modify the field-change processing in `changes_summary` to detect array-typed values and render count notation.
 
-Add `get_history` and `get_journal_entry` methods to `VarlinkClient` in `crates/netfyr-varlink/src/client.rs`.
+**Produces**: Compilable state. List fields use `field(+N,-M)` notation.
 
-**Produces**: Compilable state. Client methods available but no server to call yet.
+**Independent of**: Steps 1-2 (changes_summary is called by format_text_list but the notation change is orthogonal to column layout).
 
-**Depends on**: Nothing (independent of Steps 1-2).
+### Step 4: Implement color support (GAP-4)
 
-### Step 4: Add daemon server handlers
+Add `colorize_changes` helper. Modify `format_text_list` to colorize CHANGES after truncation. Modify `format_text_detail` to colorize diff prefixes.
 
-Add `handle_get_history` and `handle_get_journal_entry` to `crates/netfyr-daemon/src/server.rs`. Wire them into the dispatch.
+**Produces**: Compilable state. Color output when enabled.
 
-**Produces**: Compilable state. Daemon can serve history requests.
+**Depends on**: Steps 1-2 (must colorize after truncation to avoid ANSI width issues). Step 3 (list notation tokens need color rules).
 
-**Depends on**: Nothing (independent of Steps 1-3, but functionally paired with Step 3).
+### Step 5: Update Varlink IDL (GAP-7)
 
-### Step 5: Wire daemon mode into history CLI
+Add `GetHistory`, `GetJournalEntry`, `Revert` methods and `EntryNotFound` error to `io.netfyr.varlink`.
 
-Update `run_history` in `history.rs` to detect daemon mode (try Varlink connect) and call `client.get_history()` / `client.get_journal_entry()`. Deserialize `serde_json::Value` responses into `JournalEntry`.
+**Produces**: Compilable state (IDL is not compiled). API contract documented.
 
-**Produces**: Compilable state. Full feature complete.
+**Independent of**: All other steps.
 
-**Depends on**: Steps 2, 3.
+### Step 6: Add Varlink client tests (GAP-5)
+
+Add 6 unit tests to `crates/netfyr-varlink/src/client.rs`.
+
+**Produces**: Compilable state. Tests pass.
+
+**Independent of**: Steps 1-5 (tests exercise existing client methods).
+
+### Step 7: Add daemon server tests (GAP-6)
+
+Add 4 unit tests to `crates/netfyr-daemon/src/server.rs`.
+
+**Produces**: Compilable state. Tests pass.
+
+**Independent of**: Steps 1-6 (tests exercise existing server handlers).
 
 ## Risks and Mitigations
 
-### 1. Archive entries invisible to history
+### 1. ANSI escape sequences in width calculations
 
-**Risk**: `Journal::read_recent()` and `read_entry()` only scan `current.ndjson`. Entries rotated to gzip archives are not returned. `--since 7d` may miss entries from rotated files.
+**Risk**: If color is applied before width measurement, the ANSI escape bytes (e.g., `\x1b[32m`) inflate the string length, causing premature truncation.
 
-**Mitigation**: This is a known limitation of the `Journal` API from SPEC-351. The spec does not mention archive traversal. Document this behavior: the history command shows entries from the current journal file only. Entries older than the rotation threshold (~10,000 entries or 50MB) are not shown. This is acceptable for the initial implementation — archive reading can be added to `Journal` in a future spec.
+**Mitigation**: Design Decision #2 mandates computing and truncating the CHANGES string as plain text first, then colorizing. The `changes_summary` function returns plain text; `colorize_changes` is a separate post-processing step called after truncation. This completely eliminates the ANSI-width problem.
 
-### 2. Journal directory auto-creation
+### 2. List field overlap computation correctness
 
-**Risk**: `Journal::open()` calls `create_dir_all()`, so it creates the directory even when we want to detect "no journal exists."
+**Risk**: Counting list element overlap via `serde_json::Value::eq` could produce wrong results if the same logical value has different JSON representations (e.g., `1` vs `1.0`).
 
-**Mitigation**: Check `Path::exists()` on the journal directory *before* calling `Journal::open_default()`. Read the `NETFYR_JOURNAL_DIR` env var (default `/var/lib/netfyr/journal`) to determine the path. Only call `Journal::open_default()` if the directory exists.
+**Mitigation**: `netfyr-state::Value` serializes deterministically via serde — integers are always integers, IPs are always strings with consistent formatting. Round-trip through `value_to_json` is tested. The JSON values in `SerializableFieldChange.current` and `.desired` are produced by the same serializer, so representation is consistent.
 
-### 3. Large read_recent count with filters
+### 3. `terminal_size` crate version compatibility
 
-**Risk**: When filters are active, we call `read_recent(10_000)` to get enough entries to filter. If the journal has 10,000 entries, this reads and parses all of them into memory.
+**Risk**: Version `0.4` may have breaking changes or be unavailable.
 
-**Mitigation**: 10,000 entries × ~500 bytes each ≈ 5MB of JSON text, ~20MB parsed. This is within acceptable memory bounds for a CLI tool. The `Journal` rotation threshold is 10,000 entries, so this is the theoretical maximum. If performance becomes a concern, streaming/lazy parsing can be added later.
+**Mitigation**: `terminal_size 0.4` is the current stable release as of early 2026. The API surface we use is one function: `terminal_size() -> Option<(Width, Height)>`. This API has been stable since 0.1. If 0.4 is unavailable, 0.3 has the same API.
 
-### 4. Trigger substring matching false positives
+### 4. Server test environment variable isolation
 
-**Risk**: `--trigger apply` could match both `policy_apply` and hypothetical future `re_apply` variants.
+**Risk**: Tests that set `NETFYR_JOURNAL_DIR` could interfere with each other under parallel execution.
 
-**Mitigation**: The current trigger variants are well-differentiated: `policy_apply`, `dhcp_event`, `external_change`, `daemon_startup`, `revert`. Substring matching is specified by the spec. The risk of false positives with the current variant set is zero. If new variants are added, the matching behavior can be refined.
+**Mitigation**: The existing CLI history tests already use this pattern with an `ENV_MUTEX`. Server tests should follow the same pattern: use a `Mutex<()>` guard around env var manipulation. Each test creates its own temp directory for journal data.
 
-### 5. Two entry point files (main.rs and netfyr_cli_main.rs)
+### 5. Color in non-TTY environments (CI)
 
-**Risk**: Forgetting to update one of the two entry points.
+**Risk**: Tests that assert on colorized output could fail in CI where the terminal is not a TTY, because `colored` auto-disables colors for non-TTY output.
 
-**Mitigation**: Both files have identical dispatch logic. Both must be updated. The implementation order explicitly calls out updating both files in Step 2.
+**Mitigation**: Tests for color output should either: (a) set `colored::control::set_override(true)` before testing and restore after, or (b) test the `colorize_changes` function directly after forcing color on. The existing color tests in `lib.rs` already follow pattern (a). Tests that assert on plain-text output (like the existing `format_text_list` tests) are unaffected.
 
-### 6. Daemon server journal open failures
+### 6. Truncation edge case: CHANGES fits exactly
 
-**Risk**: `Journal::open_default()` in the server handler could fail (permissions, disk full, etc.).
+**Risk**: Off-by-one in truncation: if CHANGES is exactly `max_width` chars, it should NOT be truncated. If it's `max_width + 1`, it should be truncated to `max_width - 3` + `...`.
 
-**Mitigation**: Return a Varlink `InternalError` with the error message. The CLI will display the error. This follows the same pattern as other handler error paths.
+**Mitigation**: The condition is `if changes.len() > max_changes_width`. When `len() == max_changes_width`, no truncation. When `len() > max_changes_width`, truncate to `max_changes_width - 3` and append `...` (total = `max_changes_width`). If `max_changes_width < 3`, just show `...` (3 chars).
 
 ## Test Strategy
 
-### Unit tests (in `history.rs`)
+### Unit tests for GAP-1 (column order)
 
-- **`parse_since` function**:
-  - Relative durations: `"30s"`, `"5m"`, `"1h"`, `"7d"` each produce a `DateTime<Utc>` approximately that duration in the past.
-  - ISO 8601: `"2026-04-20T14:00:00Z"` parses to the correct timestamp.
-  - Invalid input: `"abc"`, `"5x"`, `""` return errors.
-  - Edge case: `"0s"` returns approximately `Utc::now()`.
+- Verify the header line has columns in order: SEQ, TIMESTAMP, TRIGGER, ENTITIES, OUTCOME, CHANGES.
+- Verify that CHANGES appears after OUTCOME in data rows.
+- Existing test `test_format_text_list_contains_header_with_all_column_names` verifies presence but not order. Add a new test that checks OUTCOME appears before CHANGES in the header string (by comparing `find()` positions).
 
-- **`parse_history_selector` function**:
-  - `"name=eth0"` returns `Ok(("name", "eth0"))`.
-  - `"type=ethernet"` returns error (only `name` is allowed).
-  - `"foo=bar"` returns error.
-  - Missing `=` returns error.
+### Unit tests for GAP-2 (truncation)
 
-- **`matches_trigger` function**:
-  - `"apply"` matches `Trigger::PolicyApply { .. }` (whose type is `"policy_apply"`).
-  - `"dhcp"` matches `Trigger::DhcpEvent { .. }` (whose type is `"dhcp_event"`).
-  - `"external"` matches `Trigger::ExternalChange { .. }`.
-  - `"startup"` matches `Trigger::DaemonStartup`.
-  - `"revert"` matches `Trigger::Revert { .. }`.
-  - `"bogus"` matches none.
-  - Case insensitivity: `"APPLY"` matches `policy_apply`.
+- Create an entry with a very long CHANGES string (many field changes). Call `format_text_list`. Verify no output line exceeds 120 chars (assuming non-TTY fallback).
+- Verify that truncated CHANGES ends with `...`.
+- Verify that short CHANGES is not truncated (no `...` suffix).
 
-- **`matches_selector` function**:
-  - Entry with `diff.operations[0].entity_name = "eth0"` matches `name=eth0`.
-  - Entry with only `eth1` does not match `name=eth0`.
-  - Entry with multiple operations, one matching, returns true.
-  - Empty operations list returns false.
+### Unit tests for GAP-3 (list field notation)
 
-- **`filter_entries` function**:
-  - Filters combine with AND logic.
-  - `--count` is applied last.
-  - With no filters, returns first `count` entries.
+- Create a `SerializableDiffOp` with `field_changes` containing a field where `current = [a, b]` and `desired = [a, b, c]` (one addition). Verify `changes_summary` produces `field(+1)`.
+- Field where `current = [a, b, c]` and `desired = [a]` (two removals). Verify `field(-2)`.
+- Field where `current = [a, b]` and `desired = [b, c]` (one added, one removed). Verify `field(+1,-1)`.
+- Field where both current and desired are non-array (scalar). Verify `~field` notation (unchanged behavior).
+- Mixed entry with both scalar and list changes: verify both notations coexist.
 
-- **Text formatting functions**:
-  - `format_text_list` produces correct column headers.
-  - `format_text_list` with an entry shows SEQ, timestamp, trigger, entities, changes, outcome.
-  - `format_text_detail` includes all sections: entry header, trigger, policies, diff, outcome, state after.
-  - `entities_summary` truncates with "+N more" when > 3 entities.
-  - `changes_summary` uses `+`, `~`, `-` prefixes correctly.
-  - `outcome_summary` formats `Applied` and `Observed` correctly.
-  - `trigger_display_name` maps all variants correctly.
+### Unit tests for GAP-4 (color)
 
-- **JSON formatting**:
-  - `format_json_list` produces a valid JSON array.
-  - `format_json_detail` produces a valid JSON object.
+- Force colors on with `colored::control::set_override(true)`. Call `colorize_changes("+mtu")`. Verify result contains ANSI green escape. Call `colorize_changes("~mtu")`. Verify yellow. Call `colorize_changes("-mtu")`. Verify red.
+- Verify `format_text_detail` diff section contains ANSI codes when colors are enabled.
+- Restore override after each test.
 
-### Unit tests (in `client.rs`)
+### Unit tests for GAP-5 (Varlink client)
 
-- `get_history` sends `io.netfyr.GetHistory` method with correct parameters and deserializes the `entries` array from the response.
-- `get_journal_entry` sends `io.netfyr.GetJournalEntry` with `seq` parameter.
-- `get_journal_entry` returns `None` when server responds with `entry: null`.
+6 tests as described in File Changes section 4. All use the existing `spawn_mock_server` / `spawn_error_server` infrastructure.
 
-### Unit tests (in `server.rs`)
+### Unit tests for GAP-6 (daemon server)
 
-- `handle_get_history` with empty journal returns `entries: []`.
-- `handle_get_journal_entry` with valid seq returns the entry.
-- `handle_get_journal_entry` with invalid seq returns `entry: null`.
-- `handle_get_history` with `count` parameter limits results.
-- Unknown method dispatch still returns error (existing test, verify no regression).
+4 tests as described in File Changes section 5. Use `make_stream_pair()` and `NETFYR_JOURNAL_DIR` with temp directories.
 
-### Integration-level tests
+### No new integration tests needed
 
-- The acceptance criteria scenarios (list, count, filter by time, filter by trigger, filter by entity, combine filters, show detail, show nonexistent, JSON output, empty journal) are primarily tested via unit tests on the formatting and filtering functions, using constructed `JournalEntry` instances.
-- Full end-to-end testing (CLI binary invocation with a real journal) is out of scope for this plan — the existing e2e test infrastructure can be extended later.
+The Varlink IDL update (GAP-7) is documentation-only and does not require tests. The existing acceptance-criteria tests in `history.rs` already cover the behavioral requirements.

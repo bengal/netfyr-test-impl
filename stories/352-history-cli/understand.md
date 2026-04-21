@@ -1,112 +1,152 @@
-# SPEC-352: History CLI and Varlink API — Gap Analysis
+# Gap Analysis: SPEC-352 — History CLI and Varlink API
 
 ## Current State
 
-### Journal infrastructure (complete)
-`crates/netfyr-journal/` is fully implemented by SPEC-351:
-- `JournalEntry` struct with `seq`, `timestamp`, `trigger`, `active_policies`, `diff` (`SerializableDiff`), `state_after` (`SerializableStateSet`), `outcome` (`ApplyOutcome`)
-- `Trigger` enum: `PolicyApply { source }`, `DhcpEvent { policy_name, event_kind }`, `ExternalChange { changed_entities }`, `DaemonStartup`, `Revert { target_seq }` — all serialized with snaek_case `type` discriminator
-- `ApplyOutcome` enum: `Applied { succeeded, failed, skipped }`, `Observed`
-- `PolicySummary` struct: `name`, `factory_type`, `priority`
-- `Journal` struct: `open_default()` (reads `NETFYR_JOURNAL_DIR`, defaults to `/var/lib/netfyr/journal`), `open(dir)`, `append()`, `read_recent(count)`, `read_entry(seq)`, `latest_state_for(entity_name)`
-- `Journal::open()` calls `create_dir_all` — it **always creates** the journal directory rather than returning an error when missing
-- `read_recent()` and `read_entry()` only scan `current.ndjson`, not gzip-compressed archives in `archive/`
+The majority of SPEC-352 is already implemented. Relevant code:
 
-### CLI (partial)
-`crates/netfyr-cli/` has `apply` and `query` subcommands. The `Commands` enum in `lib.rs` contains only `Apply(apply::ApplyArgs)` and `Query(query::QueryArgs)`. No `history` module exists.
+### `crates/netfyr-cli/src/history.rs` (fully present)
+- `HistoryOutputFormat` (Text, Json), `HistoryArgs` (all fields from spec: count, since, trigger, selector, show, output)
+- `run_history()` with daemon-detection: tries Varlink, falls back to local journal read
+- `run_history_local()`: handles missing journal dir (exit 1), empty journal, `--show`, listing with filters
+- `run_history_daemon()`: delegates to `VarlinkClient::get_history()` / `get_journal_entry()`
+- `parse_since()`: relative durations (s/m/h/d) and RFC 3339 timestamps
+- `filter_entries()`, `matches_trigger()`, `matches_selector()`: AND-logic filtering
+- `format_text_list()`, `format_text_detail()`, `format_json_list()`, `format_json_detail()`
+- `trigger_display_name()`, `outcome_summary()`, `entities_summary()`, `changes_summary()`
+- `journal_dir_path()` using `NETFYR_JOURNAL_DIR` env var
+- Comprehensive unit tests covering parse_since, filter_entries, formatting functions, and integration scenarios
 
-`OutputFormat` in `query.rs` has `Yaml` and `Json` variants; the history command needs `Text` and `Json` (distinct enum, since history's default is `text` not `yaml`).
+### `crates/netfyr-cli/src/main.rs` and `lib.rs`
+- `Commands::History(history::HistoryArgs)` is present in the `Commands` enum
+- Dispatch in `main()` calls `run_history(args)` correctly
+- `run_history` is re-exported from lib.rs
 
-The daemon-detection pattern in `query.rs` is the reference implementation: read `NETFYR_SOCKET_PATH` env var, attempt `VarlinkClient::connect`, fall back to local on `VarlinkError::ConnectionFailed`.
+### `crates/netfyr-varlink/src/client.rs`
+- `get_history(count, since, trigger, selector_name)` → `Vec<serde_json::Value>` implemented
+- `get_journal_entry(seq)` → `Option<serde_json::Value>` implemented
+- `VarlinkError::EntryNotFound` variant present
 
-### Varlink client (partial)
-`crates/netfyr-varlink/src/client.rs` exposes `connect`, `submit_policies`, `query`, `dry_run`, `get_status`. No `get_history` or `get_journal_entry` methods exist.
+### `crates/netfyr-daemon/src/server.rs`
+- `handle_get_history()` implemented: reads journal, applies filters (since, trigger, selector_name), limits count, returns JSON array
+- `handle_get_journal_entry()` implemented: reads by seq, returns entry or null
+- Both handlers are wired into `handle_connection()` dispatch table
+- `server_parse_since()` and `server_trigger_type_str()` are local duplicates of the CLI helpers
 
-`crates/netfyr-varlink/src/types.rs` has Varlink DTO types for states, policies, diffs, and apply reports. No journal-entry Varlink types exist.
-
-There is no `io.netfyr.varlink` IDL file; the protocol is hand-rolled JSON-over-Unix-socket. The spec mentions one but the implementation does not use it — new methods follow the same manual pattern.
-
-### Daemon server (partial)
-`crates/netfyr-daemon/src/server.rs` dispatches `SubmitPolicies`, `Query`, `DryRun`, `GetStatus`. No `GetHistory` or `GetJournalEntry` handlers exist. The daemon currently has no `Journal` reference; it would need one added to serve history via Varlink.
-
----
+### `crates/netfyr-varlink/src/io.netfyr.varlink`
+Present but incomplete — contains `SubmitPolicies`, `Query`, `DryRun`, `GetStatus` only. Missing `GetHistory`, `GetJournalEntry`, `Revert`, and `error EntryNotFound`.
 
 ## Requirements
 
-1. **New CLI module** `crates/netfyr-cli/src/history.rs` implementing:
-   - `HistoryArgs` struct (clap `Args`): `count: usize` (default 20), `since: Option<String>`, `trigger: Option<String>`, `selector: Vec<(String, String)>` (key=value, only `name` key is relevant), `show: Option<u64>`, `output: OutputFormat`
-   - `OutputFormat` enum: `Text` (default), `Json`
-   - `run_history(args: HistoryArgs) -> Result<ExitCode>`
-   - `parse_duration(s: &str) -> Result<DateTime<Utc>>` supporting `30s`, `5m`, `1h`, `7d` and ISO 8601
-   - Text list formatter: fixed-width columns SEQ / TIMESTAMP / TRIGGER / ENTITIES / CHANGES / OUTCOME
-   - Text detail formatter for `--show <seq>`: full entry layout
-   - JSON output: array of `serde_json::Value` (entries serialized as-is from `JournalEntry`) for list; single object for `--show`
-   - Daemon-detection: try Varlink `GetHistory` / `GetJournalEntry`, fall back to `Journal::open_default()`
-   - Missing journal directory: detect and print `"No journal found at /var/lib/netfyr/journal/"`, exit 1
-   - Empty journal: print `"No journal entries found."`, exit 0
+From the acceptance criteria, the complete feature requires:
 
-2. **CLI registration**: add `History(history::HistoryArgs)` variant to `Commands` enum in `lib.rs`; expose `run_history` from `lib.rs`; dispatch in `main.rs`/`netfyr_cli_main.rs`
-
-3. **Varlink client methods** in `crates/netfyr-varlink/src/client.rs`:
-   - `get_history(&mut self, count: Option<usize>, since: Option<String>, trigger: Option<String>, selector_name: Option<String>) -> Result<Vec<VarlinkJournalEntry>, VarlinkError>`
-   - `get_journal_entry(&mut self, seq: u64) -> Result<Option<VarlinkJournalEntry>, VarlinkError>`
-
-4. **Varlink DTO types** in `crates/netfyr-varlink/src/types.rs`:
-   - `VarlinkJournalEntry` (mirrors `JournalEntry` but with JSON-compatible fields)
-   - `VarlinkTrigger`, `VarlinkPolicySummary`, `VarlinkApplyOutcome` (or reuse `JournalEntry`'s serde-derived JSON directly)
-   - Conversion `From<&JournalEntry> for VarlinkJournalEntry` (or serialize `JournalEntry` to `serde_json::Value` directly since `JournalEntry` already derives `Serialize`)
-
-5. **Daemon server handlers** in `crates/netfyr-daemon/src/server.rs`:
-   - `handle_get_history(stream, params, journal) -> Result<()>`
-   - `handle_get_journal_entry(stream, params, journal) -> Result<()>`
-   - `Journal` (or `Arc<Mutex<Journal>>` / path) threaded through the server or opened on demand per request
-
-6. **Filtering logic** (in `history.rs`, applied post-read):
-   - `--since`: compare `entry.timestamp >= cutoff`
-   - `--trigger`: case-insensitive substring match against the trigger's `type` field string
-   - `--selector name=X`: check if any `diff.operations[].entity_name == X`
-   - `--count`: applied last as a `.take(count)` after all filters
-
----
+1. **CLI subcommand** with args: `-n/--count`, `--since`, `--trigger`, `-s/--selector`, `--show`, `-o/--output`
+2. **Dual-mode operation**: daemon (Varlink) if socket available, otherwise direct journal read
+3. **Text list output**: fixed-width columns SEQ, TIMESTAMP, TRIGGER, ENTITIES, OUTCOME, CHANGES — with CHANGES last, truncated to terminal width (or 120 chars for non-TTY) with `...`
+4. **Text detail output** (`--show <seq>`): full entry with trigger details, active policies, diff, outcome, state snapshot
+5. **JSON output**: array for list, object for detail; same structure as NDJSON journal
+6. **Filter behavior**: time (--since), trigger type (partial/case-insensitive match), entity name (name=X), count limit — all combined with AND logic
+7. **Empty/missing journal**: appropriate messages and exit codes
+8. **Varlink methods** `GetHistory` and `GetJournalEntry` handled by daemon
+9. **Color support**: `+` green, `-` red, `~` yellow in CHANGES and diff output
+10. **CHANGES notation**: scalar fields use `+field`/`~field`/`-field`; list fields use `addr(+N)`/`addr(-N)` notation; entity-level ops use `+entity`/`-entity`
+11. **Varlink IDL** updated with new methods and types
 
 ## Gap Analysis
 
-| File | Status | Change Required |
-|------|--------|-----------------|
-| `crates/netfyr-cli/src/history.rs` | **Missing** | Create new file with full history command implementation |
-| `crates/netfyr-cli/src/lib.rs` | Exists | Add `pub mod history`, `pub use history::run_history`, add `History(history::HistoryArgs)` to `Commands` |
-| `crates/netfyr-cli/src/main.rs` | Exists | Add `Commands::History(args) => run_history(args).await` dispatch arm |
-| `crates/netfyr-cli/src/netfyr_cli_main.rs` | Exists | Same dispatch if this is the actual entry point (need to confirm which of main.rs / netfyr_cli_main.rs is the true entry) |
-| `crates/netfyr-varlink/src/client.rs` | Exists | Add `get_history` and `get_journal_entry` async methods |
-| `crates/netfyr-varlink/src/types.rs` | Exists | Add `VarlinkJournalEntry` and related types (or reuse `JournalEntry` JSON serialization) |
-| `crates/netfyr-varlink/src/lib.rs` | Exists | Re-export new Varlink journal types |
-| `crates/netfyr-daemon/src/server.rs` | Exists | Add `handle_get_history` and `handle_get_journal_entry` handlers; thread `Journal` access into dispatch |
-| `crates/netfyr-daemon/src/main.rs` | Exists | Wire `Journal` into server if not already present |
+### GAP-1: Column order in `format_text_list` (functional)
 
----
+**File**: `crates/netfyr-cli/src/history.rs`, lines 337–356
+
+Current header: `SEQ TIMESTAMP TRIGGER ENTITIES CHANGES OUTCOME`
+Spec requires: `SEQ TIMESTAMP TRIGGER ENTITIES OUTCOME CHANGES` (CHANGES last, OUTCOME before it)
+
+The existing test at line 941 verifies column presence but not column order, so it does not catch this mismatch. The column ordering matters because CHANGES is supposed to use all remaining terminal width.
+
+**Fix required**: Swap OUTCOME and CHANGES in both header and data rows in `format_text_list`.
+
+### GAP-2: Terminal width truncation of CHANGES not implemented (functional)
+
+**File**: `crates/netfyr-cli/src/history.rs`
+
+The spec requires CHANGES to be truncated with `...` when the full row would exceed terminal width (or 120 chars when stdout is not a TTY). The current implementation applies a fixed count-based truncation in `changes_summary()` (shows at most 3 changes then `+N more`) but does not measure actual line width or query terminal width.
+
+**Fix required**: After composing each row in `format_text_list`, measure its rendered length and truncate the CHANGES value to fit within `min(terminal_width, 120)` columns, appending `...` if truncated. Use `std::io::IsTerminal` (stable since Rust 1.70) plus an ioctl or a lightweight crate to query terminal width.
+
+### GAP-3: List field notation not implemented in `changes_summary` (functional)
+
+**File**: `crates/netfyr-cli/src/history.rs`, lines 510–570
+
+The spec defines two notation systems:
+- **Scalar fields** (mtu, carrier, state, etc.): `+field`, `~field`, `-field`
+- **List fields** (addresses, routes): `addr(+N)`, `addr(-N)`, `addr(+N,-M)` — counted additions/removals, never `~`
+
+The current `changes_summary()` applies scalar notation uniformly to all fields. There is no list-field detection. The existing tests only verify scalar notation.
+
+**Fix required**: Detect list-typed fields by checking if `current` or `desired` in `SerializableFieldChange` is a JSON array, then render using count notation. Known list fields per the spec: `addresses`, `routes`.
+
+### GAP-4: Color support not implemented (functional, per spec)
+
+**File**: `crates/netfyr-cli/src/history.rs`
+
+The spec requires `+` indicators to be green, `-` red, `~` yellow in the CHANGES column and the diff block of `--show` output. The `colored` crate is already a dependency of `netfyr-cli`. No color is currently applied in `format_text_list()` or `format_text_detail()`.
+
+**Fix required**: Apply `colored::Colorize` to `+`/`-`/`~` prefixes in `changes_summary()` output and in the diff rendering block of `format_text_detail()`. Color must be conditioned on `colored`'s global override so it respects the `--color`/`NO_COLOR` already wired up in `main()`.
+
+### GAP-5: Missing Varlink client tests for `get_history` and `get_journal_entry`
+
+**File**: `crates/netfyr-varlink/src/client.rs` (tests section, after line 317)
+
+The test suite covers `submit_policies`, `query`, `dry_run`, `get_status`, `revert`, and error variants — but has no tests for `get_history` or `get_journal_entry`. The acceptance criteria include daemon-mode scenarios that depend on these methods.
+
+**Fix required**: Add unit tests using the `spawn_mock_server` pattern already present:
+- `test_get_history_sends_correct_method_and_parameters` — verify method name and optional params forwarded correctly
+- `test_get_history_returns_entries_array` — verify `entries` JSON array is extracted and returned
+- `test_get_journal_entry_returns_entry_when_present` — verify non-null entry becomes `Some(value)`
+- `test_get_journal_entry_returns_none_when_entry_is_null` — verify null response becomes `None`
+
+### GAP-6: Missing server-side tests for `handle_get_history` and `handle_get_journal_entry`
+
+**File**: `crates/netfyr-daemon/src/server.rs` (tests section, after line 876)
+
+The server test suite has no coverage for the two new handlers. These handlers call `Journal::open_default()`, making them harder to test in isolation, but the error paths can be verified without a real journal.
+
+**Fix required**: Add unit tests:
+- `test_handle_get_history_missing_seq_param_returns_error` — call with `{}`, verify InternalError (missing seq)
+- `test_handle_get_journal_entry_missing_seq_parameter_returns_error` — call with `{}`, verify InternalError
+- `test_handle_get_history_returns_entries_field_in_parameters` — supply a real journal dir via env var and verify `entries` is an array in the response
+
+### GAP-7: `io.netfyr.varlink` missing `GetHistory`, `GetJournalEntry`, `Revert`, and `EntryNotFound`
+
+**File**: `crates/netfyr-varlink/src/io.netfyr.varlink`
+
+The IDL file documents the public Varlink interface. It is missing:
+- `method GetHistory(count: ?int, since: ?string, trigger: ?string, selector_name: ?string) -> (entries: []object)`
+- `method GetJournalEntry(seq: int) -> (entry: ?object)`
+- `method Revert(target_seq: int, dry_run: bool) -> (report: ApplyReport, entry_timestamp: string)`
+- `error EntryNotFound (reason: string)`
+
+The Varlink IDL is not parsed at runtime (the wire protocol is hand-rolled JSON), so this is a documentation/contract gap rather than a runtime functional one. The spec explicitly lists this file as a deliverable.
+
+**Fix required**: Add the missing method declarations and `error EntryNotFound` to the .varlink file. Structured journal types in the IDL may be simplified to `object` since the daemon returns raw serialized JSON.
 
 ## Integration Points
 
-- **`netfyr-journal::Journal`**: The history command reads journal data via `Journal::open_default()` in daemon-free mode. The daemon's server reads via a shared `Journal` instance (to be added). The journal's `read_recent(count)` and `read_entry(seq)` are the primary APIs; all filtering beyond count happens in the CLI layer.
-- **`netfyr-varlink::VarlinkClient::call()`**: The private `call()` method is the single entry point for all Varlink requests. New methods (`get_history`, `get_journal_entry`) follow the same pattern: build a `serde_json::json!({...})` params map, call `self.call("io.netfyr.GetHistory", params)`, extract and deserialize the response field.
-- **`netfyr-cli::query::OutputFormat`**: The history command needs its own `OutputFormat` enum (`Text` + `Json`, not `Yaml` + `Json`). It should not reuse `query::OutputFormat` since the defaults and variants differ.
-- **`netfyr-cli::query::daemon_socket_path()`**: This function is private to `query.rs`. The history module will need either its own copy or for it to be extracted to a shared `cli_util` module or `lib.rs`.
-- **`clap` `Commands` enum**: Adding `History` requires updating the doc-comment in `Cli` as well for consistency with existing `apply` and `query` entries.
-
----
+- **`netfyr-journal`**: `Journal::open()`, `Journal::open_default()`, `Journal::read_recent()`, `Journal::read_entry()` — used in both CLI local mode and daemon handler. `JournalEntry`, `SerializableDiff`, `SerializableDiffOp`, `SerializableFieldChange`, `SerializableStateSet`, `Trigger`, `ApplyOutcome` are deserialized in the CLI after receiving raw JSON from daemon.
+- **`netfyr-varlink`**: `VarlinkClient::get_history()` and `get_journal_entry()` used by `run_history_daemon()`. Return type is `Vec<serde_json::Value>` / `Option<serde_json::Value>` to avoid a journal dependency in the varlink crate; the CLI does final deserialization.
+- **`crate::daemon_socket_path()`**: shared helper for daemon detection, same pattern as `apply` and `query`.
+- **`colored` crate**: already a dependency of `netfyr-cli`; GAP-4 uses `colored::Colorize` consistent with the `--color` / `NO_COLOR` global already configured by `resolve_color_mode()`.
+- **`xtask`**: uses `Cli::command()` for man page generation; `History` is already in `Commands` so the man page is extended automatically.
 
 ## Risks
 
-1. **Archive reads not implemented**: `Journal::read_recent()` and `read_entry()` only scan `current.ndjson`. Entries rotated to gzip archives are invisible. The `--since` flag with durations longer than the rotation period (e.g., `--since 7d`) will silently miss archived entries. The spec does not mention archive traversal, but operators may expect it. This is a functional gap that should be clarified before implementation.
+1. **Duplicate duration-parsing logic**: `server_parse_since()` in `server.rs` and `parse_since()` in `history.rs` are near-identical. If one is changed (e.g. new time unit), the other will diverge. Refactoring is blocked by the crate dependency direction (varlink/daemon cannot depend on cli), so this duplication is structural.
 
-2. **Journal directory creation on open**: `Journal::open()` calls `create_dir_all`, so calling it to check for a missing journal directory will create it instead of returning an error. The missing-directory error scenario in the acceptance criteria requires a separate existence check (`Path::exists()`) before opening. Alternatively, `Journal::open_default()` must be called only after verifying the directory exists.
+2. **Terminal width query portability (GAP-2)**: Querying terminal width requires a platform-specific call. `libc` is already a transitive dependency. If a cross-platform solution is preferred, a lightweight crate (e.g. `terminal_size`) would need to be added to `netfyr-cli/Cargo.toml`.
 
-3. **Daemon server journal access**: The daemon's `serve_varlink` function currently receives `PolicyStore`, `FactoryManager`, and `Reconciler`. Adding `Journal` access requires plumbing it through `serve_varlink` — either as an `Arc<Mutex<Journal>>` for shared mutable access, or by reopening the journal read-only per request. The journal uses file-level advisory locks (`fcntl F_WRLCK/F_UNLCK`) so concurrent read access from multiple threads opening the same file may require care.
+3. **List field detection (GAP-3)**: `SerializableFieldChange` carries only field name and JSON values — no type metadata. Detecting lists by checking `serde_json::Value::is_array()` on current/desired is practical but could misfire for malformed state. Alternatively, hard-coding known list field names (`addresses`, `routes`) is more robust within the current domain.
 
-4. **`VarlinkJournalEntry` type design**: `JournalEntry` already derives `Serialize`/`Deserialize` with well-defined JSON shapes. The simplest approach is to serialize `JournalEntry` directly to `serde_json::Value` in the daemon and deserialize from `serde_json::Value` in the client, avoiding a redundant DTO. However, this couples the Varlink wire format to the journal's internal serialization format. The spec defines separate Varlink types — whether to create distinct types or alias is an implementation decision.
+4. **Multi-selector ignored in daemon mode**: `run_history_daemon()` passes only `args.selector.first()` to `get_history()` (line 158–159). Multiple `-s` selectors are silently dropped in daemon mode. The spec only demonstrates `name=X` selectors, so this is an edge case, but it creates a behavior difference between daemon and local modes.
 
-5. **Trigger string matching ambiguity**: The spec says `--trigger external` should match `ExternalChange`. The `Trigger` enum serializes with a `type` field using `snake_case` (e.g., `"external_change"`). Partial, case-insensitive substring matching (e.g., `"external"` matches `"external_change"`) is the stated behavior but must be implemented carefully to avoid false matches (e.g., `"apply"` matching both `"policy_apply"` and potentially other variants containing that substring).
+5. **Test isolation for env-var-based integration tests**: Tests that call `run_history_local` mutate `NETFYR_JOURNAL_DIR` and are guarded by a global `Mutex<()>`. This is fragile under parallel test execution. The pattern is already established in the existing tests, so the risk is managed but not eliminated.
 
-6. **Selector parsing reuse**: `query.rs` defines a private `parse_selector` function. The history command accepts only `name=X` selectors (not `type`, `driver`, `mac`, `pci_path`). A copy or shared utility will be needed; the spec's `HistoryArgs` uses `value_parser = parse_selector` suggesting a new history-specific parser that only accepts `name=`.
-
-7. **`main.rs` vs `netfyr_cli_main.rs`**: The CLI has two potential entry-point files. The actual dispatch location must be verified by reading them before adding the `History` dispatch arm.
+6. **Color in JSON output**: Applying color in `format_text_detail` is straightforward. Applying color in `format_text_list` to individual cells within a fixed-width format requires care to account for invisible ANSI escape bytes when computing column widths, since `colored` strings include escape sequences in their byte length.

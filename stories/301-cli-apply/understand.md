@@ -1,39 +1,39 @@
-# SPEC-301: CLI Apply Command — Gap Analysis
+# UNDERSTAND: SPEC-301 — CLI Apply Command
 
 ## Current State
 
-The `netfyr-cli` crate already contains a substantial implementation.
+### Core apply implementation — fully present
 
-**`crates/netfyr-cli/src/apply.rs`** (~1033 lines):
-- `ApplyArgs` with `paths: Vec<PathBuf>` and `dry_run: bool`
-- `run_apply(args: ApplyArgs) -> Result<ExitCode>` — full daemon-detect → daemon-free/daemon dispatch
-- `load_policies(&[PathBuf]) -> Result<PolicySet>` — file/dir loading with missing-path detection
-- `policies_to_inputs` — converts static policies via `StaticFactory` to `PolicyInput`
-- `create_backend_registry()` — registers `NetlinkBackend`
-- `determine_exit_code` and `daemon_exit_code` — 0/1/2 exit code mapping
-- Display functions: `display_apply_report`, `display_dry_run_report`, `display_varlink_apply_report`, `display_varlink_diff`, `print_conflicts`
-- 30+ unit tests covering exit codes, `load_policies`, DHCP-without-daemon scenario
+`crates/netfyr-cli/src/apply.rs` (~1279 lines) is substantially complete:
 
-**`crates/netfyr-cli/src/lib.rs`**:
-- `Cli` struct with `command: Option<Commands>` — `Option`, not required
-- `Commands` enum with `Apply(ApplyArgs)` and `Query(QueryArgs)` variants
-- Missing `#[command(subcommand_required = true, arg_required_else_help = true)]`
+- **`ApplyArgs`** — `paths: Vec<PathBuf>` (required), `dry_run: bool`, both clap-annotated.
+- **`run_apply()`** — complete daemon-detection flow: reads `NETFYR_SOCKET_PATH`, calls `VarlinkClient::connect`, dispatches on `VarlinkError::ConnectionFailed` to daemon-free mode.
+- **Daemon-free path** — DHCP gate (errors with `"requires the netfyr daemon"` and `"systemctl start netfyr"`); `policies_to_inputs` via `StaticFactory`; `merge()` for reconciliation; `BackendRegistry::query_all()`; dual diff (`generate_diff` for display, `compute_state_diff` for apply); `registry.apply()`; `Journal::open_default()` write-back.
+- **Daemon path** — `run_apply_daemon()` calls `client.dry_run()` or `client.submit_policies()`.
+- **`load_policies()`** — handles files and directories, delegates to `load_policy_file` / `load_policy_dir`, checks for missing paths (error contains `"path not found"`), detects duplicate policy names across paths.
+- **`validate_policies()`** — runs `SchemaRegistry::validate()` on all states, aggregates all errors.
+- **`determine_exit_code()` / `daemon_exit_code()`** — correct 0/1/2 exit code matrix.
+- **Display functions** — `display_apply_report`, `display_dry_run_report`, `display_varlink_apply_report`, `display_varlink_diff`, `print_conflicts` — all present, using the `colored` crate.
+- **`create_backend_registry()`** — registers `NetlinkBackend`.
+- **Unit tests** — 30+ tests covering `load_policies`, `determine_exit_code`, `daemon_exit_code`, `display_apply_report` smoke tests, and the DHCP-without-daemon `run_apply` async path.
 
-**`crates/netfyr-cli/src/main.rs`**:
-- Parses `Cli`, dispatches on `cli.command`
-- `None` arm prints `"netfyr"` and returns `ExitCode::from(0u8)` — exits 0 instead of 2
+### CLI structure — present but missing `--color` flag
 
-**`tests/`** — all 8 shell integration tests for SPEC-301 already exist:
-- `301-apply-static-mtu.sh` — MTU apply in namespace (applies mtu=1400, verifies with `ip link`)
-- `301-apply-with-address.sh` — MTU + address in namespace (verifies `ip addr`)
-- `301-apply-dry-run.sh` — dry-run does not mutate kernel state
-- `301-dhcp-policy-no-daemon.sh` — DHCP policy exits 2 with required message text
-- `301-dry-run-no-changes.sh` — dry-run exits 0 when policy matches current state
-- `301-no-args-error.sh` — `netfyr apply` with no paths exits 2
-- `301-path-not-found.sh` — nonexistent path exits 2 with "path not found"
-- `301-yaml-parse-error.sh` — invalid YAML exits 2
+`crates/netfyr-cli/src/lib.rs`:
+- `Cli` struct with `#[command(subcommand_required = true, arg_required_else_help = true)]` — satisfies "no subcommand shows help, exit 2" via clap.
+- `Commands` enum with `Apply`, `Query`, `History`, `Revert`.
+- **Missing**: `--color` global flag (`ColorMode` enum, `color: ColorMode` field on `Cli`).
 
-All shell tests follow SPEC-001 conventions: binary check, `NETFYR_SOCKET_PATH=/nonexistent` override, source `helpers.sh`, `netns_setup`, no `exit 0` on failure.
+`crates/netfyr-cli/src/main.rs` — correct tokio main using `Cli::parse()` and `Commands` (non-optional), dispatches all four subcommands, maps errors to `ExitCode::from(2u8)`.
+
+`crates/netfyr-cli/src/netfyr_cli_main.rs` — an alternate entry point with a manual `if args().len() == 1 { println!("netfyr"); exit(0) }` guard. This exits 0 instead of 2. Whether this is the installed binary depends on `[[bin]]` Cargo config; `main.rs` appears to be the canonical binary.
+
+### Integration tests — all present
+
+All 13 shell tests for SPEC-301 exist under `tests/301-*.sh`:
+`301-apply-static-mtu.sh`, `301-apply-with-address.sh`, `301-apply-dry-run.sh`, `301-apply-no-changes.sh`, `301-conflict-warning.sh`, `301-dhcp-policy-no-daemon.sh`, `301-dry-run-no-changes.sh`, `301-no-args-error.sh`, `301-no-subcommand.sh`, `301-partial-failure.sh`, `301-path-not-found.sh`, `301-total-failure.sh`, `301-yaml-parse-error.sh`.
+
+`tests/helpers.sh` is complete with all required helpers.
 
 ---
 
@@ -41,122 +41,85 @@ All shell tests follow SPEC-001 conventions: binary check, `NETFYR_SOCKET_PATH=/
 
 Concrete technical requirements from the acceptance criteria:
 
-1. Socket detection via `NETFYR_SOCKET_PATH` env var, defaulting to `/run/netfyr/netfyr.sock`; `VarlinkError::ConnectionFailed` → daemon-free fallback.
-2. Policy loading: `load_policy_file` / `load_policy_dir`; bare state YAML auto-wrapped (filename → policy name, priority 100, `FactoryType::Static`).
-3. Daemon-free DHCP guard: any `factory_type != Static` → error containing `"requires the netfyr daemon"` and `"systemctl start netfyr"`, exit 2.
-4. Reconciliation: `merge(Vec<PolicyInput>)` → `ReconciliationResult.effective_state` + `.conflicts`.
-5. Dual diff: `generate_diff(desired, actual, managed_entities, schema)` for display; `compute_state_diff(actual, desired)` for `registry.apply()`.
-6. Dry-run: display diff, never call `apply()`, exit 1 if changes pending, 0 if none.
-7. Apply: `registry.apply(&state_diff)`, display `ApplyReport`, print conflict warnings.
-8. Exit codes: 0 = success/no changes; 1 = partial failure or conflicts; 2 = total failure or fatal error (including YAML parse errors, DHCP without daemon).
-9. **No subcommand**: `netfyr` with no args prints usage help and exits 2 (via clap `SubcommandRequiredElseHelp`).
-10. **No path args**: `netfyr apply` with no paths triggers clap required-arg error, exits 2.
-11. Daemon mode: submit `Vec<VarlinkPolicy>` via `client.submit_policies()` or `client.dry_run()`; display `VarlinkApplyReport`.
+1. `ApplyArgs` with `paths: Vec<PathBuf>` (required) and `--dry-run: bool` — both clap-annotated.
+2. `run_apply(args)` returns `Result<ExitCode>` with full two-mode flow.
+3. Daemon detection via `NETFYR_SOCKET_PATH` (default `/run/netfyr/netfyr.sock`); `ConnectionFailed` → daemon-free fallback.
+4. Daemon-free mode: static-only gate; reconcile; query; diff; apply; journal write.
+5. Daemon mode: `submit_policies` or `dry_run` via `VarlinkClient`.
+6. Policy loading: files, directories, bare-state auto-wrap (filename stem → policy name, priority 100, `FactoryType::Static`), duplicate detection, "path not found" error.
+7. Exit codes: 0 (success/no-op), 1 (partial failure or conflicts), 2 (total failure or fatal error).
+8. Colored output for diff lines (`+` green, `~` yellow, `-`/`x` red), gated by `--color` flag and `NO_COLOR` env var.
+9. **`--color` global flag** with `ColorMode { Auto, Always, Never }` and `NO_COLOR` env var support.
+10. No-subcommand: clap prints usage, exits 2.
+11. No-path-argument: clap prints required-arg error, exits 2.
 
 ---
 
 ## Gap Analysis
 
-### GAP 1 — `lib.rs`: Missing `subcommand_required = true, arg_required_else_help = true`; `command` is `Option<Commands>` (MUST FIX)
+### GAP 1 — `--color` global flag and `ColorMode` enum are absent (file: `crates/netfyr-cli/src/lib.rs`)
 
-**File**: `crates/netfyr-cli/src/lib.rs`
-
-Current:
+The spec requires:
 ```rust
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Commands>,
-}
+#[arg(long, global = true, default_value = "auto")]
+color: ColorMode,
+
+#[derive(Clone, ValueEnum)]
+enum ColorMode { Auto, Always, Never }
 ```
 
-Required by spec:
-```rust
-#[command(subcommand_required = true, arg_required_else_help = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-```
+Neither `ColorMode` nor the `color` field exist anywhere in the crate. The `Cli` struct in `lib.rs` currently has no color field.
 
-Without these attributes, clap does not print help and exit 2 when no subcommand is given. The AC "No subcommand shows usage help, exit code 2" fails.
+**What must be created**: `ColorMode` enum (with `ValueEnum` derive), `color: ColorMode` field on `Cli`.
 
-### GAP 2 — `main.rs`: `None` arm exits 0 instead of 2 (MUST FIX)
+### GAP 2 — `NO_COLOR` env var and color resolution logic absent (file: `crates/netfyr-cli/src/main.rs`)
 
-**File**: `crates/netfyr-cli/src/main.rs`
+The spec requires:
+- If `NO_COLOR` is set (any value), disable colors regardless of `--color`.
+- `auto`: enable when stdout is a TTY.
+- `always`/`never`: force on/off.
 
-Current `None =>` arm:
-```rust
-None => {
-    println!("netfyr");
-    ExitCode::from(0u8)
-}
-```
+Currently the `colored` crate is used unconditionally in all display functions. No color resolution or `colored::control::set_override` call exists anywhere. Color mode resolution must be applied in `main.rs` after `Cli::parse()`, before any subcommand handler runs.
 
-When GAP 1 is fixed (`command` becomes `Commands`, not `Option<Commands>`), this arm must be removed. Alternatively, if `Option<Commands>` is kept for xtask compatibility, this arm must call `Cli::command().print_help()` and return `ExitCode::from(2u8)`.
+**What must be created**: A color-setup function (likely in `lib.rs` or `main.rs`) that checks `NO_COLOR`, then maps `ColorMode` to a `colored::control::set_override(bool)` call (or lets `colored`'s default TTY detection handle `Auto`).
 
-### GAP 3 — Potential compile error: `DiffReport::operations` direct field access
+### GAP 3 — `netfyr_cli_main.rs` exits 0 for no-args (file: `crates/netfyr-cli/src/netfyr_cli_main.rs`)
 
-**File**: `crates/netfyr-cli/src/apply.rs:342`
+The manual `if args().len() == 1 { exit(0) }` guard bypasses clap entirely and exits 0 instead of 2. If this is the installed `netfyr` binary, the `301-no-subcommand.sh` and `301-no-args-error.sh` tests will fail. Needs resolution based on `[[bin]]` Cargo configuration.
 
-`display_dry_run_report` accesses `report.operations.len()` directly. The public API snapshot for `netfyr-reconcile::DiffReport` lists only methods (`format_text`, `format_yaml`, `format_json`, `is_empty`) — no `operations` field. If this field is not `pub`, the code will not compile. The implementation phase must read `crates/netfyr-reconcile/src/report.rs` to verify field visibility and adjust accordingly (e.g., use `format_text()` line count or a new `len()` method).
+### No gap in: apply flow logic, daemon detection, policy loading, exit codes, display functions, unit tests, integration test scripts
 
-### GAP 4 — Potential compile error: `ConflictReport::conflicts` field and `Conflict` struct field access
-
-**File**: `crates/netfyr-cli/src/apply.rs:313–331`
-
-`print_conflicts` iterates `conflicts.conflicts` and accesses `c.entity_key`, `c.field_name`, `c.priority`, `c.contributions`. The `ConflictReport` public API shows only `new`, `is_empty`, `len`, `by_entity`, `summary` — no public `conflicts` field. If these fields are private, compilation fails.
-
-The same issue affects the unit test helper `conflict_report_with_one` at line 689, which constructs:
-```rust
-ConflictReport { conflicts: vec![Conflict { entity_key: ..., field_name: ..., priority: ..., contributions: vec![] }] }
-```
-
-### GAP 5 — Potential compile error: `ConflictContribution::value.value` access
-
-**File**: `crates/netfyr-cli/src/apply.rs:318`
-
-```rust
-format!("policy \"{}\" sets {}", cc.policy_id, cc.value.value)
-```
-
-`ConflictContribution` is listed in the public API with no shown fields. If `FieldValue` wraps the actual value in a private inner field, this double-deref fails.
-
-### GAP 6 — Missing shell integration test for "No subcommand shows usage help"
-
-The AC scenario "No subcommand shows usage help, exit code 2" (running bare `netfyr`) has no corresponding `301-no-subcommand.sh` test. The existing `301-no-args-error.sh` tests `netfyr apply` with no paths — a different clap error path. A test for the bare `netfyr` invocation is absent.
-
-### No gap in: Apply flow logic, daemon detection, policy loading, all display functions
-
-The functional logic in `run_apply`, `run_apply_daemon`, `load_policies`, exit code mapping, and all display functions is present and matches the spec. All 8 required shell integration test scripts exist.
+The functional core is implemented. The 13 required shell integration test scripts exist. The unit test suite is comprehensive.
 
 ---
 
 ## Integration Points
 
-| Component | Role | Interface |
-|---|---|---|
-| `netfyr-policy` | `load_policy_file`, `load_policy_dir`, `PolicySet`, `FactoryType`, `StaticFactory`, `StateFactory::produce` | Imported in `apply.rs` |
-| `netfyr-reconcile` | `merge`, `PolicyInput`, `PolicyId`, `ConflictReport`, `generate_diff`, `DiffReport` | Imported in `apply.rs` |
-| `netfyr-state` | `diff::diff` (aliased `compute_state_diff`), `SchemaRegistry`, `StateDiff` | Imported in `apply.rs` |
-| `netfyr-backend` | `BackendRegistry`, `NetlinkBackend`, `ApplyReport`, `DiffOpKind` | Imported in `apply.rs` |
-| `netfyr-varlink` | `VarlinkClient`, `VarlinkPolicy`, `VarlinkApplyReport`, `VarlinkStateDiff`, `VarlinkError` | Imported in `apply.rs` |
-| `xtask` | Calls `Cli::command()` via `CommandFactory` for man-page generation | Depends on `netfyr-cli` lib |
-| `tests/helpers.sh` | `netns_setup`, `create_veth`, `assert_has_address` | Sourced by all 301 shell tests |
+| Component | Role |
+|---|---|
+| `netfyr_policy::{load_policy_file, load_policy_dir, FactoryType, PolicySet, StaticFactory}` | Policy loading and static production |
+| `netfyr_reconcile::{merge, generate_diff, PolicyInput, PolicyId, ConflictReport, DiffReport}` | Reconciliation and display diff |
+| `netfyr_state::{diff::diff, StateSet, SchemaRegistry, StateDiff}` | State-level diff for `registry.apply()` |
+| `netfyr_backend::{BackendRegistry, NetlinkBackend, ApplyReport, DiffOpKind}` | Netlink query and apply |
+| `netfyr_varlink::{VarlinkClient, VarlinkError, VarlinkPolicy, VarlinkApplyReport, VarlinkStateDiff}` | Daemon communication |
+| `netfyr_journal::{Journal, JournalEntry, Trigger, ApplyOutcome, summarize_policies}` | Audit log write-back |
+| `colored` crate | Terminal color output — must be gated by GAP 1/2 color resolution |
+| `NETFYR_SOCKET_PATH` env var | Daemon socket override; critical for all 301 integration tests |
 
-The `NETFYR_SOCKET_PATH` env var is the critical seam between daemon and daemon-free mode; all integration tests override it to `/nonexistent`.
+The `--color` flag, once added to `Cli`, must propagate from `main.rs` to a color-setup function before any subcommand handler is dispatched.
 
 ---
 
 ## Risks
 
-1. **`DiffReport` field access** (GAP 3): If `operations` is not public on `DiffReport`, the fix requires either: (a) adding `pub fn len(&self) -> usize` to `DiffReport` in `netfyr-reconcile`, or (b) rewriting `display_dry_run_report` to derive the count from `format_text()`. This touches `netfyr-reconcile` which is outside the `netfyr-cli` crate boundary.
+1. **`colored` global state**: `colored::control::set_override` sets a process-global. Unit tests that call display functions will be unaffected (they don't call the setup function), but integration tests will respect `NO_COLOR` if set in the shell environment — which is the correct behavior.
 
-2. **`ConflictReport` / `Conflict` private fields** (GAP 4 & 5): If fields are private, both the display function and the unit test must be rewritten to use the public `by_entity()` method. This is a moderate refactor. The struct construction in the unit test will need to use `ConflictReport::new()` with a mock-friendly alternative or a test constructor.
+2. **TTY detection for `Auto`**: If color resolution delegates to `colored`'s built-in TTY detection for `Auto` (by not calling `set_override`), no additional `atty` / `IsTerminal` dependency is needed. If the implementation forces `set_override` for `Auto` too, TTY detection must be added explicitly.
 
-3. **`subcommand_required` vs xtask compatibility** (GAP 1): `xtask` imports `Cli` to call `Cli::command()` for man-page generation. If `command: Option<Commands>` is changed to `command: Commands`, xtask code that calls `.command` directly may break. The implementation phase must check `xtask/src/main.rs` before modifying `Cli`.
+3. **`netfyr_cli_main.rs` vs `main.rs` binary target**: If both files are configured as `[[bin]]` targets in `Cargo.toml`, one of them is the installed `netfyr` binary and the other is dead or a secondary binary. The Cargo.toml `[[bin]]` section must be read to resolve which file's behavior is observable by integration tests.
 
-4. **Unsafe `set_var` in async tests**: The test at line 854 uses `unsafe { std::env::set_var("NETFYR_SOCKET_PATH", ...) }`. In multi-threaded tokio runtimes, concurrent env mutation is unsound. Rust 1.81+ treats `set_var` in multithreaded contexts as unsafe. This may produce warnings or lint failures in CI.
+4. **Bare-state auto-wrapping lives in `netfyr-policy`**: The CLI's `load_policies` delegates to `load_policy_file`. If SPEC-008 (bare-state auto-wrap) is not yet implemented in `netfyr-policy`, the `301-apply-static-mtu.sh` and `301-apply-with-address.sh` tests will fail regardless of CLI correctness.
 
-5. **Bare-state auto-wrapping is a `netfyr-policy` concern**: The spec says bare state YAML (no `kind` field) is auto-wrapped using the filename as the policy name. This logic lives in `load_policy_file` in `netfyr-policy` (SPEC-008). The CLI's `load_policies` just delegates to that function. If SPEC-008 is not implemented in `netfyr-policy`, the shell tests `301-apply-static-mtu.sh` and `301-apply-with-address.sh` will fail even though the CLI code is correct.
+5. **`unsafe { set_var }` in async tests**: The DHCP-without-daemon test (line ~950 in `apply.rs`) uses `unsafe { std::env::set_var(...) }` inside a `#[tokio::test]`. In Rust 1.81+, this emits a safety warning because the tokio runtime is multi-threaded. This may produce CI warnings or lints.
 
-6. **No `tests/301-no-subcommand.sh`**: The AC "No subcommand shows usage help" is only verifiable via a shell script that runs bare `netfyr` and checks exit 2. Without this test, `make integration-test SPEC=301` will not catch regressions in that scenario.
+6. **`VarlinkError::ConnectionFailed` match coverage**: Daemon detection only falls back to daemon-free mode on `VarlinkError::ConnectionFailed(_)`. Other connection errors (e.g., permission denied, protocol mismatch) re-surface as fatal errors. This is per-spec but the exact variant names in `netfyr-varlink` must be confirmed to match what `VarlinkClient::connect` actually emits for the "socket not present" case.

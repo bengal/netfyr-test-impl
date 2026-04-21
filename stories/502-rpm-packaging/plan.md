@@ -2,115 +2,117 @@
 
 ## Approach
 
-The RPM packaging infrastructure is already implemented. Four files exist: `netfyr.spec`, `scripts/build-rpm.sh`, `dist/systemd/netfyr.service`, and `dist/systemd/netfyr.socket`. All supporting artifacts (man pages in `man/`, example policy in `examples/policies/`, `LICENSE` file, `.gitignore` with `/vendor`) are in place.
+The RPM packaging infrastructure is already implemented. Four files exist and are correct: `netfyr.spec`, `scripts/build-rpm.sh`, `dist/systemd/netfyr.service`, and `dist/systemd/netfyr.socket`. All supporting artifacts (man pages in `man/`, example policy in `examples/policies/`, `LICENSE` file, `.gitignore` with `/vendor`) are in place.
 
-The only required change is a **bug fix in `netfyr.spec`**: lines 47 and 77 reference `target/release/netfyr-cli`, but the correct CLI binary is `target/release/netfyr`. The `netfyr-cli` crate declares two `[[bin]]` targets in its `Cargo.toml`: `name = "netfyr"` (from `src/main.rs`, the primary CLI) and `name = "netfyr-cli"` (from `src/netfyr_cli_main.rs`, a secondary entry point). Cargo outputs both as separate binaries. The spec needs to reference the primary one — `target/release/netfyr` — which is the binary that should be installed as `/usr/bin/netfyr`.
+The only defect is that `netfyr.spec` does not install or declare the man8 page (`netfyr-daemon.8`) for the daemon subpackage. The `%install` section copies man pages for sections 1, 5, and 7, but omits section 8. The `%files daemon` section lists the daemon binary and systemd units but does not include the man8 entry. This means `rpmbuild -ba` will fail: `xtask` generates `man/netfyr-daemon.8` during `%build`, the file ends up in the build tree, but it is never installed into the buildroot and never declared as owned by any package. RPM will report an "installed but unpackaged file" error or (depending on build system configuration) silently omit it — either way violating the spec's FHS table which requires `/usr/share/man/man8/netfyr-daemon.8.gz` in the `netfyr-daemon` package.
 
-No new files need to be created. No dependencies change. No Rust code is modified. The fix is two path corrections and cleanup of two misleading comments.
-
-The alternative of renaming the Cargo `[[bin]]` entry was rejected because it would be a cross-cutting change affecting other stories, test infrastructure, and the crate's public build artifacts. Fixing the spec to reference the correct existing binary name is the minimal, correct solution.
+The fix is two small additions to `netfyr.spec`: install commands in `%install` and a file declaration in `%files daemon`. No new files need to be created. No dependencies change. No other files require modification.
 
 ## Design Decisions
 
-1. **Decision**: Change `target/release/netfyr-cli` to `target/release/netfyr` in the spec's `%install` and `%check` sections.
-   - **Alternatives considered**: (a) Renaming the `[[bin]]` in `crates/netfyr-cli/Cargo.toml` to only produce `netfyr-cli` and keeping the spec's rename approach. (b) Keeping the spec as-is (which would fail at build time).
-   - **Rationale**: The Cargo workspace already produces `target/release/netfyr` as the primary CLI binary. The spec should reference this directly. The current spec references the secondary binary (`netfyr-cli`) which is not intended for installation. Installing `target/release/netfyr` to `%{_bindir}/netfyr` is a no-rename copy — simple and correct.
+1. **Decision**: Add man8 installation commands to `%install` and a man8 file entry to `%files daemon` in the existing `netfyr.spec`.
+   - **Alternatives considered**: (a) Skip the man8 page entirely and remove `man/netfyr-daemon.8` from the repo — rejected because the spec's FHS table explicitly requires the daemon man page in the daemon RPM, and omitting it would violate Fedora packaging guidelines for shipping binaries without man pages. (b) Ship the man8 page in the base `netfyr` package instead of `netfyr-daemon` — rejected because Fedora convention is to ship man pages with the binary they document, and `netfyr-daemon.8` documents the daemon binary which lives in the `netfyr-daemon` subpackage.
+   - **Rationale**: The spec's FHS table explicitly places `netfyr-daemon.8` in the `netfyr-daemon` package. The man page already exists in the repo at `man/netfyr-daemon.8`. Adding the two missing blocks (install + files) is the minimal correct fix and follows the pattern already established by man sections 1, 5, and 7.
 
-2. **Decision**: Remove the misleading comment on line 46 that says "the Cargo binary is named netfyr-cli; rename on install".
-   - **Alternatives considered**: Updating the comment to say "the Cargo binary is named netfyr".
-   - **Rationale**: The install command `install -Dpm 0755 target/release/netfyr %{buildroot}%{_bindir}/netfyr` is self-explanatory. A simpler comment ("Install CLI binary") matches the style used for the daemon binary on line 49.
+2. **Decision**: Place the man8 install commands immediately after the man7 block (after current line 58: `install -pm 0644 man/netfyr-examples.7 %{buildroot}%{_mandir}/man7/`), maintaining the ascending section-number order (man1 → man5 → man7 → man8).
+   - **Alternatives considered**: Placing them in the systemd unit install block or at the end of `%install`.
+   - **Rationale**: Grouping all man page installations together, in section order, matches the existing style and makes the spec easier to audit.
 
-3. **Decision**: Remove the misleading comment on line 76 that says "the CLI binary is named netfyr-cli in the build output".
-   - **Alternatives considered**: Keeping a corrected comment.
-   - **Rationale**: The smoke-test command `target/release/netfyr --help > /dev/null` is self-evident. The existing comment above it on line 75 ("Smoke-test: verify the built binaries are functional.") provides sufficient context.
+3. **Decision**: Place the `%{_mandir}/man8/netfyr-daemon.8*` entry in `%files daemon` immediately after `%{_bindir}/netfyr-daemon` (after current line 104), before the systemd unit entries.
+   - **Alternatives considered**: Placing it after the systemd unit entries (lines 105-106).
+   - **Rationale**: Mirrors the ordering convention in `%files` for the base package where man pages follow the binary entry. Groups "netfyr-daemon specific content" (binary + man page) before "infrastructure content" (systemd units).
+
+4. **Decision**: Use the two-line `install -d` + `install -pm` pattern rather than `install -Dpm`.
+   - **Alternatives considered**: Using `install -Dpm 0644 man/netfyr-daemon.8 %{buildroot}%{_mandir}/man8/netfyr-daemon.8` (single command that auto-creates parent directories).
+   - **Rationale**: The existing man5 and man7 blocks use the two-line pattern (`install -d` to create the directory, then `install -pm` to copy the file). Consistency within the spec file matters more than saving one line.
 
 ## File Changes
 
 ### 1. `netfyr.spec` — modify
 
-Four changes, all in the same file:
+Two additions to the existing file:
 
-**Change A — Line 46 (comment fix):**
-- **Current**: `# Install CLI binary (the Cargo binary is named netfyr-cli; rename on install)`
-- **New**: `# Install CLI binary`
-- **Why**: The comment is factually wrong — the binary is named `netfyr`, not `netfyr-cli`.
+**Addition A — `%install` section, after line 58 (after `install -pm 0644 man/netfyr-examples.7 %{buildroot}%{_mandir}/man7/`):**
 
-**Change B — Line 47 (binary path fix in `%install`):**
-- **Current**: `install -Dpm 0755 target/release/netfyr-cli %{buildroot}%{_bindir}/netfyr`
-- **New**: `install -Dpm 0755 target/release/netfyr %{buildroot}%{_bindir}/netfyr`
-- **Why**: The primary CLI binary produced by Cargo is `target/release/netfyr`. The current path `target/release/netfyr-cli` references the secondary entry point, causing `%install` to fail with "No such file or directory" (or worse, install the wrong binary if both exist).
+Insert two lines to install the man8 page into the buildroot:
+```
+install -d %{buildroot}%{_mandir}/man8
+install -pm 0644 man/netfyr-daemon.8 %{buildroot}%{_mandir}/man8/
+```
 
-**Change C — Line 76 (comment removal in `%check`):**
-- **Current**: `# Note: the CLI binary is named netfyr-cli in the build output.`
-- **Remove this line entirely.**
-- **Why**: Factually wrong and misleading. The preceding comment on line 75 is sufficient.
+- `install -d` creates the `man8` directory under the buildroot's mandir.
+- `install -pm 0644` copies `man/netfyr-daemon.8` with correct permissions and preserves timestamps.
+- This follows the exact same pattern as the man5 block (lines 55-56) and man7 block (lines 57-58).
 
-**Change D — Line 77 (binary path fix in `%check`):**
-- **Current**: `target/release/netfyr-cli --help > /dev/null`
-- **New**: `target/release/netfyr --help > /dev/null`
-- **Why**: Must smoke-test the same binary that gets installed. The current line tests the wrong binary.
+**Addition B — `%files daemon` section, after line 104 (after `%{_bindir}/netfyr-daemon`):**
+
+Insert one line declaring the man8 page as owned by the daemon subpackage:
+```
+%{_mandir}/man8/netfyr-daemon.8*
+```
+
+- The `*` glob suffix matches the `.gz` extension that `rpmbuild` adds when it compresses man pages during the build.
+- This follows the same glob pattern used for all other man page entries in `%files` (e.g., `%{_mandir}/man1/netfyr.1*`).
+
+**Why these changes are necessary**: Without Addition A, the man8 page is never copied from the source tree into the buildroot, so it cannot appear in any RPM. Without Addition B, even if the file were somehow present in the buildroot, RPM would not include it in the `netfyr-daemon` package (and would error on it as an unpackaged file). Both additions are required together.
 
 ### No other files need changes
 
-All other files are already correct and require no modifications:
+All other artifacts have been verified as correct and complete:
 
-- **`scripts/build-rpm.sh`**: Executable (mode 755 confirmed), reads Name/Version from spec, creates source and vendor tarballs, cleans up vendor/ after tarball creation, copies spec to `~/rpmbuild/SPECS/`, runs `rpmbuild -ba`. Matches spec requirements exactly.
-- **`dist/systemd/netfyr.service`**: `Type=notify`, `ExecStart=/usr/bin/netfyr-daemon`, `RuntimeDirectory=netfyr`, `StateDirectory=netfyr`, correct ordering targets (`After=network-pre.target`, `Before=network.target`). Matches spec.
+- **`scripts/build-rpm.sh`** (mode 755): Creates source and vendor tarballs, reads Name/Version from spec, cleans up vendor/ after tarball creation, runs `rpmbuild -ba`. Correct as-is.
+- **`dist/systemd/netfyr.service`**: `Type=notify`, `ExecStart=/usr/bin/netfyr-daemon`, `RuntimeDirectory=netfyr`, `StateDirectory=netfyr`, correct ordering targets. Matches spec.
 - **`dist/systemd/netfyr.socket`**: `ListenStream=/run/netfyr/netfyr.sock`, `SocketMode=0666`. Matches spec.
-- **`.gitignore`**: Already contains `/vendor` (along with `/target` and `/.factory/`).
-- **`man/`**: All seven man pages exist: `netfyr.1`, `netfyr-apply.1`, `netfyr-query.1`, `netfyr-history.1`, `netfyr-revert.1`, `netfyr.yaml.5`, `netfyr-examples.7`.
-- **`examples/policies/bare-ethernet.yaml`**: Exists for the `%install` glob.
-- **`LICENSE`**: Exists at workspace root for `%license` directive.
+- **`.gitignore`**: Contains `/vendor` (line 2). No change needed.
+- **`man/`**: All eight man pages exist: `netfyr.1`, `netfyr-apply.1`, `netfyr-query.1`, `netfyr-history.1`, `netfyr-revert.1`, `netfyr.yaml.5`, `netfyr-examples.7`, `netfyr-daemon.8`.
+- **`examples/policies/bare-ethernet.yaml`**: Present for the `%install` glob.
+- **`LICENSE`**: Present at workspace root for `%license` directives in both `%files` sections.
 
 ## Dependencies
 
-No new crate dependencies. This is a packaging-only change — no `Cargo.toml` files are modified.
+No new crate dependencies. This is a packaging metadata fix — no `Cargo.toml` files are modified.
 
 ## Implementation Order
 
-1. **Fix `netfyr.spec`** — Apply all four changes (A through D) described above. This is a single atomic edit to one file. The spec parses correctly before and after — there is no intermediate broken state.
+1. **Edit `netfyr.spec`** — Apply both additions (A and B) described above. Both must be applied together in a single edit. After this step, the spec file is complete and consistent.
 
-That is the entire implementation. One step, one file, four edits.
+That is the entire implementation. One step, one file, two insertions.
 
 ## Risks and Mitigations
 
-1. **Risk**: The secondary binary `target/release/netfyr-cli` (from `src/netfyr_cli_main.rs`) is also built by `%cargo_build` but is not installed. If it serves a purpose that requires packaging, it would be missing.
-   - **Mitigation**: The spec explicitly requires only `/usr/bin/netfyr` and `/usr/bin/netfyr-daemon`. The `netfyr-cli` binary is a secondary entry point not called for in the packaging requirements. If it needs packaging in the future, a third `install` line can be added.
+1. **Risk**: Incorrect insertion point causes the man8 install commands to appear inside a comment block or after an unrelated section.
+   - **Mitigation**: The plan specifies exact line-level insertion points with surrounding context. The implementer should verify that the new lines appear (a) in `%install` between the man7 block and the systemd unit block, and (b) in `%files daemon` between the binary entry and the systemd unit entries.
 
-2. **Risk**: `rpmlint` may flag warnings unrelated to this change (e.g., `non-standard-group`, socket permission warnings for `SocketMode=0666`, or informational notes).
-   - **Mitigation**: The acceptance criteria says "no errors" from rpmlint. Informational warnings and notes are acceptable. The `%changelog` is already present (lines 109-111), which prevents the most common rpmlint error.
+2. **Risk**: `rpmlint` may flag informational warnings unrelated to this change (e.g., `non-standard-group`, socket permission warnings for `SocketMode=0666`).
+   - **Mitigation**: The acceptance criteria states "no errors" from `rpmlint`. Informational warnings and notes are acceptable per Fedora packaging practice. The `%changelog` is already present (lines 108-110), which prevents the most common rpmlint error.
 
-3. **Risk**: The `%build` step runs `cargo run -p xtask -- man` to regenerate man pages. If the xtask binary has changed since the committed man pages were generated, the output could differ.
-   - **Mitigation**: The man pages are committed to the repo and regeneration is a consistency check. If xtask output diverges, the build still succeeds (the `install` commands use the generated output). The regeneration ensures the installed pages match the current code.
+3. **Risk**: The `%build` step runs `cargo run -p xtask -- man` which regenerates man pages. If xtask's output has changed since the committed pages were generated, the installed content could differ from what's in the repo.
+   - **Mitigation**: This is pre-existing behavior unrelated to this change. The regeneration ensures installed pages match the current code. If xtask output diverges, the build still succeeds — the `install` commands use whatever `cargo run -p xtask -- man` produces.
 
-4. **Risk**: `%cargo_build` might not build all workspace members, leaving `target/release/netfyr` or `target/release/netfyr-daemon` missing.
-   - **Mitigation**: The Cargo workspace has no `default-members` restriction, so `%cargo_build` (which wraps `cargo build --release`) builds all members. Both binaries will be produced.
+4. **Risk**: `%cargo_build` might not build the daemon binary if the workspace has `default-members` restrictions.
+   - **Mitigation**: The workspace `Cargo.toml` has no `default-members` restriction (verified from codebase context), so `%cargo_build` builds all workspace members including both `netfyr-cli` and `netfyr-daemon` crates.
 
-5. **Risk**: Version drift between `Version: 0.1.0` in the spec and `version = "0.1.0"` in individual `Cargo.toml` files.
-   - **Mitigation**: Out of scope for this story. The version is 0.1.0 in both places currently. An automated version-sync check could be added later.
+5. **Risk**: Version drift between `Version: 0.1.0` in the spec and individual `Cargo.toml` versions.
+   - **Mitigation**: Out of scope for this story. Both are currently `0.1.0`. No automated sync exists, but this is a known accepted risk noted in the understanding analysis.
 
 ## Test Strategy
 
-Since this is a packaging fix (not Rust code), traditional unit/integration tests don't apply. Validation focuses on:
+Since this is a packaging metadata fix (not Rust code), validation is through packaging tools, not Rust test harnesses:
 
-1. **Spec correctness**: Verify that `netfyr.spec` lines 47 and 77 now reference `target/release/netfyr` (not `netfyr-cli`). This can be checked with a simple grep.
+1. **Visual inspection**: Verify the `%install` section now has install commands for man sections 1, 5, 7, and 8 in ascending order. Verify `%files daemon` now includes `%{_mandir}/man8/netfyr-daemon.8*` between the binary and systemd unit entries.
 
-2. **Binary name verification**: Run `cargo build --release -p netfyr-cli` and confirm `target/release/netfyr` exists. This validates that the spec references a binary that actually gets built.
+2. **Grep verification**: Confirm `man8` appears in both the `%install` and `%files daemon` sections of `netfyr.spec`. A quick `grep -n man8 netfyr.spec` should show exactly 3 lines (the `install -d`, the `install -pm`, and the `%files` entry).
 
-3. **Spec parse check**: If `rpmspec` is available, run `rpmspec -P netfyr.spec` to verify macro expansion produces the correct `install` commands.
+3. **rpmlint**: Run `rpmlint netfyr.spec` and confirm no errors related to file lists or man pages.
 
-4. **rpmlint**: Run `rpmlint netfyr.spec` to verify no errors.
+4. **Spec parse check**: If `rpmspec` is available, run `rpmspec -P netfyr.spec` to verify macro expansion produces correct `install` commands for all four man page sections.
 
-5. **Full RPM build** (if rpmbuild is available in the environment): Run `./scripts/build-rpm.sh` end-to-end. Verify:
-   - Build exits 0
-   - `netfyr-0.1.0-1.*.rpm` and `netfyr-daemon-0.1.0-1.*.rpm` are produced
-   - `rpm -qlp` on both RPMs shows expected file lists
+5. **Full RPM build** (if `rpmbuild` and Rust toolchain available): Run `./scripts/build-rpm.sh` end-to-end. Verify:
+   - Build exits 0 with no "unpackaged files" errors
+   - `rpm -qlp` on the `netfyr-daemon` RPM shows `/usr/share/man/man8/netfyr-daemon.8.gz`
+   - `rpm -qlp` on the `netfyr` RPM still shows all man1, man5, man7 pages (regression check)
+   - Both RPMs install cleanly with `dnf install`
 
-6. **Post-install smoke tests** (if in a Fedora environment with dnf):
-   - `netfyr --help` exits 0
-   - `netfyr-daemon --help` exits 0
-   - `man netfyr` renders
-   - `systemctl cat netfyr.service` shows correct content
-   - `rpm -qR netfyr-daemon` lists `netfyr` and `systemd`
+6. **File list completeness**: Compare `rpm -qlp` output for both RPMs against the FHS table in SPEC-502 to confirm every expected path is present and assigned to the correct package.
 
-No Rust test code needs to be written. The acceptance criteria scenarios from the spec serve as the complete test plan — they are validated through the RPM build system, not through Rust test harnesses.
+No Rust test code needs to be written. The acceptance criteria scenarios from the spec serve as the test plan — they are validated through the RPM build system.

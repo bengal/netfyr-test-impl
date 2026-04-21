@@ -144,8 +144,11 @@
     "501-man-pages": [
       "301-cli-apply",
       "302-cli-query",
+      "351-journal-infrastructure",
       "352-history-cli",
-      "354-state-revert"
+      "353-external-change-detection",
+      "354-state-revert",
+      "403-daemon"
     ],
     "502-rpm-packaging": [
       "001-workspace-setup",
